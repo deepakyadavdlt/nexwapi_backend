@@ -1,0 +1,195 @@
+// Prisma schema — PostgreSQL (driver adapter: @prisma/adapter-pg)
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  password  String? // bcrypt hash (real auth later)
+  company   String   @default("Nexwapi")
+  role      String   @default("Owner")
+  createdAt DateTime @default(now())
+}
+
+model Agent {
+  id        String    @id @default(cuid())
+  name      String
+  email     String    @unique
+  role      String    @default("Agent") // Owner | Admin | Agent
+  color     String    @default("#25D366")
+  createdAt DateTime  @default(now())
+  contacts  Contact[]
+}
+
+model Note {
+  id        String   @id @default(cuid())
+  contact   Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  contactId String
+  text      String
+  author    String   @default("You")
+  createdAt DateTime @default(now())
+
+  @@index([contactId])
+}
+
+model Contact {
+  id              String    @id @default(cuid())
+  name            String
+  phone           String    @unique
+  tags            String[]  @default([])
+  optedIn         Boolean   @default(true)
+  color           String    @default("#25D366")
+  createdAt       DateTime  @default(now())
+  messages        Message[]
+  notes           Note[]
+  assignedAgent   Agent?    @relation(fields: [assignedAgentId], references: [id])
+  assignedAgentId String?
+  activeFlowId    String? // chatbot: current flow the contact is in
+  activeFlowStep  String? // chatbot: current step id within the flow
+  attributes      Json      @default("{}") // custom fields (key/value)
+  chatStatus      String    @default("open") // open | pending | resolved
+  labels          String[]  @default([]) // chat labels
+}
+
+model Label {
+  id        String   @id @default(cuid())
+  name      String
+  color     String   @default("#25D366")
+  createdAt DateTime @default(now())
+}
+
+model Drip {
+  id          String           @id @default(cuid())
+  name        String
+  enabled     Boolean          @default(true)
+  steps       Json             @default("[]") // [{ template, delayHours }]
+  createdAt   DateTime         @default(now())
+  enrollments DripEnrollment[]
+}
+
+model DripEnrollment {
+  id          String   @id @default(cuid())
+  drip        Drip     @relation(fields: [dripId], references: [id], onDelete: Cascade)
+  dripId      String
+  contactId   String
+  currentStep Int      @default(0)
+  nextAt      DateTime
+  status      String   @default("active") // active | completed
+  createdAt   DateTime @default(now())
+
+  @@index([status, nextAt])
+}
+
+model Segment {
+  id        String   @id @default(cuid())
+  name      String
+  tags      String[] @default([])
+  match     String   @default("any") // any | all
+  createdAt DateTime @default(now())
+}
+
+model Product {
+  id          String   @id @default(cuid())
+  name        String
+  price       String   @default("")
+  description String   @default("")
+  imageUrl    String   @default("")
+  createdAt   DateTime @default(now())
+}
+
+model Setting {
+  id           String   @id @default("default")
+  awayEnabled  Boolean  @default(false)
+  awayMessage  String   @default("Thanks for messaging! We're away right now and will reply during business hours.")
+  hoursStart   Int      @default(9) // 0-23
+  hoursEnd     Int      @default(18)
+  days         String[] @default(["Mon", "Tue", "Wed", "Thu", "Fri"])
+  businessName String   @default("Nexwapi")
+  autoAssign   Boolean  @default(false) // round-robin assign new chats to agents
+  webhookUrl   String   @default("") // outgoing events (Zapier/Make/custom)
+  csatEnabled  Boolean  @default(false) // send a rating request on chat resolve
+  csatMessage  String   @default("Thanks for chatting with us! How would you rate your experience?")
+  updatedAt    DateTime @updatedAt
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  name       String
+  key        String    @unique
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+}
+
+model Flow {
+  id          String   @id @default(cuid())
+  name        String
+  triggerType String   @default("keyword") // keyword | any
+  trigger     String   @default("")
+  enabled     Boolean  @default(true)
+  steps       Json     @default("[]") // [{ id, message, buttons: [{ title, next }] }]
+  createdAt   DateTime @default(now())
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  waId      String?  @unique // WhatsApp wamid (for delivery/read status updates)
+  contact   Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  contactId String
+  direction String // "in" | "out"
+  type      String   @default("text") // text | template | image | document | audio | video | interactive
+  text      String
+  mediaUrl  String? // local URL for image/document/etc.
+  filename  String?
+  status    String   @default("sent") // sent | delivered | read
+  at        DateTime @default(now())
+
+  @@index([contactId])
+}
+
+model Template {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  category  String   @default("Utility") // Authentication | Utility | Marketing
+  language  String   @default("en")
+  status    String   @default("pending") // pending | approved | rejected
+  body      String
+  createdAt DateTime @default(now())
+}
+
+model QuickReply {
+  id        String   @id @default(cuid())
+  title     String
+  text      String
+  createdAt DateTime @default(now())
+}
+
+model Automation {
+  id        String   @id @default(cuid())
+  name      String
+  keyword   String   @default("") // empty = with matchType "any"
+  matchType String   @default("contains") // contains | exact | any
+  reply     String
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+model Campaign {
+  id         String   @id @default(cuid())
+  name       String
+  template   String
+  audience   String   @default("All contacts")
+  recipients Int      @default(0)
+  sent       Int      @default(0)
+  delivered  Int      @default(0)
+  read       Int      @default(0)
+  replied    Int      @default(0)
+  status      String   @default("scheduled") // scheduled | running | completed
+  scheduledAt DateTime? // when to auto-send (null = manual)
+  createdAt   DateTime @default(now())
+}

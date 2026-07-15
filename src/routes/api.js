@@ -8,7 +8,7 @@ import path from "path";
 import { prisma, toMessage, pickColor } from "../lib/prisma.js";
 import {
   sendText, sendTemplate, sendTemplateWithParams, createTemplate, listTemplates,
-  uploadMedia, sendMediaById, sendButtons,
+  uploadMedia, sendMediaById, sendButtons, createCarouselTemplate,
 } from "../lib/whatsappService.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
@@ -23,9 +23,9 @@ function waMediaType(mime) {
 }
 import { WA_LIVE } from "../config/whatsapp.js";
 import { hashPassword, comparePassword, signToken } from "../lib/auth.js";
-import { runCampaign, resolveAudience } from "../lib/campaignRunner.js";
+import { runCampaign, resolveAudience, resolveAudienceContacts } from "../lib/campaignRunner.js";
 import { enrollContacts } from "../lib/dripRunner.js";
-import { fireEvent } from "../lib/events.js";
+import { fireEvent, logActivity } from "../lib/events.js";
 
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s);
 const publicUser = (u) => ({ id: u.id, name: u.name, email: u.email, company: u.company, role: u.role });
@@ -208,6 +208,7 @@ router.patch("/conversations/:id/status", async (req, res) => {
   try {
     const c = await prisma.contact.update({ where: { id: req.params.id }, data: { chatStatus: status } });
     fireEvent("chat.status", { name: c.name, phone: c.phone, status }).catch(() => {});
+    logActivity(c.id, "status", `Chat marked ${status}`);
 
     // On resolve, optionally send a CSAT rating request.
     if (status === "resolved") {
@@ -290,6 +291,7 @@ router.patch("/conversations/:id/assign", async (req, res) => {
       data: { assignedAgentId: agentId || null },
       include: { assignedAgent: true },
     });
+    logActivity(contact.id, "assign", contact.assignedAgent ? `Assigned to ${contact.assignedAgent.name}` : "Unassigned");
     res.json({
       assignedAgent: contact.assignedAgent
         ? { id: contact.assignedAgent.id, name: contact.assignedAgent.name, color: contact.assignedAgent.color }
@@ -298,6 +300,12 @@ router.patch("/conversations/:id/assign", async (req, res) => {
   } catch {
     res.sendStatus(404);
   }
+});
+
+// Contact activity timeline (events).
+router.get("/conversations/:id/timeline", async (req, res) => {
+  const events = await prisma.event.findMany({ where: { contactId: req.params.id }, orderBy: { createdAt: "desc" }, take: 50 });
+  res.json(events.map((e) => ({ ...e, createdAt: e.createdAt.getTime() })));
 });
 
 /* -------------------------- Contact notes ------------------------------ */
@@ -312,6 +320,7 @@ router.post("/conversations/:id/notes", async (req, res) => {
   const contact = await prisma.contact.findUnique({ where: { id: req.params.id } });
   if (!contact) return res.sendStatus(404);
   const note = await prisma.note.create({ data: { contactId: req.params.id, text, author } });
+  logActivity(req.params.id, "note", "Note added");
   res.status(201).json({ ...note, createdAt: note.createdAt.getTime() });
 });
 
@@ -413,6 +422,7 @@ router.patch("/conversations/:id/labels", async (req, res) => {
   const { labels } = req.body || {};
   try {
     const c = await prisma.contact.update({ where: { id: req.params.id }, data: { labels: Array.isArray(labels) ? labels : [] } });
+    logActivity(c.id, "label", c.labels.length ? `Labels: ${c.labels.join(", ")}` : "Labels cleared");
     res.json({ labels: c.labels });
   } catch {
     res.sendStatus(404);
@@ -521,7 +531,7 @@ router.get("/templates", async (_req, res) => {
 });
 
 router.post("/templates", async (req, res) => {
-  const { name, category = "Utility", language = "en", body } = req.body || {};
+  const { name, category = "Utility", language = "en", body, headerType, headerText, headerImageUrl, buttons, format = "text", cards } = req.body || {};
   if (!name || !body) return res.status(400).json({ error: "name and body required" });
   const cleanName = String(name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
 
@@ -530,7 +540,9 @@ router.post("/templates", async (req, res) => {
   let metaError = null;
   if (WA_LIVE) {
     try {
-      const r = await createTemplate({ name: cleanName, category, language, body });
+      const r = format === "carousel" && Array.isArray(cards) && cards.length
+        ? await createCarouselTemplate({ name: cleanName, category, language, body, cards })
+        : await createTemplate({ name: cleanName, category, language, body, headerType, headerText, headerImageUrl, buttons });
       status = (r.status || "pending").toLowerCase();
     } catch (e) {
       metaError = e.message;
@@ -539,7 +551,7 @@ router.post("/templates", async (req, res) => {
 
   try {
     const tpl = await prisma.template.create({
-      data: { name: cleanName, category, language, body, status },
+      data: { name: cleanName, category, language, body, status, format, cards: format === "carousel" ? cards : undefined },
     });
     res.status(201).json({ ...tpl, createdAt: tpl.createdAt.getTime(), metaError });
   } catch (e) {
@@ -578,7 +590,7 @@ router.get("/campaigns", async (_req, res) => {
 router.post("/campaigns", async (req, res) => {
   const { name, template, audience = "All contacts", scheduledAt } = req.body || {};
   if (!name || !template) return res.status(400).json({ error: "name and template required" });
-  const recipients = await prisma.contact.count({ where: await resolveAudience(audience) });
+  const recipients = (await resolveAudienceContacts(audience)).length;
   const campaign = await prisma.campaign.create({
     data: {
       name, template, audience, recipients, status: "scheduled",
@@ -841,12 +853,27 @@ router.get("/reports", async (_req, res) => {
 
   const campaigns = await prisma.campaign.findMany({ orderBy: { createdAt: "desc" }, take: 6 });
 
+  // Response-time: avg minutes from a contact's first inbound to our first reply.
+  const withMsgs = await prisma.contact.findMany({ include: { messages: { orderBy: { at: "asc" } } } });
+  let totalRespMin = 0, responded = 0, inboundContacts = 0;
+  for (const c of withMsgs) {
+    const firstIn = c.messages.find((m) => m.direction === "in");
+    if (!firstIn) continue;
+    inboundContacts++;
+    const firstOut = c.messages.find((m) => m.direction === "out" && m.at > firstIn.at);
+    if (firstOut) { totalRespMin += (firstOut.at - firstIn.at) / 60000; responded++; }
+  }
+  const avgResponseMinutes = responded ? Math.round(totalRespMin / responded) : 0;
+  const responseRate = inboundContacts ? Math.round((responded / inboundContacts) * 100) : 0;
+
   res.json({
     totals: {
       contacts: contactsTotal,
       messages: inbound + outbound,
       chats: open + pending + resolved,
       resolvedRate: open + pending + resolved ? Math.round((resolved / (open + pending + resolved)) * 100) : 0,
+      avgResponseMinutes,
+      responseRate,
     },
     agents: agentStats,
     statusBreakdown: { open, pending, resolved },

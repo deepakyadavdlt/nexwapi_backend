@@ -57,6 +57,16 @@ model Contact {
   labels          String[]  @default([]) // chat labels
 }
 
+model Event {
+  id        String   @id @default(cuid())
+  contactId String
+  type      String // status | assign | note | label | campaign | drip | created | template
+  text      String
+  createdAt DateTime @default(now())
+
+  @@index([contactId])
+}
+
 model Label {
   id        String   @id @default(cuid())
   name      String
@@ -159,6 +169,8 @@ model Template {
   language  String   @default("en")
   status    String   @default("pending") // pending | approved | rejected
   body      String
+  format    String   @default("text") // text | carousel
+  cards     Json? // carousel cards: [{ imageUrl, body, buttons: [{ type, text, url }] }]
   createdAt DateTime @default(now())
 }
 

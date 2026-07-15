@@ -1,5 +1,11 @@
-// lib/events.js — fire outgoing webhook events to a configured URL (Zapier/Make/custom).
+// lib/events.js — outgoing webhooks + contact activity logging.
 import { prisma } from "./prisma.js";
+
+// Record an activity event on a contact's timeline (best-effort).
+export function logActivity(contactId, type, text) {
+  if (!contactId) return;
+  prisma.event.create({ data: { contactId, type, text } }).catch(() => {});
+}
 
 export async function fireEvent(event, data) {
   try {

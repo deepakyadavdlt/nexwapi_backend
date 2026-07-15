@@ -85,6 +85,31 @@ async function maybeAway(contact) {
 /* --------------------------- Chatbot flow engine --------------------------- */
 // Send a flow step (text, or interactive buttons) and update the contact's state.
 async function sendStep(contact, flow, step) {
+  // API-call node: hit an external URL, save part of the response, then continue.
+  if (step.apiCall?.url) {
+    try {
+      const resp = await fetch(step.apiCall.url);
+      const body = await resp.text();
+      let value = body.slice(0, 300);
+      try {
+        const j = JSON.parse(body);
+        value = step.apiCall.field ? String(j[step.apiCall.field] ?? "") : JSON.stringify(j).slice(0, 300);
+      } catch {}
+      if (step.apiCall.saveField) {
+        const attrs = { ...(contact.attributes || {}), [step.apiCall.saveField]: value };
+        await prisma.contact.update({ where: { id: contact.id }, data: { attributes: attrs } });
+        contact.attributes = attrs;
+      }
+      console.log("[flow] api-call ->", step.apiCall.url, "saved:", value.slice(0, 40));
+    } catch (e) {
+      console.error("[flow] api-call failed:", e.message);
+    }
+    const nextStep = flow.steps.find((s) => s.id === step.apiCall.next);
+    if (nextStep) return sendStep(contact, flow, nextStep);
+    await prisma.contact.update({ where: { id: contact.id }, data: { activeFlowId: null, activeFlowStep: null } });
+    return;
+  }
+
   const buttons = (step.buttons || []).filter((b) => b.title && b.next);
   let r;
   if (buttons.length) {
@@ -95,8 +120,8 @@ async function sendStep(contact, flow, step) {
   await prisma.message.create({
     data: { waId: r.messages?.[0]?.id || null, contactId: contact.id, direction: "out", type: buttons.length ? "interactive" : "text", text: step.message, status: "sent" },
   });
-  // Stay in the flow if this step offers buttons OR captures a reply; else it ends.
-  const waiting = buttons.length > 0 || Boolean(step.capture?.field);
+  // Stay in the flow if this step offers buttons, captures a reply, or branches on conditions.
+  const waiting = buttons.length > 0 || Boolean(step.capture?.field) || (step.conditions?.length > 0);
   await prisma.contact.update({
     where: { id: contact.id },
     data: waiting ? { activeFlowId: flow.id, activeFlowStep: step.id } : { activeFlowId: null, activeFlowStep: null },
@@ -125,6 +150,11 @@ async function runChatbot(contact, m, text) {
         contact.attributes = attrs;
         nextId = current.capture.next;
         console.log(`[wa] captured "${current.capture.field}" =`, text);
+      }
+      // Conditional branch: route by keyword in the reply, else a default step.
+      if (!nextId && current?.conditions?.length) {
+        const cond = current.conditions.find((c) => c.match && lc.includes(c.match.toLowerCase()));
+        nextId = cond?.next || current.defaultNext || null;
       }
       const next = nextId ? flow.steps.find((s) => s.id === nextId) : null;
       if (next) { await sendStep(contact, flow, next); return true; }

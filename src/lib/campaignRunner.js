@@ -16,6 +16,19 @@ export async function resolveAudience(audience) {
   return where;
 }
 
+// Resolve an audience to a contact list, supporting engagement-based retargeting.
+export async function resolveAudienceContacts(audience) {
+  if (/^engaged:notreplied/i.test(audience)) {
+    const cs = await prisma.contact.findMany({ where: { optedIn: true }, include: { messages: true } });
+    return cs.filter((c) => c.messages.some((m) => m.direction === "out") && !c.messages.some((m) => m.direction === "in"));
+  }
+  if (/^engaged:notread/i.test(audience)) {
+    const cs = await prisma.contact.findMany({ where: { optedIn: true }, include: { messages: true } });
+    return cs.filter((c) => c.messages.some((m) => m.direction === "out" && m.status !== "read"));
+  }
+  return prisma.contact.findMany({ where: await resolveAudience(audience) });
+}
+
 // Send the campaign's template to every matching contact, updating progress.
 export async function runCampaign(id) {
   const campaign = await prisma.campaign.findUnique({ where: { id } });
@@ -24,7 +37,7 @@ export async function runCampaign(id) {
   const tpl = await prisma.template.findUnique({ where: { name: campaign.template } });
   const varCount = tpl ? (tpl.body.match(/\{\{\d+\}\}/g) || []).length : 0;
   const lang = tpl?.language || "en";
-  const contacts = await prisma.contact.findMany({ where: await resolveAudience(campaign.audience) });
+  const contacts = await resolveAudienceContacts(campaign.audience);
 
   await prisma.campaign.update({
     where: { id },

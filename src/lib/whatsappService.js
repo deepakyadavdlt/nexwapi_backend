@@ -83,6 +83,59 @@ export function sendMediaById(to, waType, mediaId, { filename, caption } = {}) {
   return send({ to, type: waType, [waType]: media });
 }
 
+// Resumable upload → returns a media "handle" used in template example headers.
+export async function uploadMediaHandle(buffer, mimetype) {
+  if (!WA_LIVE || !WA.appId) throw new Error("Live mode + WHATSAPP_APP_ID required for media templates");
+  const start = await fetch(`https://graph.facebook.com/${WA.version}/${WA.appId}/uploads?file_length=${buffer.length}&file_type=${encodeURIComponent(mimetype)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${WA.accessToken}` },
+  });
+  const s = await start.json();
+  if (!s.id) throw new Error(`upload session failed: ${JSON.stringify(s)}`);
+  const up = await fetch(`https://graph.facebook.com/${WA.version}/${s.id}`, {
+    method: "POST",
+    headers: { Authorization: `OAuth ${WA.accessToken}`, file_offset: "0" },
+    body: buffer,
+  });
+  const u = await up.json();
+  if (!u.h) throw new Error(`upload failed: ${JSON.stringify(u)}`);
+  return u.h;
+}
+
+// Create a carousel template (body + cards with image header + buttons).
+export async function createCarouselTemplate({ name, category, language, body, cards }) {
+  const cardComponents = [];
+  for (const card of cards) {
+    // Upload the card image to get a header handle.
+    const imgRes = await fetch(card.imageUrl);
+    const buffer = Buffer.from(await imgRes.arrayBuffer());
+    const mimetype = imgRes.headers.get("content-type") || "image/jpeg";
+    const handle = await uploadMediaHandle(buffer, mimetype);
+    const comps = [
+      { type: "HEADER", format: "IMAGE", example: { header_handle: [handle] } },
+      { type: "BODY", text: card.body || " " },
+    ];
+    const buttons = (card.buttons || []).filter((b) => b.text).map((b) =>
+      b.type === "URL"
+        ? { type: "URL", text: b.text, url: b.url || "https://nexwapi.com" }
+        : { type: "QUICK_REPLY", text: b.text }
+    );
+    if (buttons.length) comps.push({ type: "BUTTONS", buttons });
+    cardComponents.push({ components: comps });
+  }
+  const res = await fetch(`https://graph.facebook.com/${WA.version}/${WA.wabaId}/message_templates`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${WA.accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name, language, category: String(category).toUpperCase(),
+      components: [{ type: "BODY", text: body }, { type: "CAROUSEL", cards: cardComponents }],
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Carousel create failed: ${JSON.stringify(data)}`);
+  return data;
+}
+
 // Download inbound media by id → { buffer, mimetype }.
 export async function fetchInboundMedia(mediaId) {
   if (!WA_LIVE) return null;

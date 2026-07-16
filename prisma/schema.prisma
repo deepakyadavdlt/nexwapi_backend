@@ -8,13 +8,15 @@ datasource db {
 }
 
 model User {
-  id        String   @id @default(cuid())
-  name      String
-  email     String   @unique
-  password  String? // bcrypt hash (real auth later)
-  company   String   @default("Nexwapi")
-  role      String   @default("Owner")
-  createdAt DateTime @default(now())
+  id          String    @id @default(cuid())
+  name        String
+  email       String    @unique
+  password    String? // bcrypt hash (real auth later)
+  company     String    @default("Nexwapi")
+  role        String    @default("Owner")
+  plan        String    @default("trial") // trial | pro | expired
+  trialEndsAt DateTime? // 7-day free trial deadline
+  createdAt   DateTime  @default(now())
 }
 
 model Agent {

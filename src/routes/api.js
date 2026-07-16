@@ -28,7 +28,30 @@ import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
 
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s);
-const publicUser = (u) => ({ id: u.id, name: u.name, email: u.email, company: u.company, role: u.role });
+
+const TRIAL_DAYS = 7;
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Days left in the free trial (rounded up). null if user has no trial deadline (e.g. paid/pro).
+function trialDaysLeft(u) {
+  if (!u?.trialEndsAt) return null;
+  const ms = new Date(u.trialEndsAt).getTime() - Date.now();
+  return Math.max(0, Math.ceil(ms / DAY_MS));
+}
+const publicUser = (u) => {
+  const daysLeft = trialDaysLeft(u);
+  const expired = u?.plan === "trial" && daysLeft === 0;
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    company: u.company,
+    role: u.role,
+    plan: u.plan || "trial",
+    trialEndsAt: u.trialEndsAt ? new Date(u.trialEndsAt).getTime() : null,
+    trialDaysLeft: daysLeft,
+    trialExpired: expired,
+  };
+};
 
 const router = express.Router();
 
@@ -73,6 +96,8 @@ router.post("/auth/signup", async (req, res) => {
         password: await hashPassword(password),
         company,
         role: (await prisma.user.count()) === 0 ? "Owner" : "Member",
+        plan: "trial",
+        trialEndsAt: new Date(Date.now() + TRIAL_DAYS * DAY_MS),
       },
     });
     // Also add them as an agent for the shared inbox (best-effort).

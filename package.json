@@ -29,7 +29,8 @@
     "morgan": "^1.10.0",
     "multer": "^2.2.0",
     "nanoid": "^5.0.7",
-    "pg": "^8.13.0"
+    "pg": "^8.13.0",
+    "razorpay": "^2.9.8"
   },
   "devDependencies": {
     "prisma": "^7.8.0"

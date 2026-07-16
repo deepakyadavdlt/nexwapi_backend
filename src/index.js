@@ -57,10 +57,34 @@ app.get("/health", (_req, res) =>
 app.use("/api/whatsapp", whatsappRoutes); // GET verify + POST receive
 app.use("/api", attachUser, api); // dashboard REST API (attaches req.user if a token is present)
 
+// On boot, ensure an admin login exists when ADMIN_EMAIL/ADMIN_PASSWORD are set.
+// This lets production create/update the admin just by setting env vars + deploy,
+// without running a script against the live database.
+async function ensureAdmin() {
+  const email = (process.env.ADMIN_EMAIL || "").toLowerCase().trim();
+  const password = process.env.ADMIN_PASSWORD || "";
+  if (!email || password.length < 6) return;
+  try {
+    const { prisma } = await import("./lib/prisma.js");
+    const { hashPassword } = await import("./lib/auth.js");
+    const hash = await hashPassword(password);
+    await prisma.user.upsert({
+      where: { email },
+      update: { password: hash, role: "Owner", plan: "pro" },
+      create: { email, password: hash, name: process.env.ADMIN_NAME || "Admin", company: "Nexwapi", role: "Owner", plan: "pro" },
+    });
+    console.log(`  Admin ensured: ${email}`);
+  } catch (e) {
+    console.error("[ensureAdmin]", e?.message || e);
+  }
+}
+
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`\n  Nexwapi backend up on http://localhost:${PORT}`);
-  console.log(`  WhatsApp mode: ${WA_LIVE ? "LIVE (Meta)" : "DEMO (simulated sends)"}\n`);
+  console.log(`  WhatsApp mode: ${WA_LIVE ? "LIVE (Meta)" : "DEMO (simulated sends)"}`);
+  await ensureAdmin();
+  console.log("");
 });
 
 // Scheduler: every 30s, run due scheduled campaigns and drip-campaign steps.

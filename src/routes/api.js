@@ -22,7 +22,8 @@ function waMediaType(mime) {
   return "document";
 }
 import { WA_LIVE } from "../config/whatsapp.js";
-import { hashPassword, comparePassword, signToken } from "../lib/auth.js";
+import { hashPassword, comparePassword, signToken, requireAuth } from "../lib/auth.js";
+import { RAZORPAY_ENABLED, RAZORPAY_KEY_ID, PLANS, razorpay, verifySignature } from "../lib/razorpay.js";
 import { runCampaign, resolveAudience, resolveAudienceContacts } from "../lib/campaignRunner.js";
 import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
@@ -109,21 +110,15 @@ router.post("/auth/signup", async (req, res) => {
   }
 });
 
-// Log in with email + password (bcrypt), with a demo-account fallback.
+// Log in with email + password (bcrypt) against real database accounts only.
 router.post("/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
   const em = String(email || "").toLowerCase().trim();
 
   const user = await prisma.user.findUnique({ where: { email: em } });
-  if (user && (await comparePassword(password, user.password))) {
+  if (user?.password && (await comparePassword(password, user.password))) {
+    prisma.user.update({ where: { id: user.id }, data: { lastActiveAt: new Date() } }).catch(() => {});
     return res.json({ token: signToken(user), user: publicUser(user) });
-  }
-
-  // Demo fallback (env creds) — lets the seeded demo account work without a stored hash.
-  const demoEmail = String(process.env.DEMO_EMAIL || "admin@nexwapi.com").toLowerCase();
-  if (em === demoEmail && password === (process.env.DEMO_PASSWORD || "admin123")) {
-    const u = user || { id: "u_admin", name: "Aman", email: demoEmail, company: "Nexwapi", role: "Owner" };
-    return res.json({ token: signToken(u), user: publicUser(u) });
   }
 
   return res.status(401).json({ error: "Invalid email or password" });
@@ -136,6 +131,97 @@ router.get("/me", async (req, res) => {
   }
   const user = await prisma.user.findFirst();
   res.json(user ? publicUser(user) : { name: "Aman", email: process.env.DEMO_EMAIL, company: "Nexwapi", role: "Owner" });
+});
+
+/* ------------------------- Admin: client management -------------------- */
+function requireAdmin(req, res, next) {
+  if (req.user?.role === "Owner" || req.user?.role === "Admin") return next();
+  return res.status(403).json({ error: "Admin access only" });
+}
+
+// All signed-up clients with subscription + revenue + onboarding status.
+router.get("/admin/clients", requireAuth, requireAdmin, async (_req, res) => {
+  const users = await prisma.user.findMany({
+    orderBy: { createdAt: "desc" },
+    include: { payments: { where: { status: "paid" } } },
+  });
+  const flowActive = (await prisma.flow.count({ where: { enabled: true } }).catch(() => 0)) > 0;
+  const clients = users.map((u) => {
+    const daysLeft = trialDaysLeft(u);
+    return {
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      company: u.company,
+      role: u.role,
+      plan: u.plan,
+      trialEndsAt: u.trialEndsAt ? new Date(u.trialEndsAt).getTime() : null,
+      trialDaysLeft: daysLeft,
+      trialExpired: u.plan === "trial" && daysLeft === 0,
+      chatbotUsed: u.chatbotUsed || flowActive,
+      revenue: u.payments.reduce((s, p) => s + p.amount, 0),
+      onboardedAt: u.createdAt.getTime(),
+      upgradedAt: u.upgradedAt ? u.upgradedAt.getTime() : null,
+      lastActiveAt: u.lastActiveAt ? u.lastActiveAt.getTime() : null,
+    };
+  });
+  const summary = {
+    total: clients.length,
+    onTrial: clients.filter((c) => c.plan === "trial" && !c.trialExpired).length,
+    pro: clients.filter((c) => c.plan === "pro").length,
+    expired: clients.filter((c) => c.trialExpired).length,
+    revenue: clients.reduce((s, c) => s + c.revenue, 0),
+  };
+  res.json({ clients, summary });
+});
+
+// Admin manually sets a client's plan (used for the "manual approve" upgrade path).
+router.post("/admin/clients/:id/plan", requireAuth, requireAdmin, async (req, res) => {
+  const { plan } = req.body || {};
+  if (!["trial", "pro", "expired"].includes(plan)) return res.status(400).json({ error: "invalid plan" });
+  const data = { plan };
+  if (plan === "pro") { data.upgradedAt = new Date(); data.trialEndsAt = null; }
+  const user = await prisma.user.update({ where: { id: req.params.id }, data });
+  res.json(publicUser(user));
+});
+
+/* ------------------------------ Billing -------------------------------- */
+// Public billing config — tells the frontend if payments are live + the plan price.
+router.get("/billing/config", (_req, res) => {
+  res.json({ enabled: RAZORPAY_ENABLED, keyId: RAZORPAY_KEY_ID, plans: PLANS });
+});
+
+// Create a Razorpay order for the Pro plan.
+router.post("/billing/create-order", requireAuth, async (req, res) => {
+  if (!RAZORPAY_ENABLED) return res.status(503).json({ error: "Payments are not configured yet. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET." });
+  const plan = PLANS.pro;
+  const order = await razorpay().orders.create({
+    amount: plan.amount,
+    currency: plan.currency,
+    receipt: `u_${req.user.id}_${Date.now()}`,
+  });
+  await prisma.payment.create({
+    data: { userId: req.user.id, plan: "pro", amount: plan.amount, currency: plan.currency, status: "created", razorpayOrderId: order.id },
+  });
+  res.json({ orderId: order.id, amount: plan.amount, currency: plan.currency, keyId: RAZORPAY_KEY_ID });
+});
+
+// Verify the payment signature, mark it paid and upgrade the client to Pro.
+router.post("/billing/verify", requireAuth, async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+  if (!verifySignature(razorpay_order_id, razorpay_payment_id, razorpay_signature)) {
+    await prisma.payment.updateMany({ where: { razorpayOrderId: razorpay_order_id }, data: { status: "failed" } }).catch(() => {});
+    return res.status(400).json({ error: "Payment verification failed" });
+  }
+  await prisma.payment.updateMany({
+    where: { razorpayOrderId: razorpay_order_id },
+    data: { status: "paid", razorpayPaymentId: razorpay_payment_id, paidAt: new Date() },
+  });
+  const user = await prisma.user.update({
+    where: { id: req.user.id },
+    data: { plan: "pro", upgradedAt: new Date(), trialEndsAt: null },
+  });
+  res.json({ ok: true, user: publicUser(user) });
 });
 
 /* ------------------------------ Contacts ------------------------------- */

@@ -263,6 +263,11 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             filename = m.document?.filename || null;
           }
 
+          // Idempotent: Meta may retry the same webhook — skip if already stored.
+          if (m.id && (await prisma.message.findUnique({ where: { waId: m.id } }))) {
+            console.log("[wa] duplicate inbound skipped:", m.id);
+            continue;
+          }
           await prisma.message.create({
             data: {
               waId: m.id,

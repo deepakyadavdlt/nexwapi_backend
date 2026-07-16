@@ -8,13 +8,36 @@ datasource db {
 }
 
 model User {
-  id        String   @id @default(cuid())
-  name      String
-  email     String   @unique
-  password  String? // bcrypt hash (real auth later)
-  company   String   @default("Nexwapi")
-  role      String   @default("Owner")
-  createdAt DateTime @default(now())
+  id          String    @id @default(cuid())
+  name        String
+  email       String    @unique
+  password    String? // bcrypt hash (real auth later)
+  company     String    @default("Nexwapi")
+  role        String    @default("Owner")
+  plan        String    @default("trial") // trial | pro | expired
+  trialEndsAt DateTime? // 7-day free trial deadline
+  upgradedAt  DateTime? // when they moved to a paid plan
+  chatbotUsed Boolean   @default(false) // has this client built/used a chatbot flow
+  lastActiveAt DateTime? // last dashboard/API activity
+  createdAt   DateTime  @default(now())
+  payments    Payment[]
+}
+
+// A successful (or attempted) subscription payment via Razorpay.
+model Payment {
+  id                String   @id @default(cuid())
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId            String
+  plan              String   @default("pro") // plan purchased
+  amount            Int // in paise (₹499 = 49900)
+  currency          String   @default("INR")
+  status            String   @default("created") // created | paid | failed
+  razorpayOrderId   String?  @unique
+  razorpayPaymentId String?
+  createdAt         DateTime @default(now())
+  paidAt            DateTime?
+
+  @@index([userId])
 }
 
 model Agent {

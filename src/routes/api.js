@@ -23,7 +23,7 @@ function waMediaType(mime) {
 }
 import { WA_LIVE } from "../config/whatsapp.js";
 import { hashPassword, comparePassword, signToken, requireAuth } from "../lib/auth.js";
-import { RAZORPAY_ENABLED, RAZORPAY_KEY_ID, PLANS, razorpay, verifySignature } from "../lib/razorpay.js";
+import { RAZORPAY_ENABLED, RAZORPAY_KEY_ID, PLANS, razorpay, verifySignature, verifyWebhook } from "../lib/razorpay.js";
 import { runCampaign, resolveAudience, resolveAudienceContacts } from "../lib/campaignRunner.js";
 import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
@@ -195,15 +195,18 @@ router.get("/billing/config", (_req, res) => {
 router.post("/billing/create-order", requireAuth, async (req, res) => {
   if (!RAZORPAY_ENABLED) return res.status(503).json({ error: "Payments are not configured yet. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET." });
   const plan = PLANS.pro;
-  const order = await razorpay().orders.create({
-    amount: plan.amount,
-    currency: plan.currency,
-    receipt: `u_${req.user.id}_${Date.now()}`,
-  });
-  await prisma.payment.create({
-    data: { userId: req.user.id, plan: "pro", amount: plan.amount, currency: plan.currency, status: "created", razorpayOrderId: order.id },
-  });
-  res.json({ orderId: order.id, amount: plan.amount, currency: plan.currency, keyId: RAZORPAY_KEY_ID });
+  try {
+    // Razorpay caps receipt at 40 chars — keep it short.
+    const receipt = `rcpt_${req.user.id.slice(-8)}_${Date.now().toString(36)}`;
+    const order = await razorpay().orders.create({ amount: plan.amount, currency: plan.currency, receipt });
+    await prisma.payment.create({
+      data: { userId: req.user.id, plan: "pro", amount: plan.amount, currency: plan.currency, status: "created", razorpayOrderId: order.id },
+    });
+    res.json({ orderId: order.id, amount: plan.amount, currency: plan.currency, keyId: RAZORPAY_KEY_ID });
+  } catch (e) {
+    console.error("[create-order]", e?.error?.description || e?.message || e);
+    res.status(502).json({ error: "Could not start payment. Please try again." });
+  }
 });
 
 // Verify the payment signature, mark it paid and upgrade the client to Pro.
@@ -222,6 +225,41 @@ router.post("/billing/verify", requireAuth, async (req, res) => {
     data: { plan: "pro", upgradedAt: new Date(), trialEndsAt: null },
   });
   res.json({ ok: true, user: publicUser(user) });
+});
+
+// Razorpay webhook — server-to-server confirmation. Reliable even if the client
+// closes the browser before /billing/verify runs. Needs express.raw (bypasses
+// the global JSON parser via the exclusion in index.js) so the HMAC matches.
+router.post("/billing/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const signature = req.headers["x-razorpay-signature"];
+  if (!verifyWebhook(req.body, signature)) return res.status(400).send("invalid signature");
+  res.sendStatus(200); // ack fast; process after
+
+  try {
+    const event = JSON.parse(req.body.toString("utf8"));
+    const type = event?.event;
+    if (type === "order.paid" || type === "payment.captured") {
+      const orderId = event?.payload?.payment?.entity?.order_id || event?.payload?.order?.entity?.id;
+      const paymentId = event?.payload?.payment?.entity?.id || null;
+      if (!orderId) return;
+      const payment = await prisma.payment.findUnique({ where: { razorpayOrderId: orderId } });
+      if (!payment || payment.status === "paid") return; // unknown or already handled
+      await prisma.payment.update({
+        where: { razorpayOrderId: orderId },
+        data: { status: "paid", razorpayPaymentId: paymentId, paidAt: new Date() },
+      });
+      await prisma.user.update({
+        where: { id: payment.userId },
+        data: { plan: "pro", upgradedAt: new Date(), trialEndsAt: null },
+      });
+      console.log("[billing] webhook upgraded user", payment.userId, "order", orderId);
+    } else if (type === "payment.failed") {
+      const orderId = event?.payload?.payment?.entity?.order_id;
+      if (orderId) await prisma.payment.updateMany({ where: { razorpayOrderId: orderId }, data: { status: "failed" } }).catch(() => {});
+    }
+  } catch (e) {
+    console.error("[billing] webhook error", e?.message || e);
+  }
 });
 
 /* ------------------------------ Contacts ------------------------------- */

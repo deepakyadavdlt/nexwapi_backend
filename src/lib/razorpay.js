@@ -27,3 +27,13 @@ export function verifySignature(orderId, paymentId, signature) {
   const expected = crypto.createHmac("sha256", KEY_SECRET).update(`${orderId}|${paymentId}`).digest("hex");
   return expected === signature;
 }
+
+// Server-to-server webhook secret (set when creating the webhook in Razorpay).
+export const WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "";
+
+// Verify a webhook: HMAC-SHA256 of the RAW request body using the webhook secret.
+export function verifyWebhook(rawBody, signature) {
+  if (!WEBHOOK_SECRET || !signature) return false;
+  const expected = crypto.createHmac("sha256", WEBHOOK_SECRET).update(rawBody).digest("hex");
+  return expected === signature;
+}

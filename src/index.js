@@ -45,6 +45,7 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 // The webhook needs the RAW body, so it must bypass the global JSON parser.
 app.use((req, res, next) => {
   if (req.originalUrl === "/api/whatsapp/webhook") return next();
+  if (req.originalUrl === "/api/billing/webhook") return next();
   return express.json()(req, res, next);
 });
 

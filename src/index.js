@@ -23,20 +23,20 @@ const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
-// CORS — robust origin check so production never breaks on a misconfigured env var.
-// Always allows: the Nexwapi site + any subdomain, localhost (dev), and anything
-// explicitly listed in CORS_ORIGIN (comma-separated). Falls back to permissive
-// only when no allow-list is configured at all.
-const corsAllowList = (process.env.CORS_ORIGIN || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+// ===== CORS: frontend URLs allowed to call this API =====
+// 👉 Add your frontend URLs here.
+const ALLOWED_ORIGINS = [
+  "https://nexwapi.com",
+  "https://www.nexwapi.com",
+  "http://localhost:3000",
+  // plus anything set in the CORS_ORIGIN env var (comma-separated)
+  ...(process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean),
+];
 function corsOrigin(origin, cb) {
   if (!origin) return cb(null, true); // curl / server-to-server / same-origin
-  if (corsAllowList.includes(origin)) return cb(null, true);
+  if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+  // also allow any *.nexwapi.com subdomain
   if (/^https?:\/\/([a-z0-9-]+\.)*nexwapi\.com(:\d+)?$/i.test(origin)) return cb(null, true);
-  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return cb(null, true);
-  if (corsAllowList.length === 0) return cb(null, true); // no list set → allow all
   return cb(null, false);
 }
 app.use(cors({ origin: corsOrigin }));

@@ -23,7 +23,23 @@ const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
-app.use(cors({ origin: process.env.CORS_ORIGIN?.split(",") || "*" }));
+// CORS — robust origin check so production never breaks on a misconfigured env var.
+// Always allows: the Nexwapi site + any subdomain, localhost (dev), and anything
+// explicitly listed in CORS_ORIGIN (comma-separated). Falls back to permissive
+// only when no allow-list is configured at all.
+const corsAllowList = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+function corsOrigin(origin, cb) {
+  if (!origin) return cb(null, true); // curl / server-to-server / same-origin
+  if (corsAllowList.includes(origin)) return cb(null, true);
+  if (/^https?:\/\/([a-z0-9-]+\.)*nexwapi\.com(:\d+)?$/i.test(origin)) return cb(null, true);
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return cb(null, true);
+  if (corsAllowList.length === 0) return cb(null, true); // no list set → allow all
+  return cb(null, false);
+}
+app.use(cors({ origin: corsOrigin }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 // The webhook needs the RAW body, so it must bypass the global JSON parser.

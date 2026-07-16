@@ -32,13 +32,17 @@ const ALLOWED_ORIGINS = [
   // plus anything set in the CORS_ORIGIN env var (comma-separated)
   ...(process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean),
 ];
-function corsOrigin(origin, cb) {
-  if (!origin) return cb(null, true); // curl / server-to-server / same-origin
-  if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-  // also allow any *.nexwapi.com subdomain
-  if (/^https?:\/\/([a-z0-9-]+\.)*nexwapi\.com(:\d+)?$/i.test(origin)) return cb(null, true);
-  return cb(null, false);
-}
+// function corsOrigin(origin, cb) {
+//   if (!origin) return cb(null, true); // curl / server-to-server / same-origin
+//   if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+//   // also allow any *.nexwapi.com subdomain
+//   if (/^https?:\/\/([a-z0-9-]+\.)*nexwapi\.com(:\d+)?$/i.test(origin)) return cb(null, true);
+//   return cb(null, false);
+// }
+const corsOrigin = [
+  "https://nexwapi.com"
+];
+
 app.use(cors({ origin: corsOrigin }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 

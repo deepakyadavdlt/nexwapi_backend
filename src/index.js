@@ -23,7 +23,11 @@ const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
-app.use(cors({ origin: process.env.CORS_ORIGIN?.split(",") || "*" }));
+app.use(
+  cors({
+    origin: ["http://localhost:3000", "https://nexwapi.com"],
+  })
+);
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 // The webhook needs the RAW body, so it must bypass the global JSON parser.

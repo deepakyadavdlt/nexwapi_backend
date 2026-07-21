@@ -5,8 +5,11 @@ import cors from "cors";
 import morgan from "morgan";
 import whatsappRoutes from "./routes/whatsappRoutes.js";
 import api from "./routes/api.js";
+import superAdmin from "./routes/superAdmin.js";
 import { WA_LIVE } from "./config/whatsapp.js";
 import { attachUser } from "./lib/auth.js";
+import { validateEnv, corsOriginCheck } from "./lib/env.js";
+import { ensureDefaultPlans, ensureDefaultCoupons } from "./lib/tenant.js";
 import fs from "fs";
 import path from "path";
 
@@ -17,6 +20,8 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 process.on("unhandledRejection", (err) => console.error("[unhandledRejection]", err?.message || err));
 process.on("uncaughtException", (err) => console.error("[uncaughtException]", err?.message || err));
 
+validateEnv();
+
 const app = express();
 
 // Behind a proxy (ngrok / Render / Railway / Nginx) — trust X-Forwarded-* headers.
@@ -24,26 +29,7 @@ app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
 // ===== CORS: frontend URLs allowed to call this API =====
-// 👉 Add your frontend URLs here.
-const ALLOWED_ORIGINS = [
-  "https://nexwapi.com",
-  "https://www.nexwapi.com",
-  "http://localhost:3000",
-  // plus anything set in the CORS_ORIGIN env var (comma-separated)
-  ...(process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean),
-];
-// function corsOrigin(origin, cb) {
-//   if (!origin) return cb(null, true); // curl / server-to-server / same-origin
-//   if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-//   // also allow any *.nexwapi.com subdomain
-//   if (/^https?:\/\/([a-z0-9-]+\.)*nexwapi\.com(:\d+)?$/i.test(origin)) return cb(null, true);
-//   return cb(null, false);
-// }
-const corsOrigin = [
-  "https://nexwapi.com"
-];
-
-app.use(cors({ origin: corsOrigin }));
+app.use(cors({ origin: corsOriginCheck, credentials: true }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 // The webhook needs the RAW body, so it must bypass the global JSON parser.
@@ -60,11 +46,10 @@ app.get("/health", (_req, res) =>
 );
 
 app.use("/api/whatsapp", whatsappRoutes); // GET verify + POST receive
+app.use("/api/super-admin", attachUser, superAdmin); // platform Super Admin
 app.use("/api", attachUser, api); // dashboard REST API (attaches req.user if a token is present)
 
-// On boot, ensure an admin login exists when ADMIN_EMAIL/ADMIN_PASSWORD are set.
-// This lets production create/update the admin just by setting env vars + deploy,
-// without running a script against the live database.
+// On boot, ensure Super Admin exists when ADMIN_EMAIL/ADMIN_PASSWORD are set.
 async function ensureAdmin() {
   const email = (process.env.ADMIN_EMAIL || "").toLowerCase().trim();
   const password = process.env.ADMIN_PASSWORD || "";
@@ -75,10 +60,21 @@ async function ensureAdmin() {
     const hash = await hashPassword(password);
     await prisma.user.upsert({
       where: { email },
-      update: { password: hash, role: "Owner", plan: "pro" },
-      create: { email, password: hash, name: process.env.ADMIN_NAME || "Admin", company: "Nexwapi", role: "Owner", plan: "pro" },
+      update: { password: hash, role: "SUPER_ADMIN", companyId: null },
+      create: {
+        email,
+        password: hash,
+        name: process.env.ADMIN_NAME || "Super Admin",
+        role: "SUPER_ADMIN",
+        companyId: null,
+      },
     });
-    console.log(`  Admin ensured: ${email}`);
+    console.log(`  Super Admin ensured: ${email}`);
+    await ensureDefaultPlans();
+    await ensureDefaultCoupons();
+    const { getPlatformPricing } = await import("./lib/wallet.js");
+    await getPlatformPricing();
+    console.log("  Platform pricing ensured");
   } catch (e) {
     console.error("[ensureAdmin]", e?.message || e);
   }

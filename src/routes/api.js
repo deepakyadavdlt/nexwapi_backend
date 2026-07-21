@@ -8,8 +8,13 @@ import path from "path";
 import { prisma, toMessage, pickColor } from "../lib/prisma.js";
 import {
   sendText, sendTemplate, sendTemplateWithParams, createTemplate, listTemplates,
-  uploadMedia, sendMediaById, sendButtons, createCarouselTemplate,
+  uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getCompanyCreds,
 } from "../lib/whatsappService.js";
+import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits } from "../lib/wallet.js";
+import {
+  metaSignupConfig, exchangeCodeForToken, exchangeForLongLivedToken,
+  fetchPhoneNumbers, subscribeWabaWebhooks, fetchPhoneDetails, fetchSharedWabas,
+} from "../lib/metaOAuth.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
 const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 16 * 1024 * 1024 } }); // 16MB (WhatsApp limit)
@@ -23,42 +28,33 @@ function waMediaType(mime) {
 }
 import { WA_LIVE } from "../config/whatsapp.js";
 import { hashPassword, comparePassword, signToken, requireAuth } from "../lib/auth.js";
+import {
+  attachCompany, companyIdOf, tenantWhere, publicCompanyUser, uniqueSlug,
+  requireNotSuspended, requireFeature, isSuperAdmin,
+} from "../lib/tenant.js";
+import { PLAN_CATALOG, normalizePlan, hasFeature } from "../lib/plans.js";
 import { RAZORPAY_ENABLED, RAZORPAY_KEY_ID, PLANS, razorpay, verifySignature, verifyWebhook } from "../lib/razorpay.js";
-import { runCampaign, resolveAudience, resolveAudienceContacts } from "../lib/campaignRunner.js";
+import { runCampaign, resolveAudience } from "../lib/campaignRunner.js";
 import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
+import { loginLimiter, signupLimiter, apiMessageLimiter } from "../lib/rateLimit.js";
+import { findApiKeyByRaw, hashApiKey, keyPrefix, publicApiKeyRow } from "../lib/apiKey.js";
 
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s);
 
 const TRIAL_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
-// Days left in the free trial (rounded up). null if user has no trial deadline (e.g. paid/pro).
-function trialDaysLeft(u) {
-  if (!u?.trialEndsAt) return null;
-  const ms = new Date(u.trialEndsAt).getTime() - Date.now();
-  return Math.max(0, Math.ceil(ms / DAY_MS));
+
+async function tenantContact(req, id) {
+  return prisma.contact.findFirst({ where: { id, companyId: companyIdOf(req) } });
 }
-const publicUser = (u) => {
-  const daysLeft = trialDaysLeft(u);
-  const expired = u?.plan === "trial" && daysLeft === 0;
-  return {
-    id: u.id,
-    name: u.name,
-    email: u.email,
-    company: u.company,
-    role: u.role,
-    plan: u.plan || "trial",
-    trialEndsAt: u.trialEndsAt ? new Date(u.trialEndsAt).getTime() : null,
-    trialDaysLeft: daysLeft,
-    trialExpired: expired,
-  };
-};
 
 const router = express.Router();
 
 // Build the inbox list (contact + last message + unread count).
-async function buildConversations() {
+async function buildConversations(req) {
   const contacts = await prisma.contact.findMany({
+    where: tenantWhere(req),
     include: { messages: { orderBy: { at: "desc" }, take: 50 }, assignedAgent: true },
   });
   return contacts
@@ -85,25 +81,64 @@ async function buildConversations() {
 
 /* -------------------------------- Auth --------------------------------- */
 // Create a new account (name, email, password) with a bcrypt-hashed password.
-router.post("/auth/signup", async (req, res) => {
-  const { name, email, password, company = "" } = req.body || {};
+router.post("/auth/signup", signupLimiter, async (req, res) => {
+  const { name, email, password, company: companyName } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: "name, email and password required" });
   if (String(password).length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
   try {
+    const em = String(email).toLowerCase().trim();
+    const coName = String(companyName || name).trim();
+    const slug = await uniqueSlug(coName);
+    const trialEndsAt = new Date(Date.now() + TRIAL_DAYS * DAY_MS);
+
+    const { getPlatformPricing } = await import("../lib/wallet.js");
+    const pricing = await getPlatformPricing();
+
+    const company = await prisma.company.create({
+      data: {
+        name: coName,
+        slug,
+        email: em,
+        status: "TRIAL",
+        plan: "trial",
+        trialEndsAt,
+        trialStartedAt: new Date(),
+        messageCredits: pricing.trialCredits,
+        walletBalancePaise: 0,
+      },
+    });
+
     const user = await prisma.user.create({
       data: {
         name,
-        email: String(email).toLowerCase().trim(),
+        email: em,
         password: await hashPassword(password),
-        company,
-        role: (await prisma.user.count()) === 0 ? "Owner" : "Member",
-        plan: "trial",
-        trialEndsAt: new Date(Date.now() + TRIAL_DAYS * DAY_MS),
+        role: "OWNER",
+        companyId: company.id,
       },
     });
-    // Also add them as an agent for the shared inbox (best-effort).
-    prisma.agent.create({ data: { name, email: user.email, role: user.role } }).catch(() => {});
-    res.status(201).json({ token: signToken(user), user: publicUser(user) });
+
+    await prisma.subscription.create({
+      data: { companyId: company.id, plan: "trial", status: "active", trialEndsAt },
+    });
+    await prisma.setting.create({ data: { companyId: company.id, businessName: coName } });
+    await prisma.agent.create({
+      data: { companyId: company.id, name, email: user.email, role: "Owner" },
+    }).catch(() => {});
+    await prisma.walletTransaction.create({
+      data: {
+        companyId: company.id,
+        type: "credit",
+        reason: "admin_grant",
+        amountPaise: 0,
+        creditsDelta: pricing.trialCredits,
+        balanceAfter: 0,
+        creditsAfter: pricing.trialCredits,
+        meta: { note: "Trial starter credits" },
+      },
+    }).catch(() => {});
+
+    res.status(201).json({ token: signToken(user), user: publicCompanyUser(user, company) });
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "An account with this email already exists" });
     throw e;
@@ -111,64 +146,88 @@ router.post("/auth/signup", async (req, res) => {
 });
 
 // Log in with email + password (bcrypt) against real database accounts only.
-router.post("/auth/login", async (req, res) => {
+router.post("/auth/login", loginLimiter, async (req, res) => {
   const { email, password } = req.body || {};
   const em = String(email || "").toLowerCase().trim();
 
-  const user = await prisma.user.findUnique({ where: { email: em } });
+  const user = await prisma.user.findUnique({
+    where: { email: em },
+    include: { company: { include: { subscription: true } } },
+  });
   if (user?.password && (await comparePassword(password, user.password))) {
-    prisma.user.update({ where: { id: user.id }, data: { lastActiveAt: new Date() } }).catch(() => {});
-    return res.json({ token: signToken(user), user: publicUser(user) });
+    prisma.user.update({ where: { id: user.id }, data: { lastActiveAt: new Date(), lastLoginAt: new Date() } }).catch(() => {});
+    if (user.companyId) {
+      prisma.company.update({ where: { id: user.companyId }, data: { lastActiveAt: new Date() } }).catch(() => {});
+    }
+    return res.json({ token: signToken(user), user: publicCompanyUser(user, user.company) });
   }
 
   return res.status(401).json({ error: "Invalid email or password" });
 });
 
-router.get("/me", async (req, res) => {
-  if (req.user?.id) {
-    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    if (user) return res.json(publicUser(user));
-  }
-  const user = await prisma.user.findFirst();
-  res.json(user ? publicUser(user) : { name: "Aman", email: process.env.DEMO_EMAIL, company: "Nexwapi", role: "Owner" });
+router.get("/me", requireAuth, attachCompany, async (req, res) => {
+  const user = await prisma.user.findUnique({
+    where: { id: req.user.id },
+    include: { company: { include: { subscription: true } } },
+  });
+  if (!user) return res.status(404).json({ error: "User not found" });
+  res.json({
+    ...publicCompanyUser(user, req.company || user.company),
+    ...(req.user.impersonating
+      ? { impersonating: true, impersonatedBy: req.user.impersonatedBy }
+      : {}),
+  });
 });
 
 /* ------------------------- Admin: client management -------------------- */
 function requireAdmin(req, res, next) {
-  if (req.user?.role === "Owner" || req.user?.role === "Admin") return next();
+  if (isSuperAdmin(req.user)) return next();
+  const r = req.user?.role;
+  if (r === "OWNER" || r === "Owner" || r === "ADMIN" || r === "Admin") return next();
   return res.status(403).json({ error: "Admin access only" });
 }
 
 // All signed-up clients with subscription + revenue + onboarding status.
-router.get("/admin/clients", requireAuth, requireAdmin, async (_req, res) => {
-  const users = await prisma.user.findMany({
+router.get("/admin/clients", requireAuth, requireAdmin, async (req, res) => {
+  if (!isSuperAdmin(req.user)) {
+    return res.status(403).json({ error: "Super Admin access only" });
+  }
+  const companies = await prisma.company.findMany({
     orderBy: { createdAt: "desc" },
-    include: { payments: { where: { status: "paid" } } },
+    include: {
+      payments: { where: { status: "paid" } },
+      users: { take: 1, orderBy: { createdAt: "asc" } },
+    },
   });
   const flowActive = (await prisma.flow.count({ where: { enabled: true } }).catch(() => 0)) > 0;
-  const clients = users.map((u) => {
-    const daysLeft = trialDaysLeft(u);
+  const clients = companies.map((c) => {
+    const owner = c.users?.[0];
+    const trialEndsAt = c.trialEndsAt ? new Date(c.trialEndsAt).getTime() : null;
+    const daysLeft = trialEndsAt ? Math.max(0, Math.ceil((trialEndsAt - Date.now()) / DAY_MS)) : null;
+    const plan = normalizePlan(c.plan);
     return {
-      id: u.id,
-      name: u.name,
-      email: u.email,
-      company: u.company,
-      role: u.role,
-      plan: u.plan,
-      trialEndsAt: u.trialEndsAt ? new Date(u.trialEndsAt).getTime() : null,
+      id: c.id,
+      name: c.name,
+      email: owner?.email || c.email,
+      ownerId: owner?.id,
+      company: c.name,
+      role: owner?.role,
+      plan,
+      status: c.status,
+      trialEndsAt,
       trialDaysLeft: daysLeft,
-      trialExpired: u.plan === "trial" && daysLeft === 0,
-      chatbotUsed: u.chatbotUsed || flowActive,
-      revenue: u.payments.reduce((s, p) => s + p.amount, 0),
-      onboardedAt: u.createdAt.getTime(),
-      upgradedAt: u.upgradedAt ? u.upgradedAt.getTime() : null,
-      lastActiveAt: u.lastActiveAt ? u.lastActiveAt.getTime() : null,
+      trialExpired: c.status === "EXPIRED" || (c.status === "TRIAL" && daysLeft === 0),
+      chatbotUsed: c.chatbotUsed || flowActive,
+      revenue: c.payments.reduce((s, p) => s + p.amount, 0),
+      onboardedAt: c.createdAt.getTime(),
+      upgradedAt: c.upgradedAt ? c.upgradedAt.getTime() : null,
+      lastActiveAt: c.lastActiveAt ? c.lastActiveAt.getTime() : null,
     };
   });
   const summary = {
     total: clients.length,
     onTrial: clients.filter((c) => c.plan === "trial" && !c.trialExpired).length,
-    pro: clients.filter((c) => c.plan === "pro").length,
+    pro: clients.filter((c) => c.plan === "growth").length,
     expired: clients.filter((c) => c.trialExpired).length,
     revenue: clients.reduce((s, c) => s + c.revenue, 0),
   };
@@ -177,54 +236,131 @@ router.get("/admin/clients", requireAuth, requireAdmin, async (_req, res) => {
 
 // Admin manually sets a client's plan (used for the "manual approve" upgrade path).
 router.post("/admin/clients/:id/plan", requireAuth, requireAdmin, async (req, res) => {
+  if (!isSuperAdmin(req.user)) {
+    return res.status(403).json({ error: "Super Admin access only" });
+  }
   const { plan } = req.body || {};
-  if (!["trial", "pro", "expired"].includes(plan)) return res.status(400).json({ error: "invalid plan" });
-  const data = { plan };
-  if (plan === "pro") { data.upgradedAt = new Date(); data.trialEndsAt = null; }
-  const user = await prisma.user.update({ where: { id: req.params.id }, data });
-  res.json(publicUser(user));
+  const planKey = normalizePlan(plan);
+  if (!["trial", "starter", "growth", "expired"].includes(planKey)) {
+    return res.status(400).json({ error: "invalid plan" });
+  }
+  const data = { plan: planKey };
+  if (planKey === "growth" || planKey === "starter") {
+    data.status = "ACTIVE";
+    data.upgradedAt = new Date();
+    data.trialEndsAt = null;
+  } else if (planKey === "expired") {
+    data.status = "EXPIRED";
+  } else if (planKey === "trial") {
+    data.status = "TRIAL";
+  }
+  const company = await prisma.company.update({ where: { id: req.params.id }, data });
+  const owner = await prisma.user.findFirst({ where: { companyId: company.id }, orderBy: { createdAt: "asc" } });
+  res.json(publicCompanyUser(owner || { id: req.user.id, name: company.name, email: company.email, role: "OWNER", companyId: company.id }, company));
 });
 
 /* ------------------------------ Billing -------------------------------- */
 // Public billing config — tells the frontend if payments are live + the plan price.
 router.get("/billing/config", (_req, res) => {
-  res.json({ enabled: RAZORPAY_ENABLED, keyId: RAZORPAY_KEY_ID, plans: PLANS });
+  res.json({ enabled: RAZORPAY_ENABLED, keyId: RAZORPAY_KEY_ID, plans: PLAN_CATALOG, legacyPlans: PLANS });
 });
 
-// Create a Razorpay order for the Pro plan.
-router.post("/billing/create-order", requireAuth, async (req, res) => {
+// Create a Razorpay order for starter or growth plan.
+router.post("/billing/create-order", requireAuth, attachCompany, async (req, res) => {
   if (!RAZORPAY_ENABLED) return res.status(503).json({ error: "Payments are not configured yet. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET." });
-  const plan = PLANS.pro;
+  const planKey = normalizePlan(req.body?.planKey || req.body?.plan || "growth");
+  if (!["starter", "growth"].includes(planKey)) {
+    return res.status(400).json({ error: "planKey must be starter or growth" });
+  }
+  const plan = PLAN_CATALOG[planKey];
+  const companyId = companyIdOf(req);
+  if (!companyId) return res.status(403).json({ error: "No company linked to this account" });
   try {
-    // Razorpay caps receipt at 40 chars — keep it short.
     const receipt = `rcpt_${req.user.id.slice(-8)}_${Date.now().toString(36)}`;
     const order = await razorpay().orders.create({ amount: plan.amount, currency: plan.currency, receipt });
     await prisma.payment.create({
-      data: { userId: req.user.id, plan: "pro", amount: plan.amount, currency: plan.currency, status: "created", razorpayOrderId: order.id },
+      data: {
+        userId: req.user.id,
+        companyId,
+        plan: planKey,
+        amount: plan.amount,
+        currency: plan.currency,
+        status: "created",
+        razorpayOrderId: order.id,
+      },
     });
-    res.json({ orderId: order.id, amount: plan.amount, currency: plan.currency, keyId: RAZORPAY_KEY_ID });
+    res.json({ orderId: order.id, amount: plan.amount, currency: plan.currency, keyId: RAZORPAY_KEY_ID, planKey });
   } catch (e) {
     console.error("[create-order]", e?.error?.description || e?.message || e);
     res.status(502).json({ error: "Could not start payment. Please try again." });
   }
 });
 
-// Verify the payment signature, mark it paid and upgrade the client to Pro.
-router.post("/billing/verify", requireAuth, async (req, res) => {
+// Verify the payment signature, mark it paid and upgrade the company plan.
+router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
   const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+  const companyId = companyIdOf(req);
+  if (!companyId) return res.status(403).json({ error: "No company linked to this account" });
   if (!verifySignature(razorpay_order_id, razorpay_payment_id, razorpay_signature)) {
-    await prisma.payment.updateMany({ where: { razorpayOrderId: razorpay_order_id }, data: { status: "failed" } }).catch(() => {});
+    await prisma.payment.updateMany({ where: { razorpayOrderId: razorpay_order_id, companyId }, data: { status: "failed" } }).catch(() => {});
     return res.status(400).json({ error: "Payment verification failed" });
   }
-  await prisma.payment.updateMany({
+  const payment = await prisma.payment.findUnique({ where: { razorpayOrderId: razorpay_order_id } });
+  if (!payment || payment.companyId !== companyId) {
+    return res.status(404).json({ error: "Payment not found" });
+  }
+
+  // Idempotent: webhook may have already credited — never double-credit
+  if (payment.status === "paid") {
+    const company = await prisma.company.findUnique({ where: { id: companyId } });
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    return res.json({ ok: true, alreadyProcessed: true, user: publicCompanyUser(user, company) });
+  }
+
+  await prisma.payment.update({
     where: { razorpayOrderId: razorpay_order_id },
     data: { status: "paid", razorpayPaymentId: razorpay_payment_id, paidAt: new Date() },
   });
-  const user = await prisma.user.update({
-    where: { id: req.user.id },
-    data: { plan: "pro", upgradedAt: new Date(), trialEndsAt: null },
-  });
-  res.json({ ok: true, user: publicUser(user) });
+
+  let company;
+  if (payment.type === "wallet_recharge") {
+    const pricing = await getPlatformPricing();
+    const credits = payment.creditsAdded || creditsFromPaise(payment.amount, pricing.creditsPerRupee);
+    const r = await creditWallet({
+      companyId,
+      amountPaise: payment.amount,
+      credits,
+      reason: "recharge",
+      createdBy: req.user.id,
+      meta: { orderId: razorpay_order_id },
+    });
+    company = r.company;
+    if (company.status === "EXPIRED" || company.status === "SUSPENDED") {
+      company = await prisma.company.update({
+        where: { id: companyId },
+        data: { status: "ACTIVE" },
+      });
+    }
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { creditsAdded: credits },
+    });
+  } else {
+    const planKey = normalizePlan(payment.plan);
+    company = await prisma.company.update({
+      where: { id: companyId },
+      data: { plan: planKey, status: "ACTIVE", upgradedAt: new Date(), trialEndsAt: null },
+    });
+    await prisma.subscription.update({
+      where: { companyId },
+      data: { plan: planKey, status: "active", activatedAt: new Date(), trialEndsAt: null },
+    }).catch(() => {});
+    await applyPlanCredits(companyId, planKey, req.user.id).catch(() => {});
+    company = await prisma.company.findUnique({ where: { id: companyId } });
+  }
+
+  const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+  res.json({ ok: true, user: publicCompanyUser(user, company) });
 });
 
 // Razorpay webhook — server-to-server confirmation. Reliable even if the client
@@ -248,11 +384,37 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
         where: { razorpayOrderId: orderId },
         data: { status: "paid", razorpayPaymentId: paymentId, paidAt: new Date() },
       });
-      await prisma.user.update({
-        where: { id: payment.userId },
-        data: { plan: "pro", upgradedAt: new Date(), trialEndsAt: null },
-      });
-      console.log("[billing] webhook upgraded user", payment.userId, "order", orderId);
+      if (payment.companyId) {
+        if (payment.type === "wallet_recharge") {
+          const { creditWallet, creditsFromPaise, getPlatformPricing } = await import("../lib/wallet.js");
+          const pricing = await getPlatformPricing();
+          const credits = payment.creditsAdded || creditsFromPaise(payment.amount, pricing.creditsPerRupee);
+          await creditWallet({
+            companyId: payment.companyId,
+            amountPaise: payment.amount,
+            credits,
+            reason: "recharge",
+            meta: { orderId, via: "webhook" },
+          });
+          await prisma.company.update({
+            where: { id: payment.companyId },
+            data: { status: "ACTIVE" },
+          }).catch(() => {});
+        } else {
+          const planKey = normalizePlan(payment.plan);
+          await prisma.company.update({
+            where: { id: payment.companyId },
+            data: { plan: planKey, status: "ACTIVE", upgradedAt: new Date(), trialEndsAt: null },
+          });
+          await prisma.subscription.update({
+            where: { companyId: payment.companyId },
+            data: { plan: planKey, status: "active", activatedAt: new Date(), trialEndsAt: null },
+          }).catch(() => {});
+          const { applyPlanCredits } = await import("../lib/wallet.js");
+          await applyPlanCredits(payment.companyId, planKey).catch(() => {});
+        }
+        console.log("[billing] webhook paid", payment.type, payment.companyId, "order", orderId);
+      }
     } else if (type === "payment.failed") {
       const orderId = event?.payload?.payment?.entity?.order_id;
       if (orderId) await prisma.payment.updateMany({ where: { razorpayOrderId: orderId }, data: { status: "failed" } }).catch(() => {});
@@ -262,9 +424,80 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
   }
 });
 
+// Public send API (for Zapier / Shopify / custom integrations). Auth via x-api-key.
+router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
+  const key = req.headers["x-api-key"];
+  if (!key) return res.status(401).json({ error: "Missing x-api-key header" });
+  const apiKey = await findApiKeyByRaw(String(key));
+  if (!apiKey) return res.status(401).json({ error: "Invalid API key" });
+  const plan = normalizePlan(apiKey.company?.plan || "trial");
+  if (!hasFeature(plan, "api")) {
+    return res.status(403).json({ error: "Your plan does not include api", code: "FEATURE_LOCKED", feature: "api", plan });
+  }
+  if (apiKey.company?.status === "SUSPENDED") {
+    return res.status(403).json({ error: "Account suspended", code: "SUSPENDED" });
+  }
+  prisma.apiKey.update({ where: { id: apiKey.id }, data: { lastUsedAt: new Date() } }).catch(() => {});
+
+  const { to, text, template, params, language = "en" } = req.body || {};
+  if (!to) return res.status(400).json({ error: "to (phone number) required" });
+  const pricing = await getPlatformPricing();
+  const creditsNeeded = pricing.creditPerOutbound || 1;
+  try {
+    await spendCredits(apiKey.companyId, creditsNeeded, "api_message_send", {
+      to,
+      template: template || null,
+      channel: "api_key",
+    });
+  } catch (e) {
+    return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
+  }
+  const creds = await getCompanyCreds(apiKey.companyId);
+  try {
+    let result;
+    if (template) {
+      result = params?.length
+        ? await sendTemplateWithParams(to, template, params, language, creds)
+        : await sendTemplate(to, template, language, creds);
+    } else if (text) {
+      result = await sendText(to, text, creds);
+    } else {
+      await refundCredits(apiKey.companyId, creditsNeeded, "api_message_refund", { reason: "missing body" }).catch(() => {});
+      return res.status(400).json({ error: "text or template required" });
+    }
+    const cleanPhone = String(to).replace(/[^\d]/g, "");
+    const contact = await prisma.contact.findFirst({ where: { companyId: apiKey.companyId, phone: cleanPhone } });
+    if (contact) {
+      await prisma.message.create({
+        data: {
+          companyId: apiKey.companyId,
+          contactId: contact.id,
+          waId: result.messages?.[0]?.id || null,
+          direction: "out",
+          type: template ? "template" : "text",
+          text: text || `[Template: ${template}]`,
+          status: "sent",
+        },
+      });
+    }
+    res.json({ ok: true, messageId: result.messages?.[0]?.id || null });
+  } catch (e) {
+    await refundCredits(apiKey.companyId, creditsNeeded, "api_message_refund", {
+      to,
+      reason: e.message,
+      template: template || null,
+      channel: "api_key",
+    }).catch(() => {});
+    res.status(502).json({ error: e.message });
+  }
+});
+
+router.use(requireAuth);
+router.use(attachCompany);
+
 /* ------------------------------ Contacts ------------------------------- */
-router.get("/contacts", async (_req, res) => {
-  const contacts = await prisma.contact.findMany({ orderBy: { createdAt: "desc" } });
+router.get("/contacts", async (req, res) => {
+  const contacts = await prisma.contact.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   res.json(contacts.map((c) => ({ ...c, createdAt: c.createdAt.getTime() })));
 });
 
@@ -272,10 +505,11 @@ router.post("/contacts", async (req, res) => {
   const { name, phone, tags = [] } = req.body || {};
   if (!name || !phone) return res.status(400).json({ error: "name and phone required" });
   const cleanPhone = String(phone).replace(/[^\d]/g, "");
-  const count = await prisma.contact.count();
+  const count = await prisma.contact.count({ where: tenantWhere(req) });
   try {
     const contact = await prisma.contact.create({
       data: {
+        companyId: companyIdOf(req),
         name,
         phone: cleanPhone,
         tags: Array.isArray(tags) ? tags : String(tags).split(",").map((t) => t.trim()).filter(Boolean),
@@ -291,7 +525,8 @@ router.post("/contacts", async (req, res) => {
 
 router.delete("/contacts/:id", async (req, res) => {
   try {
-    await prisma.contact.delete({ where: { id: req.params.id } });
+    const deleted = await prisma.contact.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -302,7 +537,7 @@ router.delete("/contacts/:id", async (req, res) => {
 router.post("/contacts/import", async (req, res) => {
   const { contacts } = req.body || {};
   if (!Array.isArray(contacts)) return res.status(400).json({ error: "contacts array required" });
-  const start = await prisma.contact.count();
+  const start = await prisma.contact.count({ where: tenantWhere(req) });
   let added = 0, skipped = 0;
   for (const c of contacts) {
     const phone = String(c.phone || "").replace(/[^\d]/g, "");
@@ -311,7 +546,9 @@ router.post("/contacts/import", async (req, res) => {
       ? c.tags
       : String(c.tags || "").split(/[;|]/).map((t) => t.trim()).filter(Boolean);
     try {
-      await prisma.contact.create({ data: { name: String(c.name).trim(), phone, tags, color: pickColor(start + added) } });
+      await prisma.contact.create({
+        data: { companyId: companyIdOf(req), name: String(c.name).trim(), phone, tags, color: pickColor(start + added) },
+      });
       added++;
     } catch {
       skipped++; // duplicate phone / invalid
@@ -321,10 +558,19 @@ router.post("/contacts/import", async (req, res) => {
 });
 
 // Send a media file (image / document / video / audio) to a contact.
-router.post("/conversations/:id/media", upload.single("file"), async (req, res) => {
-  const contact = await prisma.contact.findUnique({ where: { id: req.params.id } });
+router.post("/conversations/:id/media", requireNotSuspended, upload.single("file"), async (req, res) => {
+  const contact = await tenantContact(req, req.params.id);
   if (!contact) return res.sendStatus(404);
   if (!req.file) return res.status(400).json({ error: "file required" });
+
+  const companyId = companyIdOf(req);
+  const pricing = await getPlatformPricing();
+  const creditsNeeded = pricing.creditPerOutbound || 1;
+  try {
+    await spendCredits(companyId, creditsNeeded, "message_send", { to: contact.phone, type: "media" });
+  } catch (e) {
+    return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
+  }
 
   const { originalname, mimetype, filename, path: tmpPath } = req.file;
   const storedName = filename + (path.extname(originalname) || "");
@@ -332,20 +578,36 @@ router.post("/conversations/:id/media", upload.single("file"), async (req, res) 
   const publicUrl = `${req.protocol}://${req.get("host")}/uploads/${storedName}`;
   const waType = waMediaType(mimetype);
   const caption = req.body?.caption || "";
+  const creds = await getCompanyCreds(companyId);
 
   let waId = null;
   try {
-    const mediaId = await uploadMedia(fs.readFileSync(path.join(UPLOAD_DIR, storedName)), mimetype, originalname);
+    const mediaId = await uploadMedia(fs.readFileSync(path.join(UPLOAD_DIR, storedName)), mimetype, originalname, creds);
     if (mediaId) {
-      const r = await sendMediaById(contact.phone, waType, mediaId, { filename: originalname, caption });
+      const r = await sendMediaById(contact.phone, waType, mediaId, { filename: originalname, caption }, creds);
       waId = r.messages?.[0]?.id || null;
     }
   } catch (e) {
+    await refundCredits(companyId, creditsNeeded, "message_refund", {
+      to: contact.phone,
+      reason: e.message,
+      type: "media",
+    }).catch(() => {});
     return res.status(502).json({ error: e.message });
   }
 
   const msg = await prisma.message.create({
-    data: { contactId: contact.id, waId, direction: "out", type: waType, text: caption || originalname, mediaUrl: publicUrl, filename: originalname, status: "sent" },
+    data: {
+      companyId,
+      contactId: contact.id,
+      waId,
+      direction: "out",
+      type: waType,
+      text: caption || originalname,
+      mediaUrl: publicUrl,
+      filename: originalname,
+      status: "sent",
+    },
   });
   res.status(201).json(toMessage(msg));
 });
@@ -355,21 +617,34 @@ router.patch("/conversations/:id/status", async (req, res) => {
   const { status } = req.body || {};
   if (!["open", "pending", "resolved"].includes(status)) return res.status(400).json({ error: "invalid status" });
   try {
-    const c = await prisma.contact.update({ where: { id: req.params.id }, data: { chatStatus: status } });
+    const existing = await tenantContact(req, req.params.id);
+    if (!existing) return res.sendStatus(404);
+    const c = await prisma.contact.update({ where: { id: existing.id }, data: { chatStatus: status } });
     fireEvent("chat.status", { name: c.name, phone: c.phone, status }).catch(() => {});
     logActivity(c.id, "status", `Chat marked ${status}`);
 
     // On resolve, optionally send a CSAT rating request.
     if (status === "resolved") {
-      const s = await prisma.setting.findUnique({ where: { id: "default" } });
+      const s = await prisma.setting.findUnique({ where: { companyId: companyIdOf(req) } });
       if (s?.csatEnabled) {
         try {
+          const creds = await getCompanyCreds(companyIdOf(req));
           const r = await sendButtons(c.phone, s.csatMessage, [
             { id: "csat:Great", title: "😀 Great" },
             { id: "csat:Okay", title: "🙂 Okay" },
             { id: "csat:Poor", title: "😞 Poor" },
-          ]);
-          await prisma.message.create({ data: { contactId: c.id, waId: r.messages?.[0]?.id || null, direction: "out", type: "interactive", text: s.csatMessage, status: "sent" } });
+          ], creds);
+          await prisma.message.create({
+            data: {
+              companyId: companyIdOf(req),
+              contactId: c.id,
+              waId: r.messages?.[0]?.id || null,
+              direction: "out",
+              type: "interactive",
+              text: s.csatMessage,
+              status: "sent",
+            },
+          });
         } catch (e) { console.error("[csat] send failed:", e.message); }
       }
     }
@@ -380,21 +655,22 @@ router.patch("/conversations/:id/status", async (req, res) => {
 });
 
 /* ---------------------------- Quick Replies ---------------------------- */
-router.get("/quick-replies", async (_req, res) => {
-  const items = await prisma.quickReply.findMany({ orderBy: { createdAt: "desc" } });
+router.get("/quick-replies", async (req, res) => {
+  const items = await prisma.quickReply.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   res.json(items.map((q) => ({ ...q, createdAt: q.createdAt.getTime() })));
 });
 
 router.post("/quick-replies", async (req, res) => {
   const { title, text } = req.body || {};
   if (!title || !text) return res.status(400).json({ error: "title and text required" });
-  const q = await prisma.quickReply.create({ data: { title, text } });
+  const q = await prisma.quickReply.create({ data: { companyId: companyIdOf(req), title, text } });
   res.status(201).json({ ...q, createdAt: q.createdAt.getTime() });
 });
 
 router.delete("/quick-replies/:id", async (req, res) => {
   try {
-    await prisma.quickReply.delete({ where: { id: req.params.id } });
+    const deleted = await prisma.quickReply.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -402,8 +678,8 @@ router.delete("/quick-replies/:id", async (req, res) => {
 });
 
 /* ------------------------------- Agents -------------------------------- */
-router.get("/agents", async (_req, res) => {
-  const agents = await prisma.agent.findMany({ orderBy: { createdAt: "asc" } });
+router.get("/agents", async (req, res) => {
+  const agents = await prisma.agent.findMany({ where: tenantWhere(req), orderBy: { createdAt: "asc" } });
   res.json(agents.map((a) => ({ ...a, createdAt: a.createdAt.getTime() })));
 });
 
@@ -412,8 +688,10 @@ router.post("/agents", async (req, res) => {
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
   const colors = ["#25D366", "#128C7E", "#34B7F1", "#7C3AED", "#F59E0B", "#EF4444"];
   try {
-    const count = await prisma.agent.count();
-    const agent = await prisma.agent.create({ data: { name, email, role, color: colors[count % colors.length] } });
+    const count = await prisma.agent.count({ where: tenantWhere(req) });
+    const agent = await prisma.agent.create({
+      data: { companyId: companyIdOf(req), name, email, role, color: colors[count % colors.length] },
+    });
     res.status(201).json({ ...agent, createdAt: agent.createdAt.getTime() });
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "Agent with this email already exists" });
@@ -423,8 +701,10 @@ router.post("/agents", async (req, res) => {
 
 router.delete("/agents/:id", async (req, res) => {
   try {
-    await prisma.contact.updateMany({ where: { assignedAgentId: req.params.id }, data: { assignedAgentId: null } });
-    await prisma.agent.delete({ where: { id: req.params.id } });
+    const agent = await prisma.agent.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (!agent) return res.sendStatus(404);
+    await prisma.contact.updateMany({ where: { assignedAgentId: agent.id, ...tenantWhere(req) }, data: { assignedAgentId: null } });
+    await prisma.agent.delete({ where: { id: agent.id } });
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -435,8 +715,14 @@ router.delete("/agents/:id", async (req, res) => {
 router.patch("/conversations/:id/assign", async (req, res) => {
   const { agentId } = req.body || {};
   try {
+    const existing = await tenantContact(req, req.params.id);
+    if (!existing) return res.sendStatus(404);
+    if (agentId) {
+      const agent = await prisma.agent.findFirst({ where: { id: agentId, ...tenantWhere(req) } });
+      if (!agent) return res.status(400).json({ error: "Invalid agent" });
+    }
     const contact = await prisma.contact.update({
-      where: { id: req.params.id },
+      where: { id: existing.id },
       data: { assignedAgentId: agentId || null },
       include: { assignedAgent: true },
     });
@@ -453,23 +739,27 @@ router.patch("/conversations/:id/assign", async (req, res) => {
 
 // Contact activity timeline (events).
 router.get("/conversations/:id/timeline", async (req, res) => {
-  const events = await prisma.event.findMany({ where: { contactId: req.params.id }, orderBy: { createdAt: "desc" }, take: 50 });
+  const contact = await tenantContact(req, req.params.id);
+  if (!contact) return res.sendStatus(404);
+  const events = await prisma.event.findMany({ where: { contactId: contact.id }, orderBy: { createdAt: "desc" }, take: 50 });
   res.json(events.map((e) => ({ ...e, createdAt: e.createdAt.getTime() })));
 });
 
 /* -------------------------- Contact notes ------------------------------ */
 router.get("/conversations/:id/notes", async (req, res) => {
-  const notes = await prisma.note.findMany({ where: { contactId: req.params.id }, orderBy: { createdAt: "desc" } });
+  const contact = await tenantContact(req, req.params.id);
+  if (!contact) return res.sendStatus(404);
+  const notes = await prisma.note.findMany({ where: { contactId: contact.id }, orderBy: { createdAt: "desc" } });
   res.json(notes.map((n) => ({ ...n, createdAt: n.createdAt.getTime() })));
 });
 
 router.post("/conversations/:id/notes", async (req, res) => {
   const { text, author = "You" } = req.body || {};
   if (!text) return res.status(400).json({ error: "text required" });
-  const contact = await prisma.contact.findUnique({ where: { id: req.params.id } });
+  const contact = await tenantContact(req, req.params.id);
   if (!contact) return res.sendStatus(404);
-  const note = await prisma.note.create({ data: { contactId: req.params.id, text, author } });
-  logActivity(req.params.id, "note", "Note added");
+  const note = await prisma.note.create({ data: { contactId: contact.id, text, author } });
+  logActivity(contact.id, "note", "Note added");
   res.status(201).json({ ...note, createdAt: note.createdAt.getTime() });
 });
 
@@ -486,7 +776,9 @@ router.delete("/notes/:id", async (req, res) => {
 router.patch("/conversations/:id/attributes", async (req, res) => {
   const { attributes } = req.body || {};
   try {
-    const contact = await prisma.contact.update({ where: { id: req.params.id }, data: { attributes: attributes || {} } });
+    const existing = await tenantContact(req, req.params.id);
+    if (!existing) return res.sendStatus(404);
+    const contact = await prisma.contact.update({ where: { id: existing.id }, data: { attributes: attributes || {} } });
     res.json({ attributes: contact.attributes });
   } catch {
     res.sendStatus(404);
@@ -494,21 +786,22 @@ router.patch("/conversations/:id/attributes", async (req, res) => {
 });
 
 /* --------------------------- Product catalog --------------------------- */
-router.get("/products", async (_req, res) => {
-  const products = await prisma.product.findMany({ orderBy: { createdAt: "desc" } });
+router.get("/products", async (req, res) => {
+  const products = await prisma.product.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   res.json(products.map((p) => ({ ...p, createdAt: p.createdAt.getTime() })));
 });
 
 router.post("/products", async (req, res) => {
   const { name, price = "", description = "", imageUrl = "" } = req.body || {};
   if (!name) return res.status(400).json({ error: "name required" });
-  const product = await prisma.product.create({ data: { name, price, description, imageUrl } });
+  const product = await prisma.product.create({ data: { companyId: companyIdOf(req), name, price, description, imageUrl } });
   res.status(201).json({ ...product, createdAt: product.createdAt.getTime() });
 });
 
 router.delete("/products/:id", async (req, res) => {
   try {
-    await prisma.product.delete({ where: { id: req.params.id } });
+    const deleted = await prisma.product.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -516,13 +809,15 @@ router.delete("/products/:id", async (req, res) => {
 });
 
 /* ------------------------------ Segments ------------------------------- */
-router.get("/segments", async (_req, res) => {
-  const segments = await prisma.segment.findMany({ orderBy: { createdAt: "desc" } });
+router.get("/segments", async (req, res) => {
+  const segments = await prisma.segment.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   const withCounts = await Promise.all(
     segments.map(async (s) => ({
       ...s,
       createdAt: s.createdAt.getTime(),
-      count: await prisma.contact.count({ where: await resolveAudience(`segment: ${s.name}`) }),
+      count: await prisma.contact.count({
+        where: { ...(await resolveAudience(`segment: ${s.name}`, companyIdOf(req))), ...tenantWhere(req) },
+      }),
     }))
   );
   res.json(withCounts);
@@ -531,13 +826,14 @@ router.get("/segments", async (_req, res) => {
 router.post("/segments", async (req, res) => {
   const { name, tags = [], match = "any" } = req.body || {};
   if (!name || !Array.isArray(tags) || !tags.length) return res.status(400).json({ error: "name and tags required" });
-  const seg = await prisma.segment.create({ data: { name, tags, match } });
+  const seg = await prisma.segment.create({ data: { companyId: companyIdOf(req), name, tags, match } });
   res.status(201).json({ ...seg, createdAt: seg.createdAt.getTime() });
 });
 
 router.delete("/segments/:id", async (req, res) => {
   try {
-    await prisma.segment.delete({ where: { id: req.params.id } });
+    const deleted = await prisma.segment.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -545,21 +841,22 @@ router.delete("/segments/:id", async (req, res) => {
 });
 
 /* ------------------------------- Labels -------------------------------- */
-router.get("/labels", async (_req, res) => {
-  const labels = await prisma.label.findMany({ orderBy: { createdAt: "asc" } });
+router.get("/labels", async (req, res) => {
+  const labels = await prisma.label.findMany({ where: tenantWhere(req), orderBy: { createdAt: "asc" } });
   res.json(labels.map((l) => ({ ...l, createdAt: l.createdAt.getTime() })));
 });
 
 router.post("/labels", async (req, res) => {
   const { name, color = "#25D366" } = req.body || {};
   if (!name) return res.status(400).json({ error: "name required" });
-  const label = await prisma.label.create({ data: { name, color } });
+  const label = await prisma.label.create({ data: { companyId: companyIdOf(req), name, color } });
   res.status(201).json({ ...label, createdAt: label.createdAt.getTime() });
 });
 
 router.delete("/labels/:id", async (req, res) => {
   try {
-    await prisma.label.delete({ where: { id: req.params.id } });
+    const deleted = await prisma.label.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -570,7 +867,12 @@ router.delete("/labels/:id", async (req, res) => {
 router.patch("/conversations/:id/labels", async (req, res) => {
   const { labels } = req.body || {};
   try {
-    const c = await prisma.contact.update({ where: { id: req.params.id }, data: { labels: Array.isArray(labels) ? labels : [] } });
+    const existing = await tenantContact(req, req.params.id);
+    if (!existing) return res.sendStatus(404);
+    const c = await prisma.contact.update({
+      where: { id: existing.id },
+      data: { labels: Array.isArray(labels) ? labels : [] },
+    });
     logActivity(c.id, "label", c.labels.length ? `Labels: ${c.labels.join(", ")}` : "Labels cleared");
     res.json({ labels: c.labels });
   } catch {
@@ -579,14 +881,14 @@ router.patch("/conversations/:id/labels", async (req, res) => {
 });
 
 /* ----------------------------- Inbox / chat ---------------------------- */
-router.get("/conversations", async (_req, res) => res.json(await buildConversations()));
+router.get("/conversations", async (req, res) => res.json(await buildConversations(req)));
 
 // Full-text search across all message content — returns matching chats + snippet.
 router.get("/search", async (req, res) => {
   const q = String(req.query.q || "").trim();
   if (q.length < 2) return res.json([]);
   const messages = await prisma.message.findMany({
-    where: { text: { contains: q, mode: "insensitive" } },
+    where: { text: { contains: q, mode: "insensitive" }, ...tenantWhere(req) },
     include: { contact: true },
     orderBy: { at: "desc" },
     take: 40,
@@ -602,7 +904,10 @@ router.get("/search", async (req, res) => {
 });
 
 router.get("/conversations/:id/messages", async (req, res) => {
-  const contact = await prisma.contact.findUnique({ where: { id: req.params.id }, include: { assignedAgent: true } });
+  const contact = await prisma.contact.findFirst({
+    where: { id: req.params.id, ...tenantWhere(req) },
+    include: { assignedAgent: true },
+  });
   if (!contact) return res.sendStatus(404);
   // Mark inbound as read.
   await prisma.message.updateMany({
@@ -625,57 +930,101 @@ router.get("/conversations/:id/messages", async (req, res) => {
   });
 });
 
-router.post("/conversations/:id/messages", async (req, res) => {
-  const contact = await prisma.contact.findUnique({ where: { id: req.params.id } });
+router.post("/conversations/:id/messages", requireNotSuspended, async (req, res) => {
+  const contact = await tenantContact(req, req.params.id);
   if (!contact) return res.sendStatus(404);
   const { text } = req.body || {};
   if (!text) return res.status(400).json({ error: "text required" });
+  const companyId = companyIdOf(req);
 
+  const pricing = await getPlatformPricing();
+  const creditsNeeded = pricing.creditPerOutbound || 1;
+  try {
+    await spendCredits(companyId, creditsNeeded, "message_send", { to: contact.phone });
+  } catch (e) {
+    return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
+  }
+
+  const creds = await getCompanyCreds(companyId);
   let waId = null;
   try {
-    const result = await sendText(contact.phone, text);
+    const result = await sendText(contact.phone, text, creds);
     waId = result.messages?.[0]?.id || null;
   } catch (e) {
+    await refundCredits(companyId, creditsNeeded, "message_refund", {
+      to: contact.phone,
+      reason: e.message,
+    }).catch(() => {});
     return res.status(502).json({ error: e.message });
   }
 
   const msg = await prisma.message.create({
-    data: { contactId: contact.id, waId, direction: "out", type: "text", text, status: "sent" },
+    data: {
+      companyId,
+      contactId: contact.id,
+      waId,
+      direction: "out",
+      type: "text",
+      text,
+      status: "sent",
+    },
   });
   res.status(201).json(toMessage(msg));
 });
 
 // Send an approved template to a contact (business-initiated — works outside the 24h window).
-router.post("/conversations/:id/send-template", async (req, res) => {
-  const contact = await prisma.contact.findUnique({ where: { id: req.params.id } });
+router.post("/conversations/:id/send-template", requireNotSuspended, async (req, res) => {
+  const contact = await tenantContact(req, req.params.id);
   if (!contact) return res.sendStatus(404);
   const { template, params = [], language = "en" } = req.body || {};
   if (!template) return res.status(400).json({ error: "template required" });
+  const companyId = companyIdOf(req);
 
+  const pricing = await getPlatformPricing();
+  const creditsNeeded = pricing.creditPerOutbound || 1;
+  try {
+    await spendCredits(companyId, creditsNeeded, "message_send", { to: contact.phone, template });
+  } catch (e) {
+    return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
+  }
+
+  const creds = await getCompanyCreds(companyId);
   let waId = null;
   try {
     const result = params.length
-      ? await sendTemplateWithParams(contact.phone, template, params, language)
-      : await sendTemplate(contact.phone, template, language);
+      ? await sendTemplateWithParams(contact.phone, template, params, language, creds)
+      : await sendTemplate(contact.phone, template, language, creds);
     waId = result.messages?.[0]?.id || null;
   } catch (e) {
+    await refundCredits(companyId, creditsNeeded, "message_refund", {
+      to: contact.phone,
+      reason: e.message,
+      template,
+    }).catch(() => {});
     return res.status(502).json({ error: e.message });
   }
 
-  // Render the template body with params for a readable inbox entry.
-  const tpl = await prisma.template.findUnique({ where: { name: template } });
+  const tpl = await prisma.template.findFirst({ where: { name: template, ...tenantWhere(req) } });
   let text = tpl?.body || `[Template: ${template}]`;
   params.forEach((p, i) => { text = text.replace(`{{${i + 1}}}`, p); });
 
   const msg = await prisma.message.create({
-    data: { contactId: contact.id, waId, direction: "out", type: "template", text, status: "sent" },
+    data: {
+      companyId: companyIdOf(req),
+      contactId: contact.id,
+      waId,
+      direction: "out",
+      type: "template",
+      text,
+      status: "sent",
+    },
   });
   res.status(201).json(toMessage(msg));
 });
 
 /* ------------------------------ Templates ------------------------------ */
-router.get("/templates", async (_req, res) => {
-  const templates = await prisma.template.findMany({ orderBy: { createdAt: "desc" } });
+router.get("/templates", async (req, res) => {
+  const templates = await prisma.template.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   res.json(templates.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
 });
 
@@ -684,7 +1033,6 @@ router.post("/templates", async (req, res) => {
   if (!name || !body) return res.status(400).json({ error: "name and body required" });
   const cleanName = String(name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
 
-  // Submit to Meta for approval (falls back to local-only if not live / on error).
   let status = "pending";
   let metaError = null;
   if (WA_LIVE) {
@@ -700,7 +1048,16 @@ router.post("/templates", async (req, res) => {
 
   try {
     const tpl = await prisma.template.create({
-      data: { name: cleanName, category, language, body, status, format, cards: format === "carousel" ? cards : undefined },
+      data: {
+        companyId: companyIdOf(req),
+        name: cleanName,
+        category,
+        language,
+        body,
+        status,
+        format,
+        cards: format === "carousel" ? cards : undefined,
+      },
     });
     res.status(201).json({ ...tpl, createdAt: tpl.createdAt.getTime(), metaError });
   } catch (e) {
@@ -710,20 +1067,29 @@ router.post("/templates", async (req, res) => {
 });
 
 // Pull the latest template statuses from Meta and reconcile the local list.
-router.post("/templates/sync", async (_req, res) => {
+router.post("/templates/sync", async (req, res) => {
   if (!WA_LIVE) return res.status(400).json({ error: "Not in live mode" });
   try {
     const metaTemplates = await listTemplates();
     for (const mt of metaTemplates) {
       const status = (mt.status || "").toLowerCase();
-      const existing = await prisma.template.findUnique({ where: { name: mt.name } });
+      const existing = await prisma.template.findFirst({ where: { name: mt.name, ...tenantWhere(req) } });
       if (existing) {
-        await prisma.template.update({ where: { name: mt.name }, data: { status, category: cap(mt.category), language: mt.language } });
+        await prisma.template.update({ where: { id: existing.id }, data: { status, category: cap(mt.category), language: mt.language } });
       } else {
-        await prisma.template.create({ data: { name: mt.name, status, category: cap(mt.category), language: mt.language, body: "(synced from Meta — edit in WhatsApp Manager)" } });
+        await prisma.template.create({
+          data: {
+            companyId: companyIdOf(req),
+            name: mt.name,
+            status,
+            category: cap(mt.category),
+            language: mt.language,
+            body: "(synced from Meta — edit in WhatsApp Manager)",
+          },
+        });
       }
     }
-    const all = await prisma.template.findMany({ orderBy: { createdAt: "desc" } });
+    const all = await prisma.template.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
     res.json(all.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
   } catch (e) {
     res.status(502).json({ error: e.message });
@@ -731,18 +1097,24 @@ router.post("/templates/sync", async (_req, res) => {
 });
 
 /* ------------------------------ Campaigns ------------------------------ */
-router.get("/campaigns", async (_req, res) => {
-  const campaigns = await prisma.campaign.findMany({ orderBy: { createdAt: "desc" } });
+router.get("/campaigns", async (req, res) => {
+  const campaigns = await prisma.campaign.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   res.json(campaigns.map((c) => ({ ...c, createdAt: c.createdAt.getTime(), scheduledAt: c.scheduledAt?.getTime() || null })));
 });
 
-router.post("/campaigns", async (req, res) => {
+router.post("/campaigns", requireNotSuspended, async (req, res) => {
   const { name, template, audience = "All contacts", scheduledAt } = req.body || {};
   if (!name || !template) return res.status(400).json({ error: "name and template required" });
-  const recipients = (await resolveAudienceContacts(audience)).length;
+  const audienceWhere = await resolveAudience(audience, companyIdOf(req));
+  const recipients = await prisma.contact.count({ where: { ...audienceWhere, ...tenantWhere(req) } });
   const campaign = await prisma.campaign.create({
     data: {
-      name, template, audience, recipients, status: "scheduled",
+      companyId: companyIdOf(req),
+      name,
+      template,
+      audience,
+      recipients,
+      status: "scheduled",
       scheduledAt: scheduledAt ? new Date(scheduledAt) : null,
     },
   });
@@ -750,8 +1122,8 @@ router.post("/campaigns", async (req, res) => {
 });
 
 // Broadcast engine — send now (the scheduler auto-runs scheduled ones).
-router.post("/campaigns/:id/send", async (req, res) => {
-  const campaign = await prisma.campaign.findUnique({ where: { id: req.params.id } });
+router.post("/campaigns/:id/send", requireNotSuspended, async (req, res) => {
+  const campaign = await prisma.campaign.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
   if (!campaign) return res.sendStatus(404);
   if (campaign.status === "running") return res.status(409).json({ error: "Campaign already running" });
   res.json({ ok: true, status: "running" });
@@ -759,8 +1131,12 @@ router.post("/campaigns/:id/send", async (req, res) => {
 });
 
 /* ----------------------------- Drip campaigns -------------------------- */
-router.get("/drips", async (_req, res) => {
-  const drips = await prisma.drip.findMany({ orderBy: { createdAt: "desc" }, include: { _count: { select: { enrollments: true } } } });
+router.get("/drips", async (req, res) => {
+  const drips = await prisma.drip.findMany({
+    where: tenantWhere(req),
+    orderBy: { createdAt: "desc" },
+    include: { _count: { select: { enrollments: true } } },
+  });
   res.json(drips.map((d) => ({ ...d, createdAt: d.createdAt.getTime(), enrolled: d._count.enrollments })));
 });
 
@@ -768,7 +1144,11 @@ router.post("/drips", async (req, res) => {
   const { name, steps } = req.body || {};
   if (!name) return res.status(400).json({ error: "name required" });
   const drip = await prisma.drip.create({
-    data: { name, steps: Array.isArray(steps) ? steps : [{ template: "", delayHours: 0 }] },
+    data: {
+      companyId: companyIdOf(req),
+      name,
+      steps: Array.isArray(steps) ? steps : [{ template: "", delayHours: 0 }],
+    },
   });
   res.status(201).json({ ...drip, createdAt: drip.createdAt.getTime(), enrolled: 0 });
 });
@@ -776,8 +1156,10 @@ router.post("/drips", async (req, res) => {
 router.patch("/drips/:id", async (req, res) => {
   const { name, enabled, steps } = req.body || {};
   try {
+    const existing = await prisma.drip.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (!existing) return res.sendStatus(404);
     const drip = await prisma.drip.update({
-      where: { id: req.params.id },
+      where: { id: existing.id },
       data: { ...(name !== undefined && { name }), ...(enabled !== undefined && { enabled }), ...(steps !== undefined && { steps }) },
     });
     res.json({ ...drip, createdAt: drip.createdAt.getTime() });
@@ -788,7 +1170,9 @@ router.patch("/drips/:id", async (req, res) => {
 
 router.delete("/drips/:id", async (req, res) => {
   try {
-    await prisma.drip.delete({ where: { id: req.params.id } });
+    const existing = await prisma.drip.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (!existing) return res.sendStatus(404);
+    await prisma.drip.delete({ where: { id: existing.id } });
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -796,31 +1180,36 @@ router.delete("/drips/:id", async (req, res) => {
 });
 
 // Enroll an audience into a drip.
-router.post("/drips/:id/enroll", async (req, res) => {
+router.post("/drips/:id/enroll", requireNotSuspended, async (req, res) => {
   const { audience = "All contacts" } = req.body || {};
-  const contacts = await prisma.contact.findMany({ where: await resolveAudience(audience) });
-  const enrolled = await enrollContacts(req.params.id, contacts);
+  const drip = await prisma.drip.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!drip) return res.sendStatus(404);
+  const audienceWhere = await resolveAudience(audience, companyIdOf(req));
+  const contacts = await prisma.contact.findMany({ where: { ...audienceWhere, ...tenantWhere(req) } });
+  const enrolled = await enrollContacts(drip.id, contacts);
   res.json({ enrolled });
 });
 
 /* ----------------------------- Automations ----------------------------- */
-router.get("/automations", async (_req, res) => {
-  const items = await prisma.automation.findMany({ orderBy: { createdAt: "desc" } });
+router.get("/automations", async (req, res) => {
+  const items = await prisma.automation.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   res.json(items.map((a) => ({ ...a, createdAt: a.createdAt.getTime() })));
 });
 
 router.post("/automations", async (req, res) => {
   const { name, keyword = "", matchType = "contains", reply } = req.body || {};
   if (!name || !reply) return res.status(400).json({ error: "name and reply required" });
-  const a = await prisma.automation.create({ data: { name, keyword, matchType, reply } });
+  const a = await prisma.automation.create({ data: { companyId: companyIdOf(req), name, keyword, matchType, reply } });
   res.status(201).json({ ...a, createdAt: a.createdAt.getTime() });
 });
 
 router.patch("/automations/:id", async (req, res) => {
   const { enabled, name, keyword, matchType, reply } = req.body || {};
   try {
+    const existing = await prisma.automation.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (!existing) return res.sendStatus(404);
     const a = await prisma.automation.update({
-      where: { id: req.params.id },
+      where: { id: existing.id },
       data: {
         ...(enabled !== undefined && { enabled }),
         ...(name !== undefined && { name }),
@@ -837,7 +1226,8 @@ router.patch("/automations/:id", async (req, res) => {
 
 router.delete("/automations/:id", async (req, res) => {
   try {
-    await prisma.automation.delete({ where: { id: req.params.id } });
+    const deleted = await prisma.automation.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -845,8 +1235,8 @@ router.delete("/automations/:id", async (req, res) => {
 });
 
 /* ------------------------- Chatbot Flows ------------------------------- */
-router.get("/flows", async (_req, res) => {
-  const flows = await prisma.flow.findMany({ orderBy: { createdAt: "desc" } });
+router.get("/flows", async (req, res) => {
+  const flows = await prisma.flow.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   res.json(flows.map((f) => ({ ...f, createdAt: f.createdAt.getTime() })));
 });
 
@@ -859,7 +1249,13 @@ router.post("/flows", async (req, res) => {
     { id: "agent", message: "Sure! One of our agents will reach out to you shortly. 🙌", buttons: [] },
   ];
   const flow = await prisma.flow.create({
-    data: { name, triggerType, trigger, steps: Array.isArray(steps) && steps.length ? steps : defaultSteps },
+    data: {
+      companyId: companyIdOf(req),
+      name,
+      triggerType,
+      trigger,
+      steps: Array.isArray(steps) && steps.length ? steps : defaultSteps,
+    },
   });
   res.status(201).json({ ...flow, createdAt: flow.createdAt.getTime() });
 });
@@ -867,8 +1263,10 @@ router.post("/flows", async (req, res) => {
 router.patch("/flows/:id", async (req, res) => {
   const { name, triggerType, trigger, enabled, steps } = req.body || {};
   try {
+    const existing = await prisma.flow.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (!existing) return res.sendStatus(404);
     const flow = await prisma.flow.update({
-      where: { id: req.params.id },
+      where: { id: existing.id },
       data: {
         ...(name !== undefined && { name }),
         ...(triggerType !== undefined && { triggerType }),
@@ -885,8 +1283,10 @@ router.patch("/flows/:id", async (req, res) => {
 
 router.delete("/flows/:id", async (req, res) => {
   try {
-    await prisma.contact.updateMany({ where: { activeFlowId: req.params.id }, data: { activeFlowId: null, activeFlowStep: null } });
-    await prisma.flow.delete({ where: { id: req.params.id } });
+    const existing = await prisma.flow.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (!existing) return res.sendStatus(404);
+    await prisma.contact.updateMany({ where: { activeFlowId: existing.id, ...tenantWhere(req) }, data: { activeFlowId: null, activeFlowStep: null } });
+    await prisma.flow.delete({ where: { id: existing.id } });
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -894,12 +1294,385 @@ router.delete("/flows/:id", async (req, res) => {
 });
 
 /* ------------------------------ Settings ------------------------------- */
-router.get("/settings", async (_req, res) => {
-  const s = await prisma.setting.upsert({ where: { id: "default" }, update: {}, create: { id: "default" } });
-  res.json(s);
+router.get("/settings", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: {},
+    create: { companyId, businessName: req.company?.name || "Nexwapi" },
+  });
+  const wa = await prisma.whatsAppAccount.findFirst({
+    where: { companyId, isDefault: true },
+  });
+  res.json({
+    ...s,
+    whatsappConnected: Boolean(wa?.isConnected),
+    whatsapp: wa
+      ? {
+          id: wa.id,
+          businessName: wa.businessName || wa.verifiedName,
+          phoneNumber: wa.displayPhoneNumber || wa.phoneNumber,
+          qualityRating: wa.qualityRating,
+          messagingLimit: wa.messagingLimit,
+          verificationStatus: wa.verificationStatus,
+          webhookStatus: wa.webhookStatus,
+          connectedSince: wa.connectedAt ? wa.connectedAt.getTime() : null,
+          status: wa.status,
+        }
+      : null,
+    meta: {
+      embeddedSignupReady: Boolean(process.env.WHATSAPP_APP_ID && process.env.WHATSAPP_CONFIG_ID),
+      appId: process.env.WHATSAPP_APP_ID || null,
+      configId: process.env.WHATSAPP_CONFIG_ID || null,
+      graphVersion: process.env.WHATSAPP_API_VERSION || "v22.0",
+    },
+  });
+});
+
+/* --------------------- Client WhatsApp account ------------------------ */
+router.get("/whatsapp/account", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+  if (!wa) return res.json({ connected: false, account: null });
+  res.json({
+    connected: wa.isConnected,
+    account: {
+      id: wa.id,
+      businessName: wa.businessName || wa.verifiedName,
+      phoneNumber: wa.displayPhoneNumber || wa.phoneNumber,
+      phoneNumberId: wa.phoneNumberId,
+      wabaId: wa.wabaId,
+      qualityRating: wa.qualityRating || "UNKNOWN",
+      messagingLimit: wa.messagingLimit || "—",
+      verificationStatus: wa.verificationStatus || "unverified",
+      webhookStatus: wa.webhookStatus,
+      connectedSince: wa.connectedAt ? wa.connectedAt.getTime() : null,
+      status: wa.status,
+      lastError: wa.lastError,
+      hasToken: Boolean(wa.accessToken),
+      live: Boolean(wa.phoneNumberId && wa.accessToken),
+    },
+    webhook: {
+      url: `${process.env.PUBLIC_API_URL || ""}/api/whatsapp/webhook`,
+      verifyToken: wa.verifyToken || process.env.WHATSAPP_VERIFY_TOKEN || null,
+    },
+  });
+});
+
+// Manual connect — client onboarding with real number + optional Meta Cloud API credentials.
+router.post("/whatsapp/connect", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const {
+    phoneNumberId,
+    wabaId,
+    accessToken,
+    businessName,
+    displayPhoneNumber,
+    phoneNumber,
+    verifyToken,
+  } = req.body || {};
+
+  const display = String(displayPhoneNumber || phoneNumber || "").trim();
+  const biz = String(businessName || req.company?.name || "").trim();
+  if (!display) return res.status(400).json({ error: "WhatsApp phone number is required" });
+  if (!biz) return res.status(400).json({ error: "Business name is required" });
+
+  const cleanPhone = display.replace(/[^\d+]/g, "");
+  const hasMeta = Boolean(phoneNumberId && accessToken);
+  const existing = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+
+  let qualityRating = existing?.qualityRating || null;
+  let messagingLimit = existing?.messagingLimit || null;
+  let verificationStatus = hasMeta ? "pending" : "unverified";
+  let verifiedName = null;
+  let metaPhone = null;
+  let lastError = null;
+
+  // If Meta credentials provided, verify against Graph API and pull live metadata.
+  if (hasMeta) {
+    try {
+      const ver = process.env.WHATSAPP_API_VERSION || "v22.0";
+      const url = `https://graph.facebook.com/${ver}/${phoneNumberId}?fields=display_phone_number,verified_name,quality_rating,messaging_limit_tier&access_token=${encodeURIComponent(accessToken)}`;
+      const r = await fetch(url);
+      const j = await r.json();
+      if (!r.ok) {
+        lastError = j?.error?.message || "Meta API rejected credentials";
+        return res.status(400).json({ error: lastError, meta: j?.error || null });
+      }
+      metaPhone = j.display_phone_number || null;
+      verifiedName = j.verified_name || null;
+      qualityRating = j.quality_rating || "UNKNOWN";
+      messagingLimit = j.messaging_limit_tier || j.messaging_limit || "—";
+      verificationStatus = "verified";
+    } catch (e) {
+      return res.status(502).json({ error: e?.message || "Could not reach Meta API" });
+    }
+  }
+
+  const data = {
+    phoneNumberId: phoneNumberId || existing?.phoneNumberId || null,
+    wabaId: wabaId || existing?.wabaId || null,
+    accessToken: accessToken || existing?.accessToken || null,
+    businessName: biz,
+    verifiedName: verifiedName || existing?.verifiedName || null,
+    displayPhoneNumber: metaPhone || display,
+    phoneNumber: cleanPhone,
+    verifyToken: verifyToken || process.env.WHATSAPP_VERIFY_TOKEN || existing?.verifyToken || `nex_${companyId.slice(-8)}`,
+    isConnected: true,
+    status: "connected",
+    qualityRating,
+    messagingLimit,
+    verificationStatus,
+    webhookStatus: hasMeta ? "pending" : "pending",
+    connectedAt: existing?.connectedAt || new Date(),
+    lastSyncAt: new Date(),
+    lastError,
+  };
+
+  const wa = existing
+    ? await prisma.whatsAppAccount.update({ where: { id: existing.id }, data })
+    : await prisma.whatsAppAccount.create({ data: { ...data, companyId, isDefault: true } });
+
+  const host = process.env.PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`;
+  res.json({
+    ok: true,
+    live: hasMeta,
+    account: wa,
+    webhook: {
+      url: `${host}/api/whatsapp/webhook`,
+      verifyToken: wa.verifyToken,
+      fields: ["messages", "message_template_status_update"],
+    },
+  });
+});
+
+router.post("/whatsapp/disconnect", async (req, res) => {
+  const companyId = companyIdOf(req);
+  await prisma.whatsAppAccount.updateMany({
+    where: { companyId },
+    data: { isConnected: false, status: "disconnected", accessToken: null, webhookStatus: "pending" },
+  });
+  res.json({ ok: true });
+});
+
+router.post("/whatsapp/refresh", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+  if (!wa) return res.status(404).json({ error: "No WhatsApp account" });
+  if (!wa.accessToken) return res.status(400).json({ error: "No access token stored — reconnect via Facebook" });
+
+  try {
+    const longLived = await exchangeForLongLivedToken(wa.accessToken);
+    const token = longLived.access_token || wa.accessToken;
+    let phoneMeta = null;
+    if (wa.phoneNumberId) {
+      phoneMeta = await fetchPhoneDetails(wa.phoneNumberId, token).catch(() => null);
+    }
+    const updated = await prisma.whatsAppAccount.update({
+      where: { id: wa.id },
+      data: {
+        accessToken: token,
+        tokenExpiresAt: longLived.expires_in
+          ? new Date(Date.now() + Number(longLived.expires_in) * 1000)
+          : wa.tokenExpiresAt,
+        qualityRating: phoneMeta?.quality_rating || wa.qualityRating,
+        messagingLimit: phoneMeta?.messaging_limit_tier || wa.messagingLimit,
+        verifiedName: phoneMeta?.verified_name || wa.verifiedName,
+        displayPhoneNumber: phoneMeta?.display_phone_number || wa.displayPhoneNumber,
+        lastSyncAt: new Date(),
+        lastError: null,
+        isConnected: true,
+        status: "connected",
+      },
+    });
+    res.json({ ok: true, account: updated });
+  } catch (e) {
+    await prisma.whatsAppAccount.update({
+      where: { id: wa.id },
+      data: { lastError: e.message, lastSyncAt: new Date() },
+    }).catch(() => {});
+    res.status(400).json({ error: e.message || "Token refresh failed — please reconnect WhatsApp" });
+  }
+});
+
+/* -------- Meta Embedded Signup (Facebook Login) -------- */
+router.get("/whatsapp/meta-config", (_req, res) => {
+  const host = process.env.PUBLIC_API_URL || "";
+  res.json({
+    ...metaSignupConfig(),
+    webhookUrl: `${host}/api/whatsapp/webhook`,
+    verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || null,
+  });
+});
+
+router.post("/whatsapp/embedded-signup", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const { code, redirectUri, wabaId, phoneNumberId, businessId } = req.body || {};
+  if (!code) return res.status(400).json({ error: "OAuth code required from Facebook Login" });
+
+  try {
+    const tokenData = await exchangeCodeForToken(code, redirectUri || process.env.WHATSAPP_REDIRECT_URI);
+    let accessToken = tokenData.access_token;
+    if (!accessToken) return res.status(400).json({ error: "No access token from Meta" });
+
+    // Upgrade to long-lived token (~60 days) for production reliability
+    let expiresIn = tokenData.expires_in;
+    try {
+      const longLived = await exchangeForLongLivedToken(accessToken);
+      if (longLived.access_token) {
+        accessToken = longLived.access_token;
+        expiresIn = longLived.expires_in || expiresIn;
+      }
+    } catch (e) {
+      console.warn("[embedded-signup] long-lived exchange skipped:", e.message);
+    }
+
+    let finalWaba = wabaId;
+    let finalPhoneId = phoneNumberId;
+    let phoneMeta = null;
+    let finalBusinessId = businessId || null;
+
+    // Discover WABA from Graph if session payload didn't arrive yet
+    if (!finalWaba) {
+      const shared = await fetchSharedWabas(accessToken).catch(() => []);
+      if (shared[0]) {
+        finalWaba = shared[0].id;
+        finalBusinessId = finalBusinessId || shared[0].businessId;
+      }
+    }
+
+    if (finalWaba && !finalPhoneId) {
+      const phones = await fetchPhoneNumbers(finalWaba, accessToken);
+      if (phones[0]) {
+        finalPhoneId = phones[0].id;
+        phoneMeta = phones[0];
+      }
+    }
+    if (finalPhoneId && !phoneMeta) {
+      phoneMeta = await fetchPhoneDetails(finalPhoneId, accessToken);
+    }
+    if (!finalPhoneId) {
+      return res.status(400).json({
+        error: "phoneNumberId required — complete Embedded Signup and pass session info, then retry",
+      });
+    }
+
+    if (finalWaba) {
+      await subscribeWabaWebhooks(finalWaba, accessToken).catch((e) =>
+        console.warn("[wa] subscribe webhook:", e.message)
+      );
+    }
+
+    const existing = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+    const data = {
+      businessId: finalBusinessId || null,
+      wabaId: finalWaba || null,
+      phoneNumberId: finalPhoneId,
+      accessToken,
+      displayPhoneNumber: phoneMeta?.display_phone_number || null,
+      phoneNumber: String(phoneMeta?.display_phone_number || "").replace(/[^\d]/g, "") || null,
+      businessName: phoneMeta?.verified_name || req.company?.name || null,
+      verifiedName: phoneMeta?.verified_name || null,
+      qualityRating: phoneMeta?.quality_rating || "UNKNOWN",
+      messagingLimit: phoneMeta?.messaging_limit_tier || "—",
+      verificationStatus: "verified",
+      webhookStatus: finalWaba ? "connected" : "pending",
+      isConnected: true,
+      status: "connected",
+      verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || `nex_${companyId.slice(-8)}`,
+      connectedAt: new Date(),
+      lastSyncAt: new Date(),
+      lastError: null,
+      tokenExpiresAt: expiresIn
+        ? new Date(Date.now() + Number(expiresIn) * 1000)
+        : null,
+    };
+
+    const wa = existing
+      ? await prisma.whatsAppAccount.update({ where: { id: existing.id }, data })
+      : await prisma.whatsAppAccount.create({ data: { ...data, companyId, isDefault: true } });
+
+    const host = process.env.PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`;
+    res.json({
+      ok: true,
+      live: true,
+      account: wa,
+      webhook: {
+        url: `${host}/api/whatsapp/webhook`,
+        verifyToken: wa.verifyToken,
+      },
+    });
+  } catch (e) {
+    console.error("[embedded-signup]", e.message);
+    res.status(400).json({ error: e.message || "Embedded Signup failed" });
+  }
+});
+
+/* ------------------------------ Wallet -------------------------------- */
+router.get("/wallet", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  const pricing = await getPlatformPricing();
+  if (!company) return res.status(404).json({ error: "not found" });
+  res.json({
+    walletBalancePaise: company.walletBalancePaise,
+    messageCredits: company.messageCredits,
+    freeAccess: company.freeAccess,
+    creditsPerRupee: pricing.creditsPerRupee,
+    creditPerOutbound: pricing.creditPerOutbound,
+    creditPerInbound: pricing.creditPerInbound,
+  });
+});
+
+router.get("/wallet/transactions", async (req, res) => {
+  const txns = await prisma.walletTransaction.findMany({
+    where: tenantWhere(req),
+    orderBy: { createdAt: "desc" },
+    take: 100,
+  });
+  res.json(txns.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
+});
+
+router.post("/wallet/recharge", async (req, res) => {
+  if (!RAZORPAY_ENABLED) return res.status(503).json({ error: "Payments not configured" });
+  const companyId = companyIdOf(req);
+  const amountRupees = Math.max(1, Number(req.body?.amountRupees) || 0);
+  if (amountRupees < 1) return res.status(400).json({ error: "amountRupees required (min ₹1)" });
+  const amount = Math.round(amountRupees * 100);
+  const pricing = await getPlatformPricing();
+  const credits = creditsFromPaise(amount, pricing.creditsPerRupee);
+  try {
+    const receipt = `wlt_${req.user.id.slice(-8)}_${Date.now().toString(36)}`;
+    const order = await razorpay().orders.create({ amount, currency: "INR", receipt });
+    await prisma.payment.create({
+      data: {
+        userId: req.user.id,
+        companyId,
+        plan: normalizePlan(req.company?.plan || "trial"),
+        type: "wallet_recharge",
+        amount,
+        currency: "INR",
+        status: "created",
+        creditsAdded: credits,
+        razorpayOrderId: order.id,
+      },
+    });
+    res.json({
+      orderId: order.id,
+      amount,
+      currency: "INR",
+      keyId: RAZORPAY_KEY_ID,
+      credits,
+      creditsPerRupee: pricing.creditsPerRupee,
+    });
+  } catch (e) {
+    console.error("[wallet/recharge]", e?.message || e);
+    res.status(502).json({ error: "Could not start wallet recharge" });
+  }
 });
 
 router.patch("/settings", async (req, res) => {
+  const companyId = companyIdOf(req);
   const { awayEnabled, awayMessage, hoursStart, hoursEnd, days, businessName, autoAssign, webhookUrl, csatEnabled, csatMessage } = req.body || {};
   const data = {
     ...(awayEnabled !== undefined && { awayEnabled }),
@@ -913,97 +1686,75 @@ router.patch("/settings", async (req, res) => {
     ...(csatEnabled !== undefined && { csatEnabled }),
     ...(csatMessage !== undefined && { csatMessage }),
   };
-  const s = await prisma.setting.upsert({ where: { id: "default" }, update: data, create: { id: "default", ...data } });
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: data,
+    create: { companyId, businessName: req.company?.name || "Nexwapi", ...data },
+  });
   res.json(s);
 });
 
 /* ------------------------- Developer API keys -------------------------- */
-router.get("/api-keys", async (_req, res) => {
-  const keys = await prisma.apiKey.findMany({ orderBy: { createdAt: "desc" } });
-  res.json(keys.map((k) => ({ ...k, createdAt: k.createdAt.getTime(), lastUsedAt: k.lastUsedAt?.getTime() || null })));
+router.get("/api-keys", async (req, res) => {
+  const keys = await prisma.apiKey.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
+  res.json(keys.map(publicApiKeyRow));
 });
 
-router.post("/api-keys", async (req, res) => {
+router.post("/api-keys", requireFeature("api"), async (req, res) => {
   const { name = "Default key" } = req.body || {};
-  const key = "nex_" + crypto.randomBytes(24).toString("hex");
-  const k = await prisma.apiKey.create({ data: { name, key } });
-  res.status(201).json({ ...k, createdAt: k.createdAt.getTime(), lastUsedAt: null });
+  const rawKey = "nex_" + crypto.randomBytes(24).toString("hex");
+  const hashed = `sha256:${hashApiKey(rawKey)}`;
+  const k = await prisma.apiKey.create({
+    data: { companyId: companyIdOf(req), name, key: hashed },
+  });
+  res.status(201).json({
+    ...publicApiKeyRow(k),
+    key: rawKey,
+    keyPrefix: keyPrefix(rawKey),
+    oneTimeVisible: true,
+  });
 });
 
 router.delete("/api-keys/:id", async (req, res) => {
   try {
-    await prisma.apiKey.delete({ where: { id: req.params.id } });
+    const deleted = await prisma.apiKey.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
   }
 });
 
-// Public send API (for Zapier / Shopify / custom integrations). Auth via x-api-key.
-router.post("/v1/messages", async (req, res) => {
-  const key = req.headers["x-api-key"];
-  if (!key) return res.status(401).json({ error: "Missing x-api-key header" });
-  const apiKey = await prisma.apiKey.findUnique({ where: { key } });
-  if (!apiKey) return res.status(401).json({ error: "Invalid API key" });
-  prisma.apiKey.update({ where: { id: apiKey.id }, data: { lastUsedAt: new Date() } }).catch(() => {});
-
-  const { to, text, template, params, language = "en" } = req.body || {};
-  if (!to) return res.status(400).json({ error: "to (phone number) required" });
-  try {
-    let result;
-    if (template) {
-      result = params?.length
-        ? await sendTemplateWithParams(to, template, params, language)
-        : await sendTemplate(to, template, language);
-    } else if (text) {
-      result = await sendText(to, text);
-    } else {
-      return res.status(400).json({ error: "text or template required" });
-    }
-    // Log the outbound message if the recipient is a known contact.
-    const contact = await prisma.contact.findUnique({ where: { phone: String(to).replace(/[^\d]/g, "") } });
-    if (contact) {
-      await prisma.message.create({
-        data: { contactId: contact.id, waId: result.messages?.[0]?.id || null, direction: "out", type: template ? "template" : "text", text: text || `[Template: ${template}]`, status: "sent" },
-      });
-    }
-    res.json({ ok: true, messageId: result.messages?.[0]?.id || null });
-  } catch (e) {
-    res.status(502).json({ error: e.message });
-  }
-});
-
 /* -------------------------- Reports (deep) ----------------------------- */
-router.get("/reports", async (_req, res) => {
-  const agents = await prisma.agent.findMany({ orderBy: { createdAt: "asc" } });
+router.get("/reports", async (req, res) => {
+  const tw = tenantWhere(req);
+  const agents = await prisma.agent.findMany({ where: tw, orderBy: { createdAt: "asc" } });
   const agentStats = await Promise.all(
     agents.map(async (a) => ({
       name: a.name,
       color: a.color,
-      assigned: await prisma.contact.count({ where: { assignedAgentId: a.id } }),
-      resolved: await prisma.contact.count({ where: { assignedAgentId: a.id, chatStatus: "resolved" } }),
+      assigned: await prisma.contact.count({ where: { assignedAgentId: a.id, ...tw } }),
+      resolved: await prisma.contact.count({ where: { assignedAgentId: a.id, chatStatus: "resolved", ...tw } }),
     }))
   );
 
   const [open, pending, resolved, contactsTotal, inbound, outbound] = await Promise.all([
-    prisma.contact.count({ where: { chatStatus: "open" } }),
-    prisma.contact.count({ where: { chatStatus: "pending" } }),
-    prisma.contact.count({ where: { chatStatus: "resolved" } }),
-    prisma.contact.count(),
-    prisma.message.count({ where: { direction: "in" } }),
-    prisma.message.count({ where: { direction: "out" } }),
+    prisma.contact.count({ where: { chatStatus: "open", ...tw } }),
+    prisma.contact.count({ where: { chatStatus: "pending", ...tw } }),
+    prisma.contact.count({ where: { chatStatus: "resolved", ...tw } }),
+    prisma.contact.count({ where: tw }),
+    prisma.message.count({ where: { direction: "in", ...tw } }),
+    prisma.message.count({ where: { direction: "out", ...tw } }),
   ]);
 
-  // Top tags
-  const contacts = await prisma.contact.findMany({ select: { tags: true } });
+  const contacts = await prisma.contact.findMany({ where: tw, select: { tags: true } });
   const tagMap = {};
   contacts.forEach((c) => (c.tags || []).forEach((t) => (tagMap[t] = (tagMap[t] || 0) + 1)));
   const topTags = Object.entries(tagMap).map(([tag, count]) => ({ tag, count })).sort((a, b) => b.count - a.count).slice(0, 8);
 
-  const campaigns = await prisma.campaign.findMany({ orderBy: { createdAt: "desc" }, take: 6 });
+  const campaigns = await prisma.campaign.findMany({ where: tw, orderBy: { createdAt: "desc" }, take: 6 });
 
-  // Response-time: avg minutes from a contact's first inbound to our first reply.
-  const withMsgs = await prisma.contact.findMany({ include: { messages: { orderBy: { at: "asc" } } } });
+  const withMsgs = await prisma.contact.findMany({ where: tw, include: { messages: { orderBy: { at: "asc" } } } });
   let totalRespMin = 0, responded = 0, inboundContacts = 0;
   for (const c of withMsgs) {
     const firstIn = c.messages.find((m) => m.direction === "in");
@@ -1033,11 +1784,12 @@ router.get("/reports", async (_req, res) => {
 });
 
 /* ------------------------------ Analytics ------------------------------ */
-router.get("/analytics", async (_req, res) => {
+router.get("/analytics", async (req, res) => {
+  const tw = tenantWhere(req);
   const [contacts, agg, conversations] = await Promise.all([
-    prisma.contact.count(),
-    prisma.campaign.aggregate({ _sum: { sent: true, delivered: true, read: true, replied: true }, _count: true }),
-    buildConversations(),
+    prisma.contact.count({ where: tw }),
+    prisma.campaign.aggregate({ where: tw, _sum: { sent: true, delivered: true, read: true, replied: true }, _count: true }),
+    buildConversations(req),
   ]);
 
   const sent = agg._sum.sent || 0;

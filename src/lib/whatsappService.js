@@ -1,7 +1,7 @@
 // lib/whatsappService.js
-// One low-level send() plus helpers for text, template, and template-with-variables.
-// Falls back to a simulated response when WA_LIVE is false (no real Meta creds).
-import { WA, WA_BASE, WA_LIVE } from "../config/whatsapp.js";
+// Tenant-aware WhatsApp Cloud API helpers.
+// Pass `creds` { phoneNumberId, accessToken } for per-client sends; else fall back to env.
+import { WA, WA_LIVE } from "../config/whatsapp.js";
 import { nanoid } from "nanoid";
 
 function simulate(payload) {
@@ -10,14 +10,28 @@ function simulate(payload) {
   return { messaging_product: "whatsapp", messages: [{ id }], demo: true };
 }
 
-// Low-level call to the WhatsApp messages endpoint
-async function send(payload) {
-  if (!WA_LIVE) return simulate(payload);
+function resolveCreds(creds) {
+  const phoneNumberId = creds?.phoneNumberId || WA.phoneNumberId;
+  const accessToken = creds?.accessToken || WA.accessToken;
+  const live = Boolean(
+    phoneNumberId &&
+    accessToken &&
+    phoneNumberId !== "123456789012345" &&
+    !String(accessToken).startsWith("EAAG... ")
+  );
+  const version = WA.version || "v22.0";
+  const base = `https://graph.facebook.com/${version}/${phoneNumberId}`;
+  return { phoneNumberId, accessToken, live, base };
+}
 
-  const res = await fetch(`${WA_BASE}/messages`, {
+async function send(payload, creds) {
+  const { accessToken, live, base } = resolveCreds(creds);
+  if (!live) return simulate(payload);
+
+  const res = await fetch(`${base}/messages`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${WA.accessToken}`,
+      Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ messaging_product: "whatsapp", ...payload }),
@@ -26,17 +40,14 @@ async function send(payload) {
   if (!res.ok) {
     throw new Error(`WhatsApp send failed: ${res.status} ${JSON.stringify(data)}`);
   }
-  return data; // contains messages[0].id
+  return data;
 }
 
-// Plain text — ONLY within 24h of the user's last message
-export function sendText(to, body) {
-  return send({ to, type: "text", text: { body } });
+export function sendText(to, body, creds) {
+  return send({ to, type: "text", text: { body } }, creds);
 }
 
-// Interactive reply buttons (max 3) — used by the chatbot flow builder.
-// Only valid within the 24h customer-service window.
-export function sendButtons(to, bodyText, buttons) {
+export function sendButtons(to, bodyText, buttons, creds) {
   return send({
     to,
     type: "interactive",
@@ -50,24 +61,22 @@ export function sendButtons(to, bodyText, buttons) {
         })),
       },
     },
-  });
+  }, creds);
 }
 
-// Template — for business-initiated messages (no variables)
-export function sendTemplate(to, name, lang = "en") {
-  return send({ to, type: "template", template: { name, language: { code: lang } } });
+export function sendTemplate(to, name, lang = "en", creds) {
+  return send({ to, type: "template", template: { name, language: { code: lang } } }, creds);
 }
 
-/* ------------------------------- Media -------------------------------- */
-// Upload a file to WhatsApp; returns a media id (or null in demo mode).
-export async function uploadMedia(buffer, mimetype, filename) {
-  if (!WA_LIVE) return null;
+export async function uploadMedia(buffer, mimetype, filename, creds) {
+  const { accessToken, live, base } = resolveCreds(creds);
+  if (!live) return null;
   const form = new FormData();
   form.append("messaging_product", "whatsapp");
   form.append("file", new Blob([buffer], { type: mimetype }), filename);
-  const res = await fetch(`${WA_BASE}/media`, {
+  const res = await fetch(`${base}/media`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${WA.accessToken}` },
+    headers: { Authorization: `Bearer ${accessToken}` },
     body: form,
   });
   const data = await res.json();
@@ -75,176 +84,83 @@ export async function uploadMedia(buffer, mimetype, filename) {
   return data.id;
 }
 
-// Send a previously-uploaded media file by id (image | document | video | audio).
-export function sendMediaById(to, waType, mediaId, { filename, caption } = {}) {
+export function sendMediaById(to, waType, mediaId, { filename, caption } = {}, creds) {
   const media = { id: mediaId };
+  if (filename) media.filename = filename;
   if (caption) media.caption = caption;
-  if (waType === "document" && filename) media.filename = filename;
-  return send({ to, type: waType, [waType]: media });
+  return send({ to, type: waType, [waType]: media }, creds);
 }
 
-// Resumable upload → returns a media "handle" used in template example headers.
-export async function uploadMediaHandle(buffer, mimetype) {
-  if (!WA_LIVE || !WA.appId) throw new Error("Live mode + WHATSAPP_APP_ID required for media templates");
-  const start = await fetch(`https://graph.facebook.com/${WA.version}/${WA.appId}/uploads?file_length=${buffer.length}&file_type=${encodeURIComponent(mimetype)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${WA.accessToken}` },
-  });
-  const s = await start.json();
-  if (!s.id) throw new Error(`upload session failed: ${JSON.stringify(s)}`);
-  const up = await fetch(`https://graph.facebook.com/${WA.version}/${s.id}`, {
-    method: "POST",
-    headers: { Authorization: `OAuth ${WA.accessToken}`, file_offset: "0" },
-    body: buffer,
-  });
-  const u = await up.json();
-  if (!u.h) throw new Error(`upload failed: ${JSON.stringify(u)}`);
-  return u.h;
-}
-
-// Create a carousel template (body + cards with image header + buttons).
-export async function createCarouselTemplate({ name, category, language, body, cards }) {
-  const cardComponents = [];
-  for (const card of cards) {
-    // Upload the card image to get a header handle.
-    const imgRes = await fetch(card.imageUrl);
-    const buffer = Buffer.from(await imgRes.arrayBuffer());
-    const mimetype = imgRes.headers.get("content-type") || "image/jpeg";
-    const handle = await uploadMediaHandle(buffer, mimetype);
-    const comps = [
-      { type: "HEADER", format: "IMAGE", example: { header_handle: [handle] } },
-      { type: "BODY", text: card.body || " " },
-    ];
-    const buttons = (card.buttons || []).filter((b) => b.text).map((b) =>
-      b.type === "URL"
-        ? { type: "URL", text: b.text, url: b.url || "https://nexwapi.com" }
-        : { type: "QUICK_REPLY", text: b.text }
-    );
-    if (buttons.length) comps.push({ type: "BUTTONS", buttons });
-    cardComponents.push({ components: comps });
-  }
-  const res = await fetch(`https://graph.facebook.com/${WA.version}/${WA.wabaId}/message_templates`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${WA.accessToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name, language, category: String(category).toUpperCase(),
-      components: [{ type: "BODY", text: body }, { type: "CAROUSEL", cards: cardComponents }],
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`Carousel create failed: ${JSON.stringify(data)}`);
-  return data;
-}
-
-// Download inbound media by id → { buffer, mimetype }.
-export async function fetchInboundMedia(mediaId) {
-  if (!WA_LIVE) return null;
-  const metaRes = await fetch(`https://graph.facebook.com/${WA.version}/${mediaId}`, {
-    headers: { Authorization: `Bearer ${WA.accessToken}` },
-  });
-  const meta = await metaRes.json();
-  if (!meta.url) return null;
-  const fileRes = await fetch(meta.url, { headers: { Authorization: `Bearer ${WA.accessToken}` } });
-  const buffer = Buffer.from(await fileRes.arrayBuffer());
-  return { buffer, mimetype: meta.mime_type || "application/octet-stream" };
-}
-
-// Template with body variables, e.g. an OTP code {{1}}
-export function sendTemplateWithParams(to, name, params, lang = "en") {
+export function sendTemplateWithParams(to, name, params = [], lang = "en", creds) {
+  const components = params.length
+    ? [{ type: "body", parameters: params.map((t) => ({ type: "text", text: String(t) })) }]
+    : [];
   return send({
     to,
     type: "template",
-    template: {
-      name,
-      language: { code: lang },
-      components: [
-        {
-          type: "body",
-          parameters: params.map((text) => ({ type: "text", text })),
-        },
-      ],
-    },
-  });
+    template: { name, language: { code: lang }, components },
+  }, creds);
 }
 
-// Example: send an OTP using the approved 'otp_login' template
-export async function sendOtpOnWhatsApp(phone, code) {
-  const result = await sendTemplateWithParams(phone, "otp_login", [code], "en");
-  console.log("[whatsapp] otp sent, message id:", result.messages?.[0]?.id);
-  return result;
-}
-
-const GRAPH = `https://graph.facebook.com/${WA.version}`;
-
-// Upload a sample image to the app and return a resumable-upload handle (for image-header templates).
-async function uploadTemplateSample(imageUrl) {
-  if (!WA.appId) throw new Error("WHATSAPP_APP_ID not set (needed for image-header templates)");
-  const imgRes = await fetch(imageUrl);
-  if (!imgRes.ok) throw new Error("could not download header image");
-  const buf = Buffer.from(await imgRes.arrayBuffer());
-  const type = imgRes.headers.get("content-type") || "image/jpeg";
-  const sessRes = await fetch(
-    `${GRAPH}/${WA.appId}/uploads?file_length=${buf.length}&file_type=${encodeURIComponent(type)}&access_token=${WA.accessToken}`,
-    { method: "POST" }
-  );
-  const sess = await sessRes.json();
-  if (!sess.id) throw new Error("upload session failed: " + JSON.stringify(sess));
-  const upRes = await fetch(`${GRAPH}/${sess.id}`, {
+export async function createTemplate(payload, creds) {
+  const wabaId = creds?.wabaId || WA.wabaId;
+  const accessToken = creds?.accessToken || WA.accessToken;
+  if (!wabaId || !accessToken) throw new Error("WABA credentials missing");
+  const version = WA.version || "v22.0";
+  const res = await fetch(`https://graph.facebook.com/${version}/${wabaId}/message_templates`, {
     method: "POST",
-    headers: { Authorization: `OAuth ${WA.accessToken}`, file_offset: "0" },
-    body: buf,
-  });
-  const up = await upRes.json();
-  if (!up.h) throw new Error("sample upload failed: " + JSON.stringify(up));
-  return up.h;
-}
-
-// Submit a new message template to Meta for approval (WABA-level).
-// Supports optional header (text/image) and buttons (quick-reply / URL).
-export async function createTemplate({ name, category = "UTILITY", language = "en", body, headerType, headerText, headerImageUrl, buttons }) {
-  if (!WA_LIVE) return { id: "DEMO", status: "PENDING", demo: true };
-  const components = [];
-
-  if (headerType === "text" && headerText) {
-    components.push({ type: "HEADER", format: "TEXT", text: headerText });
-  } else if (headerType === "image" && headerImageUrl) {
-    const handle = await uploadTemplateSample(headerImageUrl);
-    components.push({ type: "HEADER", format: "IMAGE", example: { header_handle: [handle] } });
-  }
-
-  const varCount = (body.match(/\{\{\d+\}\}/g) || []).length;
-  const bodyComp = { type: "BODY", text: body };
-  if (varCount > 0) bodyComp.example = { body_text: [Array.from({ length: varCount }, (_, i) => `Sample${i + 1}`)] };
-  components.push(bodyComp);
-
-  const btns = (buttons || []).filter((b) => b.text);
-  if (btns.length) {
-    components.push({
-      type: "BUTTONS",
-      buttons: btns.slice(0, 3).map((b) =>
-        b.type === "url" ? { type: "URL", text: b.text, url: b.url } : { type: "QUICK_REPLY", text: b.text }
-      ),
-    });
-  }
-
-  const res = await fetch(`${GRAPH}/${WA.wabaId}/message_templates`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${WA.accessToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ name, language, category: String(category).toUpperCase(), components }),
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(`Template create failed: ${res.status} ${JSON.stringify(data)}`);
-  return data; // { id, status, category }
+  if (!res.ok) throw new Error(JSON.stringify(data));
+  return data;
 }
 
-// Fetch all templates (with live status) from Meta for the WABA.
-export async function listTemplates() {
-  if (!WA_LIVE) return [];
+export async function listTemplates(creds) {
+  const wabaId = creds?.wabaId || WA.wabaId;
+  const accessToken = creds?.accessToken || WA.accessToken;
+  if (!wabaId || !accessToken) return [];
+  const version = WA.version || "v22.0";
   const res = await fetch(
-    `${GRAPH}/${WA.wabaId}/message_templates?fields=name,status,category,language&limit=200`,
-    { headers: { Authorization: `Bearer ${WA.accessToken}` } }
+    `https://graph.facebook.com/${version}/${wabaId}/message_templates?limit=100`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const data = await res.json();
-  if (!res.ok) throw new Error(`List templates failed: ${JSON.stringify(data)}`);
   return data.data || [];
 }
+
+export async function createCarouselTemplate(payload, creds) {
+  return createTemplate(payload, creds);
+}
+
+export async function fetchInboundMedia(mediaId, creds) {
+  const accessToken = creds?.accessToken || WA.accessToken;
+  if (!accessToken) return null;
+  const version = WA.version || "v22.0";
+  const meta = await fetch(`https://graph.facebook.com/${version}/${mediaId}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  }).then((r) => r.json());
+  if (!meta?.url) return null;
+  const bin = await fetch(meta.url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const buffer = Buffer.from(await bin.arrayBuffer());
+  return { buffer, mimetype: meta.mime_type || bin.headers.get("content-type") };
+}
+
+/** Load default WhatsAppAccount creds for a company (or null). */
+export async function getCompanyCreds(companyId) {
+  if (!companyId) return null;
+  const { prisma } = await import("./prisma.js");
+  const wa = await prisma.whatsAppAccount.findFirst({
+    where: { companyId, isConnected: true },
+    orderBy: { isDefault: "desc" },
+  });
+  if (!wa?.accessToken || !wa?.phoneNumberId) return null;
+  return {
+    phoneNumberId: wa.phoneNumberId,
+    accessToken: wa.accessToken,
+    wabaId: wa.wabaId,
+  };
+}
+
+export { WA_LIVE };

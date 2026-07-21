@@ -8,16 +8,38 @@ import fs from "fs";
 import path from "path";
 import { WA } from "../config/whatsapp.js";
 import { prisma, pickColor } from "../lib/prisma.js";
-import { sendText, sendButtons, fetchInboundMedia } from "../lib/whatsappService.js";
+import { sendText, sendButtons, fetchInboundMedia, getCompanyCreds } from "../lib/whatsappService.js";
+import { spendCredits, refundCredits, getPlatformPricing } from "../lib/wallet.js";
 import { fireEvent } from "../lib/events.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
 const EXT = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf", "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3" };
 
-// Download an inbound media file and return a servable local URL.
-async function saveInboundMedia(mediaId, hostUrl) {
+async function outboundChargeAndSend(companyId, to, sendFn, meta = {}) {
+  const pricing = await getPlatformPricing();
+  const creditsNeeded = pricing.creditPerOutbound || 1;
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  let debited = false;
   try {
-    const media = await fetchInboundMedia(mediaId);
+    if (!company?.freeAccess) {
+      await spendCredits(companyId, creditsNeeded, "message_send", { to, ...meta });
+      debited = true;
+    }
+    const creds = await getCompanyCreds(companyId);
+    return await sendFn(creds);
+  } catch (e) {
+    if (debited) {
+      await refundCredits(companyId, creditsNeeded, "message_refund", { to, reason: e.message, ...meta }).catch(() => {});
+    }
+    throw e;
+  }
+}
+
+// Download an inbound media file and return a servable local URL.
+async function saveInboundMedia(mediaId, hostUrl, companyId) {
+  try {
+    const creds = companyId ? await getCompanyCreds(companyId) : null;
+    const media = await fetchInboundMedia(mediaId, creds);
     if (!media) return null;
     const name = `in_${mediaId}${EXT[media.mimetype] || ""}`;
     fs.writeFileSync(path.join(UPLOAD_DIR, name), media.buffer);
@@ -28,9 +50,28 @@ async function saveInboundMedia(mediaId, hostUrl) {
   }
 }
 
-// Pick the first enabled automation whose rule matches the inbound text.
-async function findAutoReply(text) {
-  const autos = await prisma.automation.findMany({ where: { enabled: true }, orderBy: { createdAt: "asc" } });
+/** Resolve tenant companyId from webhook metadata.phone_number_id (or env fallback). */
+async function resolveCompanyId(value) {
+  const phoneNumberId = value?.metadata?.phone_number_id || WA.phoneNumberId;
+  if (phoneNumberId) {
+    const acct = await prisma.whatsAppAccount.findFirst({
+      where: { phoneNumberId: String(phoneNumberId), isConnected: true },
+    });
+    if (acct?.companyId) return acct.companyId;
+  }
+  // Demo / single-tenant fallback: first active company
+  const co = await prisma.company.findFirst({
+    where: { status: { in: ["TRIAL", "ACTIVE"] } },
+    orderBy: { createdAt: "asc" },
+  });
+  return co?.id || null;
+}
+
+async function findAutoReply(text, companyId) {
+  const autos = await prisma.automation.findMany({
+    where: { enabled: true, ...(companyId ? { companyId } : {}) },
+    orderBy: { createdAt: "asc" },
+  });
   const lc = (text || "").trim().toLowerCase();
   return autos.find((a) => {
     if (a.matchType === "any") return true;
@@ -40,15 +81,14 @@ async function findAutoReply(text) {
   });
 }
 
-// Round-robin: assign an unassigned chat to the agent with the fewest open chats.
-async function autoAssignIfNeeded(contact) {
+async function autoAssignIfNeeded(contact, companyId) {
   if (contact.assignedAgentId) return contact.assignedAgentId;
-  const s = await prisma.setting.findUnique({ where: { id: "default" } });
+  const s = await prisma.setting.findUnique({ where: { companyId } }).catch(() => null);
   if (!s?.autoAssign) return null;
-  const agents = await prisma.agent.findMany();
+  const agents = await prisma.agent.findMany({ where: { companyId } });
   if (!agents.length) return null;
   const counts = await Promise.all(
-    agents.map((a) => prisma.contact.count({ where: { assignedAgentId: a.id } }))
+    agents.map((a) => prisma.contact.count({ where: { assignedAgentId: a.id, companyId } }))
   );
   const idx = counts.indexOf(Math.min(...counts));
   const agentId = agents[idx].id;
@@ -57,24 +97,32 @@ async function autoAssignIfNeeded(contact) {
   return agentId;
 }
 
-// Send an away message when outside business hours and nothing else replied
-// (throttled to at most one per hour per contact).
-async function maybeAway(contact) {
-  const s = await prisma.setting.findUnique({ where: { id: "default" } });
+async function maybeAway(contact, companyId) {
+  const s = await prisma.setting.findUnique({ where: { companyId } }).catch(() => null);
   if (!s?.awayEnabled) return;
   const now = new Date();
   const day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][now.getDay()];
   const hour = now.getHours();
   const open = s.days.includes(day) && hour >= s.hoursStart && hour < s.hoursEnd;
-  if (open) return; // agents available
+  if (open) return;
   const recentOut = await prisma.message.findFirst({
     where: { contactId: contact.id, direction: "out", at: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
   });
-  if (recentOut) return; // don't spam
+  if (recentOut) return;
   try {
-    const r = await sendText(contact.phone, s.awayMessage);
+    const r = await outboundChargeAndSend(companyId, contact.phone, (creds) =>
+      sendText(contact.phone, s.awayMessage, creds)
+    , { channel: "away" });
     await prisma.message.create({
-      data: { waId: r.messages?.[0]?.id || null, contactId: contact.id, direction: "out", type: "text", text: s.awayMessage, status: "sent" },
+      data: {
+        companyId,
+        waId: r.messages?.[0]?.id || null,
+        contactId: contact.id,
+        direction: "out",
+        type: "text",
+        text: s.awayMessage,
+        status: "sent",
+      },
     });
     console.log("[wa] away message sent to", contact.phone);
   } catch (e) {
@@ -83,9 +131,8 @@ async function maybeAway(contact) {
 }
 
 /* --------------------------- Chatbot flow engine --------------------------- */
-// Send a flow step (text, or interactive buttons) and update the contact's state.
-async function sendStep(contact, flow, step) {
-  // API-call node: hit an external URL, save part of the response, then continue.
+async function sendStep(contact, flow, step, companyId) {
+  const cid = companyId || contact.companyId;
   if (step.apiCall?.url) {
     try {
       const resp = await fetch(step.apiCall.url);
@@ -105,7 +152,7 @@ async function sendStep(contact, flow, step) {
       console.error("[flow] api-call failed:", e.message);
     }
     const nextStep = flow.steps.find((s) => s.id === step.apiCall.next);
-    if (nextStep) return sendStep(contact, flow, nextStep);
+    if (nextStep) return sendStep(contact, flow, nextStep, cid);
     await prisma.contact.update({ where: { id: contact.id }, data: { activeFlowId: null, activeFlowStep: null } });
     return;
   }
@@ -113,14 +160,25 @@ async function sendStep(contact, flow, step) {
   const buttons = (step.buttons || []).filter((b) => b.title && b.next);
   let r;
   if (buttons.length) {
-    r = await sendButtons(contact.phone, step.message, buttons.map((b) => ({ id: `next:${b.next}`, title: b.title })));
+    r = await outboundChargeAndSend(cid, contact.phone, (creds) =>
+      sendButtons(contact.phone, step.message, buttons.map((b) => ({ id: `next:${b.next}`, title: b.title })), creds)
+    , { channel: "chatbot" });
   } else {
-    r = await sendText(contact.phone, step.message);
+    r = await outboundChargeAndSend(cid, contact.phone, (creds) =>
+      sendText(contact.phone, step.message, creds)
+    , { channel: "chatbot" });
   }
   await prisma.message.create({
-    data: { waId: r.messages?.[0]?.id || null, contactId: contact.id, direction: "out", type: buttons.length ? "interactive" : "text", text: step.message, status: "sent" },
+    data: {
+      companyId: cid,
+      waId: r.messages?.[0]?.id || null,
+      contactId: contact.id,
+      direction: "out",
+      type: buttons.length ? "interactive" : "text",
+      text: step.message,
+      status: "sent",
+    },
   });
-  // Stay in the flow if this step offers buttons, captures a reply, or branches on conditions.
   const waiting = buttons.length > 0 || Boolean(step.capture?.field) || (step.conditions?.length > 0);
   await prisma.contact.update({
     where: { id: contact.id },
@@ -128,14 +186,13 @@ async function sendStep(contact, flow, step) {
   });
 }
 
-// Returns true if a chatbot flow handled this message.
-async function runChatbot(contact, m, text) {
-  const btnId = m.interactive?.button_reply?.id; // "next:<stepId>"
+async function runChatbot(contact, m, text, companyId) {
+  const cid = companyId || contact.companyId;
+  const btnId = m.interactive?.button_reply?.id;
   const lc = (text || "").trim().toLowerCase();
 
-  // 1) Advance an in-progress flow.
   if (contact.activeFlowId) {
-    const flow = await prisma.flow.findUnique({ where: { id: contact.activeFlowId } });
+    const flow = await prisma.flow.findFirst({ where: { id: contact.activeFlowId, companyId: cid } });
     if (flow?.enabled && Array.isArray(flow.steps)) {
       const current = flow.steps.find((s) => s.id === contact.activeFlowStep);
       let nextId = btnId?.startsWith("next:") ? btnId.slice(5) : null;
@@ -143,7 +200,6 @@ async function runChatbot(contact, m, text) {
         const btn = (current.buttons || []).find((b) => b.title?.toLowerCase() === lc);
         if (btn) nextId = btn.next;
       }
-      // Capture step: save the user's reply into a custom field, then advance.
       if (!nextId && current?.capture?.field) {
         const attrs = { ...(contact.attributes || {}), [current.capture.field]: text };
         await prisma.contact.update({ where: { id: contact.id }, data: { attributes: attrs } });
@@ -151,24 +207,21 @@ async function runChatbot(contact, m, text) {
         nextId = current.capture.next;
         console.log(`[wa] captured "${current.capture.field}" =`, text);
       }
-      // Conditional branch: route by keyword in the reply, else a default step.
       if (!nextId && current?.conditions?.length) {
         const cond = current.conditions.find((c) => c.match && lc.includes(c.match.toLowerCase()));
         nextId = cond?.next || current.defaultNext || null;
       }
       const next = nextId ? flow.steps.find((s) => s.id === nextId) : null;
-      if (next) { await sendStep(contact, flow, next); return true; }
-      // Unrecognised reply → drop out of the flow and fall through.
+      if (next) { await sendStep(contact, flow, next, cid); return true; }
       await prisma.contact.update({ where: { id: contact.id }, data: { activeFlowId: null, activeFlowStep: null } });
     }
   }
 
-  // 2) Start a flow whose trigger matches.
-  const flows = await prisma.flow.findMany({ where: { enabled: true }, orderBy: { createdAt: "asc" } });
+  const flows = await prisma.flow.findMany({ where: { enabled: true, companyId: cid }, orderBy: { createdAt: "asc" } });
   for (const flow of flows) {
     if (!Array.isArray(flow.steps) || !flow.steps.length) continue;
     const match = flow.triggerType === "any" || (flow.trigger && lc.includes(flow.trigger.toLowerCase()));
-    if (match) { await sendStep(contact, flow, flow.steps[0]); return true; }
+    if (match) { await sendStep(contact, flow, flow.steps[0], cid); return true; }
   }
   return false;
 }
@@ -236,15 +289,26 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
       for (const change of entry?.changes || []) {
         const value = change?.value;
         if (!value) continue;
+        const companyId = await resolveCompanyId(value);
+        if (!companyId) {
+          console.warn("[wa] no company for phone_number_id", value?.metadata?.phone_number_id);
+          continue;
+        }
+        // Mark webhook activity
+        await prisma.whatsAppAccount.updateMany({
+          where: { companyId, phoneNumberId: String(value?.metadata?.phone_number_id || "") },
+          data: { lastWebhookAt: new Date(), webhookStatus: "connected" },
+        }).catch(() => {});
+
         const profileName = value?.contacts?.[0]?.profile?.name;
 
-        // Inbound messages from users
         for (const m of value.messages || []) {
-          const count = await prisma.contact.count();
+          const count = await prisma.contact.count({ where: { companyId } });
           const contact = await prisma.contact.upsert({
-            where: { phone: m.from },
+            where: { companyId_phone: { companyId, phone: m.from } },
             update: {},
             create: {
+              companyId,
               name: profileName || `+${m.from}`,
               phone: m.from,
               tags: ["inbound"],
@@ -253,23 +317,22 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
           });
           const bodyText = textOf(m);
 
-          // Download inbound media (image / document / video / audio) if present.
           let mediaUrl = null;
           let filename = null;
           const mediaObj = m.image || m.document || m.video || m.audio;
           if (mediaObj?.id) {
             const hostUrl = `${req.protocol}://${req.get("host")}`;
-            mediaUrl = await saveInboundMedia(mediaObj.id, hostUrl);
+            mediaUrl = await saveInboundMedia(mediaObj.id, hostUrl, companyId);
             filename = m.document?.filename || null;
           }
 
-          // Idempotent: Meta may retry the same webhook — skip if already stored.
           if (m.id && (await prisma.message.findUnique({ where: { waId: m.id } }))) {
             console.log("[wa] duplicate inbound skipped:", m.id);
             continue;
           }
           await prisma.message.create({
             data: {
+              companyId,
               waId: m.id,
               contactId: contact.id,
               direction: "in",
@@ -283,43 +346,52 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
           });
           console.log("[wa] incoming from", m.from, ":", bodyText);
 
-          // Fire outgoing webhook event (Zapier/Make/custom integrations).
           fireEvent("message.received", { from: m.from, name: contact.name, text: bodyText, type: m.type }).catch(() => {});
+          await autoAssignIfNeeded(contact, companyId).catch(() => {});
 
-          // Auto-assign the chat to an agent (round-robin) if enabled.
-          await autoAssignIfNeeded(contact).catch(() => {});
-
-          // 0) CSAT rating reply — save the rating and thank the user.
           const btnId0 = m.interactive?.button_reply?.id;
           if (btnId0?.startsWith("csat:")) {
             const rating = btnId0.slice(5);
             const attrs = { ...(contact.attributes || {}), csat_rating: rating, csat_at: new Date().toISOString() };
             await prisma.contact.update({ where: { id: contact.id }, data: { attributes: attrs } });
             try {
-              const r = await sendText(contact.phone, "🙏 Thank you for your feedback!");
-              await prisma.message.create({ data: { waId: r.messages?.[0]?.id || null, contactId: contact.id, direction: "out", type: "text", text: "🙏 Thank you for your feedback!", status: "sent" } });
+              const r = await outboundChargeAndSend(companyId, contact.phone, (creds) =>
+                sendText(contact.phone, "🙏 Thank you for your feedback!", creds)
+              , { channel: "csat" });
+              await prisma.message.create({
+                data: {
+                  companyId,
+                  waId: r.messages?.[0]?.id || null,
+                  contactId: contact.id,
+                  direction: "out",
+                  type: "text",
+                  text: "🙏 Thank you for your feedback!",
+                  status: "sent",
+                },
+              });
             } catch {}
             console.log("[csat] rating from", contact.phone, "=", rating);
             continue;
           }
 
-          // 1) Chatbot flows take priority (start/advance a flow).
           let handled = false;
           try {
-            handled = await runChatbot(contact, m, bodyText);
+            handled = await runChatbot(contact, m, bodyText, companyId);
             if (handled) console.log("[wa] chatbot handled", m.from);
           } catch (e) {
             console.error("[wa] chatbot error:", e.message);
           }
           if (handled) continue;
 
-          // 2) Auto-reply (free text is allowed within 24h of the user's message).
-          const auto = await findAutoReply(bodyText);
+          const auto = await findAutoReply(bodyText, companyId);
           if (auto) {
             try {
-              const r = await sendText(m.from, auto.reply);
+              const r = await outboundChargeAndSend(companyId, m.from, (creds) =>
+                sendText(m.from, auto.reply, creds)
+              , { channel: "automation", automationId: auto.id });
               await prisma.message.create({
                 data: {
+                  companyId,
                   waId: r.messages?.[0]?.id || null,
                   contactId: contact.id,
                   direction: "out",
@@ -333,14 +405,12 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
               console.error("[wa] auto-reply failed:", e.message);
             }
           } else {
-            // 3) Nothing matched — send an away message if off-hours.
-            await maybeAway(contact);
+            await maybeAway(contact, companyId);
           }
         }
 
-        // Delivery / read receipts for messages we sent
         for (const s of value.statuses || []) {
-          await prisma.message.updateMany({ where: { waId: s.id }, data: { status: s.status } });
+          await prisma.message.updateMany({ where: { waId: s.id, companyId }, data: { status: s.status } });
           console.log("[wa] status", s.id, "->", s.status);
         }
       }

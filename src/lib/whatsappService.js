@@ -11,6 +11,14 @@ function simulate(payload) {
 }
 
 function resolveCreds(creds) {
+  if (creds?.incomplete) {
+    const err = new Error(
+      "WhatsApp Meta credentials incomplete. Dashboard → WhatsApp pe Facebook se dubara connect karo (Phone ID + token zaroori)."
+    );
+    err.code = "WA_CREDS_INCOMPLETE";
+    err.status = 400;
+    throw err;
+  }
   const phoneNumberId = creds?.phoneNumberId || WA.phoneNumberId;
   const accessToken = creds?.accessToken || WA.accessToken;
   const live = Boolean(
@@ -147,7 +155,12 @@ export async function fetchInboundMedia(mediaId, creds) {
   return { buffer, mimetype: meta.mime_type || bin.headers.get("content-type") };
 }
 
-/** Load default WhatsAppAccount creds for a company (or null). */
+/**
+ * Load default WhatsAppAccount creds for a company.
+ * - null: no connected account → callers may fall back to platform env (demo/admin)
+ * - { incomplete: true }: number linked but Meta Phone ID / token missing → must NOT fall back
+ * - { phoneNumberId, accessToken, wabaId }: live per-tenant sends
+ */
 export async function getCompanyCreds(companyId) {
   if (!companyId) return null;
   const { prisma } = await import("./prisma.js");
@@ -155,12 +168,27 @@ export async function getCompanyCreds(companyId) {
     where: { companyId, isConnected: true },
     orderBy: { isDefault: "desc" },
   });
-  if (!wa?.accessToken || !wa?.phoneNumberId) return null;
+  if (!wa) return null;
+  if (!wa.accessToken || !wa.phoneNumberId) {
+    return { incomplete: true };
+  }
   return {
     phoneNumberId: wa.phoneNumberId,
     accessToken: wa.accessToken,
     wabaId: wa.wabaId,
   };
+}
+
+/** Throw a clear 400-style error when tenant WhatsApp is only partially connected. */
+export function assertLiveCreds(creds) {
+  if (creds?.incomplete) {
+    const err = new Error(
+      "WhatsApp Meta credentials incomplete. Dashboard → WhatsApp pe Facebook se dubara connect karo (Phone ID + token zaroori)."
+    );
+    err.code = "WA_CREDS_INCOMPLETE";
+    err.status = 400;
+    throw err;
+  }
 }
 
 export { WA_LIVE };

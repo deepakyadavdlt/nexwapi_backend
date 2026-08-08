@@ -8,7 +8,7 @@ import path from "path";
 import { prisma, toMessage, pickColor } from "../lib/prisma.js";
 import {
   sendText, sendTemplate, sendTemplateWithParams, createTemplate, listTemplates,
-  uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getCompanyCreds,
+  uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getCompanyCreds, assertLiveCreds,
 } from "../lib/whatsappService.js";
 import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits } from "../lib/wallet.js";
 import {
@@ -948,6 +948,7 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
   const creds = await getCompanyCreds(companyId);
   let waId = null;
   try {
+    assertLiveCreds(creds);
     const result = await sendText(contact.phone, text, creds);
     waId = result.messages?.[0]?.id || null;
   } catch (e) {
@@ -955,7 +956,8 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
       to: contact.phone,
       reason: e.message,
     }).catch(() => {});
-    return res.status(502).json({ error: e.message });
+    const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" ? 400 : 502);
+    return res.status(status).json({ error: e.message, code: e.code || undefined });
   }
 
   const msg = await prisma.message.create({
@@ -991,6 +993,7 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
   const creds = await getCompanyCreds(companyId);
   let waId = null;
   try {
+    assertLiveCreds(creds);
     const result = params.length
       ? await sendTemplateWithParams(contact.phone, template, params, language, creds)
       : await sendTemplate(contact.phone, template, language, creds);
@@ -1001,7 +1004,8 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
       reason: e.message,
       template,
     }).catch(() => {});
-    return res.status(502).json({ error: e.message });
+    const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" ? 400 : 502);
+    return res.status(status).json({ error: e.message, code: e.code || undefined });
   }
 
   const tpl = await prisma.template.findFirst({ where: { name: template, ...tenantWhere(req) } });

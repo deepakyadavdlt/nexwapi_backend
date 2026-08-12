@@ -58,16 +58,17 @@ async function ensureAdmin() {
     const { prisma } = await import("./lib/prisma.js");
     const { hashPassword } = await import("./lib/auth.js");
     const hash = await hashPassword(password);
+    const adminData = {
+      password: hash,
+      name: process.env.ADMIN_NAME || "Super Admin",
+      role: "SUPER_ADMIN",
+      isActive: true,
+      companyId: null,
+    };
     await prisma.user.upsert({
       where: { email },
-      update: { password: hash, role: "SUPER_ADMIN", companyId: null },
-      create: {
-        email,
-        password: hash,
-        name: process.env.ADMIN_NAME || "Super Admin",
-        role: "SUPER_ADMIN",
-        companyId: null,
-      },
+      update: adminData,
+      create: { email, ...adminData },
     });
     console.log(`  Super Admin ensured: ${email}`);
     await ensureDefaultPlans();

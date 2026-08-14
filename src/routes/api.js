@@ -10,10 +10,11 @@ import {
   sendText, sendTemplate, sendTemplateWithParams, createTemplate, listTemplates,
   uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getCompanyCreds, assertLiveCreds,
 } from "../lib/whatsappService.js";
-import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits } from "../lib/wallet.js";
+import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits, templateChargeCredits } from "../lib/wallet.js";
 import {
   metaSignupConfig, exchangeCodeForToken, exchangeForLongLivedToken,
   fetchPhoneNumbers, subscribeWabaWebhooks, fetchPhoneDetails, fetchSharedWabas,
+  registerCloudApiPhone,
 } from "../lib/metaOAuth.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
@@ -441,14 +442,11 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
 
   const { to, text, template, params, language = "en" } = req.body || {};
   if (!to) return res.status(400).json({ error: "to (phone number) required" });
-  const pricing = await getPlatformPricing();
-  const creditsNeeded = pricing.creditPerOutbound || 1;
+  let charge = { charged: false, creditsNeeded: 0 };
   try {
-    await spendCredits(apiKey.companyId, creditsNeeded, "api_message_send", {
-      to,
-      template: template || null,
-      channel: "api_key",
-    });
+    if (template) {
+      charge = await templateChargeCredits(apiKey.companyId, template, { to, channel: "api_key" });
+    }
   } catch (e) {
     return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
   }
@@ -462,7 +460,6 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
     } else if (text) {
       result = await sendText(to, text, creds);
     } else {
-      await refundCredits(apiKey.companyId, creditsNeeded, "api_message_refund", { reason: "missing body" }).catch(() => {});
       return res.status(400).json({ error: "text or template required" });
     }
     const cleanPhone = String(to).replace(/[^\d]/g, "");
@@ -482,12 +479,14 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
     }
     res.json({ ok: true, messageId: result.messages?.[0]?.id || null });
   } catch (e) {
-    await refundCredits(apiKey.companyId, creditsNeeded, "api_message_refund", {
-      to,
-      reason: e.message,
-      template: template || null,
-      channel: "api_key",
-    }).catch(() => {});
+    if (charge.charged) {
+      await refundCredits(apiKey.companyId, charge.creditsNeeded, "api_message_refund", {
+        to,
+        reason: e.message,
+        template: template || null,
+        channel: "api_key",
+      }).catch(() => {});
+    }
     res.status(502).json({ error: e.message });
   }
 });
@@ -564,14 +563,6 @@ router.post("/conversations/:id/media", requireNotSuspended, upload.single("file
   if (!req.file) return res.status(400).json({ error: "file required" });
 
   const companyId = companyIdOf(req);
-  const pricing = await getPlatformPricing();
-  const creditsNeeded = pricing.creditPerOutbound || 1;
-  try {
-    await spendCredits(companyId, creditsNeeded, "message_send", { to: contact.phone, type: "media" });
-  } catch (e) {
-    return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
-  }
-
   const { originalname, mimetype, filename, path: tmpPath } = req.file;
   const storedName = filename + (path.extname(originalname) || "");
   fs.renameSync(tmpPath, path.join(UPLOAD_DIR, storedName));
@@ -588,11 +579,6 @@ router.post("/conversations/:id/media", requireNotSuspended, upload.single("file
       waId = r.messages?.[0]?.id || null;
     }
   } catch (e) {
-    await refundCredits(companyId, creditsNeeded, "message_refund", {
-      to: contact.phone,
-      reason: e.message,
-      type: "media",
-    }).catch(() => {});
     return res.status(502).json({ error: e.message });
   }
 
@@ -936,15 +922,6 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
   const { text } = req.body || {};
   if (!text) return res.status(400).json({ error: "text required" });
   const companyId = companyIdOf(req);
-
-  const pricing = await getPlatformPricing();
-  const creditsNeeded = pricing.creditPerOutbound || 1;
-  try {
-    await spendCredits(companyId, creditsNeeded, "message_send", { to: contact.phone });
-  } catch (e) {
-    return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
-  }
-
   const creds = await getCompanyCreds(companyId);
   let waId = null;
   try {
@@ -952,10 +929,6 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
     const result = await sendText(contact.phone, text, creds);
     waId = result.messages?.[0]?.id || null;
   } catch (e) {
-    await refundCredits(companyId, creditsNeeded, "message_refund", {
-      to: contact.phone,
-      reason: e.message,
-    }).catch(() => {});
     const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" ? 400 : 502);
     return res.status(status).json({ error: e.message, code: e.code || undefined });
   }
@@ -981,11 +954,9 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
   const { template, params = [], language = "en" } = req.body || {};
   if (!template) return res.status(400).json({ error: "template required" });
   const companyId = companyIdOf(req);
-
-  const pricing = await getPlatformPricing();
-  const creditsNeeded = pricing.creditPerOutbound || 1;
+  let charge = { charged: false, creditsNeeded: 0 };
   try {
-    await spendCredits(companyId, creditsNeeded, "message_send", { to: contact.phone, template });
+    charge = await templateChargeCredits(companyId, template, { to: contact.phone });
   } catch (e) {
     return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
   }
@@ -999,11 +970,13 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
       : await sendTemplate(contact.phone, template, language, creds);
     waId = result.messages?.[0]?.id || null;
   } catch (e) {
-    await refundCredits(companyId, creditsNeeded, "message_refund", {
-      to: contact.phone,
-      reason: e.message,
-      template,
-    }).catch(() => {});
+    if (charge.charged) {
+      await refundCredits(companyId, charge.creditsNeeded, "message_refund", {
+        to: contact.phone,
+        reason: e.message,
+        template,
+      }).catch(() => {});
+    }
     const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" ? 400 : 502);
     return res.status(status).json({ error: e.message, code: e.code || undefined });
   }
@@ -1471,6 +1444,15 @@ router.post("/whatsapp/refresh", async (req, res) => {
     let phoneMeta = null;
     if (wa.phoneNumberId) {
       phoneMeta = await fetchPhoneDetails(wa.phoneNumberId, token).catch(() => null);
+      try {
+        await registerCloudApiPhone(
+          wa.phoneNumberId,
+          token,
+          process.env.WHATSAPP_REGISTER_PIN || "123456"
+        );
+      } catch (e) {
+        console.warn("[wa] phone register on refresh:", e.message);
+      }
     }
     const updated = await prisma.whatsAppAccount.update({
       where: { id: wa.id },
@@ -1565,6 +1547,16 @@ router.post("/whatsapp/embedded-signup", async (req, res) => {
       await subscribeWabaWebhooks(finalWaba, accessToken).catch((e) =>
         console.warn("[wa] subscribe webhook:", e.message)
       );
+    }
+
+    try {
+      await registerCloudApiPhone(
+        finalPhoneId,
+        accessToken,
+        process.env.WHATSAPP_REGISTER_PIN || "123456"
+      );
+    } catch (e) {
+      console.warn("[wa] phone register:", e.message);
     }
 
     const existing = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });

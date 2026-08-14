@@ -46,7 +46,33 @@ export async function creditWallet({
   return { company, txn };
 }
 
-/** Spend message credits (outbound send). Throws if insufficient (unless freeAccess). */
+/** Meta conversation categories that bill the client wallet. Service/session is free. */
+export function isPaidWhatsAppCategory(category) {
+  const c = String(category || "").toUpperCase();
+  if (!c) return true;
+  if (c.includes("SERVICE") || c.includes("SESSION")) return false;
+  return c.includes("MARKET") || c.includes("UTIL") || c.includes("AUTH");
+}
+
+export async function templateChargeCredits(companyId, templateName, extraMeta = {}) {
+  if (!templateName) return { charged: false, creditsNeeded: 0 };
+  const tpl = await prisma.template.findFirst({
+    where: { name: templateName, ...(companyId ? { companyId } : {}) },
+  });
+  const category = tpl?.category || "Utility";
+  if (!isPaidWhatsAppCategory(category)) {
+    return { charged: false, creditsNeeded: 0, category };
+  }
+  const pricing = await getPlatformPricing();
+  const creditsNeeded = pricing.creditPerOutbound || 1;
+  await spendCredits(companyId, creditsNeeded, "message_send", {
+    template: templateName,
+    category,
+    ...extraMeta,
+  });
+  return { charged: true, creditsNeeded, category };
+}
+
 export async function spendCredits(companyId, creditsNeeded = 1, reason = "message_send", meta = null) {
   const company = await prisma.company.findUnique({ where: { id: companyId } });
   if (!company) throw Object.assign(new Error("Company not found"), { status: 404 });

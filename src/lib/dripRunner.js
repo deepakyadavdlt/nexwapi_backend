@@ -1,7 +1,7 @@
 // lib/dripRunner.js — sends drip campaign steps on schedule.
 import { prisma } from "./prisma.js";
 import { sendTemplate, sendTemplateWithParams, getCompanyCreds } from "./whatsappService.js";
-import { spendCredits, refundCredits, getPlatformPricing } from "./wallet.js";
+import { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } from "./wallet.js";
 
 const HOUR = 60 * 60 * 1000;
 
@@ -49,13 +49,12 @@ export async function runDueDrips() {
     let debited = false;
 
     try {
-      if (!company?.freeAccess) {
-        await spendCredits(companyId, creditsNeeded, "message_send", {
+      if (!company?.freeAccess && step.template) {
+        const charge = await templateChargeCredits(companyId, step.template, {
           dripId: drip.id,
           to: contact.phone,
-          template: step.template,
         });
-        debited = true;
+        if (charge.charged) debited = true;
       }
       const tpl = await prisma.template.findFirst({ where: { name: step.template, companyId } });
       const varCount = tpl ? (tpl.body.match(/\{\{\d+\}\}/g) || []).length : 0;

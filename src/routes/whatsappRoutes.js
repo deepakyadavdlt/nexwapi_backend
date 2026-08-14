@@ -9,30 +9,15 @@ import path from "path";
 import { WA } from "../config/whatsapp.js";
 import { prisma, pickColor } from "../lib/prisma.js";
 import { sendText, sendButtons, fetchInboundMedia, getCompanyCreds } from "../lib/whatsappService.js";
-import { spendCredits, refundCredits, getPlatformPricing } from "../lib/wallet.js";
 import { fireEvent } from "../lib/events.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
 const EXT = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf", "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3" };
 
 async function outboundChargeAndSend(companyId, to, sendFn, meta = {}) {
-  const pricing = await getPlatformPricing();
-  const creditsNeeded = pricing.creditPerOutbound || 1;
-  const company = await prisma.company.findUnique({ where: { id: companyId } });
-  let debited = false;
-  try {
-    if (!company?.freeAccess) {
-      await spendCredits(companyId, creditsNeeded, "message_send", { to, ...meta });
-      debited = true;
-    }
-    const creds = await getCompanyCreds(companyId);
-    return await sendFn(creds);
-  } catch (e) {
-    if (debited) {
-      await refundCredits(companyId, creditsNeeded, "message_refund", { to, reason: e.message, ...meta }).catch(() => {});
-    }
-    throw e;
-  }
+  // Auto-replies / chatbot / away are Service (session) messages — no wallet debit.
+  const creds = await getCompanyCreds(companyId);
+  return sendFn(creds);
 }
 
 // Download an inbound media file and return a servable local URL.

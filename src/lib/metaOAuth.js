@@ -127,3 +127,28 @@ export async function fetchPhoneDetails(phoneNumberId, accessToken) {
   if (!res.ok) throw new Error(data?.error?.message || "Failed to fetch phone details");
   return data;
 }
+
+/**
+ * Register the phone number on WhatsApp Cloud API.
+ * Until this succeeds, Meta shows status "Pending" and live send/receive won't work.
+ * `pin` is the 6-digit two-step verification PIN (new numbers can use a chosen PIN).
+ */
+export async function registerCloudApiPhone(phoneNumberId, accessToken, pin = "123456") {
+  const cleanPin = String(pin || "123456").replace(/\D/g, "").padStart(6, "0").slice(0, 6);
+  const res = await fetch(`https://graph.facebook.com/${VERSION}/${phoneNumberId}/register`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ messaging_product: "whatsapp", pin: cleanPin }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    const msg = data?.error?.message || "Phone registration failed";
+    const err = new Error(msg);
+    err.meta = data?.error || data;
+    throw err;
+  }
+  return data;
+}

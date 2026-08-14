@@ -56,7 +56,7 @@ export async function runCampaign(id) {
   }
 
   const { getCompanyCreds } = await import("./whatsappService.js");
-  const { spendCredits, refundCredits, getPlatformPricing } = await import("./wallet.js");
+  const { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } = await import("./wallet.js");
   const creds = await getCompanyCreds(companyId);
   const pricing = await getPlatformPricing();
   const creditsNeeded = pricing.creditPerOutbound || 1;
@@ -76,8 +76,11 @@ export async function runCampaign(id) {
     let debited = false;
     try {
       if (!company.freeAccess) {
-        await spendCredits(companyId, creditsNeeded, "message_send", { campaignId: id, to: c.phone });
-        debited = true;
+        const charge = await templateChargeCredits(companyId, campaign.template, {
+          campaignId: id,
+          to: c.phone,
+        });
+        if (charge.charged) debited = true;
       }
       const params = Array.from({ length: varCount }, () => c.name);
       const r = params.length

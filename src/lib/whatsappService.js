@@ -13,7 +13,7 @@ function simulate(payload) {
 function resolveCreds(creds) {
   if (creds?.incomplete) {
     const err = new Error(
-      "WhatsApp Meta credentials incomplete. Dashboard → WhatsApp pe Facebook se dubara connect karo (Phone ID + token zaroori)."
+      "WhatsApp Meta credentials are incomplete. Open Dashboard → WhatsApp and reconnect with Facebook."
     );
     err.code = "WA_CREDS_INCOMPLETE";
     err.status = 400;
@@ -183,7 +183,7 @@ export async function getCompanyCreds(companyId) {
 export function assertLiveCreds(creds) {
   if (creds?.incomplete) {
     const err = new Error(
-      "WhatsApp Meta credentials incomplete. Dashboard → WhatsApp pe Facebook se dubara connect karo (Phone ID + token zaroori)."
+      "WhatsApp Meta credentials are incomplete. Open Dashboard → WhatsApp and reconnect with Facebook."
     );
     err.code = "WA_CREDS_INCOMPLETE";
     err.status = 400;

@@ -36,6 +36,30 @@ export async function exchangeCodeForToken(code, redirectUri) {
 }
 
 /**
+ * FB.login JS SDK codes must usually be exchanged with NO redirect_uri.
+ * If Meta still rejects, try the JS SDK success URL then the configured site URI.
+ * A mismatch error typically does not consume the code, so retries are safe.
+ */
+export async function exchangeEmbeddedSignupCode(code) {
+  const candidates = [
+    undefined,
+    "https://www.facebook.com/connect/login_success.html",
+    process.env.WHATSAPP_REDIRECT_URI || undefined,
+  ].filter((v, i, arr) => arr.findIndex((x) => x === v) === i);
+
+  let lastErr;
+  for (const uri of candidates) {
+    try {
+      return await exchangeCodeForToken(code, uri);
+    } catch (e) {
+      lastErr = e;
+      if (!/redirect_uri|verification code/i.test(e.message || "")) throw e;
+    }
+  }
+  throw lastErr || new Error("Token exchange failed");
+}
+
+/**
  * Exchange a short-lived user token for a long-lived token (~60 days).
  * Critical for production — Embedded Signup codes yield short-lived tokens.
  */

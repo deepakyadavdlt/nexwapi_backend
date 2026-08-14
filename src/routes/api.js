@@ -12,7 +12,7 @@ import {
 } from "../lib/whatsappService.js";
 import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits, templateChargeCredits } from "../lib/wallet.js";
 import {
-  metaSignupConfig, exchangeCodeForToken, exchangeForLongLivedToken,
+  metaSignupConfig, exchangeEmbeddedSignupCode, exchangeForLongLivedToken,
   fetchPhoneNumbers, subscribeWabaWebhooks, fetchPhoneDetails, fetchSharedWabas,
   registerCloudApiPhone,
 } from "../lib/metaOAuth.js";
@@ -1493,11 +1493,12 @@ router.get("/whatsapp/meta-config", (_req, res) => {
 
 router.post("/whatsapp/embedded-signup", async (req, res) => {
   const companyId = companyIdOf(req);
-  const { code, redirectUri, wabaId, phoneNumberId, businessId } = req.body || {};
+  const { code, wabaId, phoneNumberId, businessId } = req.body || {};
   if (!code) return res.status(400).json({ error: "OAuth code required from Facebook Login" });
 
   try {
-    const tokenData = await exchangeCodeForToken(code, redirectUri || process.env.WHATSAPP_REDIRECT_URI);
+    // JS SDK Embedded Signup codes must be exchanged WITHOUT redirect_uri.
+    const tokenData = await exchangeEmbeddedSignupCode(code);
     let accessToken = tokenData.access_token;
     if (!accessToken) return res.status(400).json({ error: "No access token from Meta" });
 

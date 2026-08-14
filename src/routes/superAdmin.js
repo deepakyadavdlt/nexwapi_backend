@@ -7,9 +7,14 @@ import { PLAN_CATALOG, normalizePlan } from "../lib/plans.js";
 import { WA_LIVE } from "../config/whatsapp.js";
 import { RAZORPAY_ENABLED } from "../lib/razorpay.js";
 import { creditWallet, getPlatformPricing } from "../lib/wallet.js";
+import multer from "multer";
+import {
+  fetchBusinessProfile, updateBusinessProfile, uploadProfilePicture, VERTICALS,
+} from "../lib/waBusinessProfile.js";
 
 const router = express.Router();
 router.use(requireAuth, requireSuperAdmin);
+const profileUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 const DAY_MS = 86400000;
 
@@ -418,6 +423,76 @@ router.post("/whatsapp-accounts/:id/refresh-token", async (req, res) => {
     res.json({ ok: true, account: updated });
   } catch (e) {
     res.status(400).json({ error: e.message || "Token refresh failed" });
+  }
+});
+
+router.get("/whatsapp-accounts/:id/profile", async (req, res) => {
+  const a = await prisma.whatsAppAccount.findUnique({
+    where: { id: req.params.id },
+    include: { company: { select: { name: true } } },
+  });
+  if (!a) return res.status(404).json({ error: "not found" });
+  if (!a.phoneNumberId || !a.accessToken) {
+    return res.status(400).json({ error: "Account has no live Meta credentials" });
+  }
+  try {
+    const profile = await fetchBusinessProfile(a.phoneNumberId, a.accessToken);
+    res.json({
+      ...profile,
+      displayName: a.businessName || a.verifiedName || "",
+      verifiedName: a.verifiedName || "",
+      phoneNumber: a.displayPhoneNumber || a.phoneNumber,
+      companyName: a.company?.name || "",
+      verticals: VERTICALS,
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.patch("/whatsapp-accounts/:id/profile", async (req, res) => {
+  const a = await prisma.whatsAppAccount.findUnique({ where: { id: req.params.id } });
+  if (!a) return res.status(404).json({ error: "not found" });
+  if (!a.phoneNumberId || !a.accessToken) {
+    return res.status(400).json({ error: "Account has no live Meta credentials" });
+  }
+  try {
+    const { displayName, about, address, description, email, website, vertical } = req.body || {};
+    await updateBusinessProfile(a.phoneNumberId, a.accessToken, {
+      about, address, description, email, website, vertical,
+    });
+    if (displayName != null && String(displayName).trim()) {
+      await prisma.whatsAppAccount.update({
+        where: { id: a.id },
+        data: { businessName: String(displayName).trim() },
+      });
+    }
+    const profile = await fetchBusinessProfile(a.phoneNumberId, a.accessToken).catch(() => ({}));
+    res.json({ ok: true, profile });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post("/whatsapp-accounts/:id/profile/photo", profileUpload.single("file"), async (req, res) => {
+  const a = await prisma.whatsAppAccount.findUnique({ where: { id: req.params.id } });
+  if (!a) return res.status(404).json({ error: "not found" });
+  if (!a.phoneNumberId || !a.accessToken) {
+    return res.status(400).json({ error: "Account has no live Meta credentials" });
+  }
+  try {
+    if (!req.file?.buffer) return res.status(400).json({ error: "Image file required (JPG or PNG, max 5MB)" });
+    const handle = await uploadProfilePicture(
+      a.accessToken,
+      req.file.buffer,
+      req.file.mimetype,
+      req.file.originalname
+    );
+    await updateBusinessProfile(a.phoneNumberId, a.accessToken, { profile_picture_handle: handle });
+    const profile = await fetchBusinessProfile(a.phoneNumberId, a.accessToken).catch(() => ({}));
+    res.json({ ok: true, profile });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
   }
 });
 

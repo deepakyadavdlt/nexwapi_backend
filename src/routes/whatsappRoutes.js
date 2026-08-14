@@ -8,15 +8,20 @@ import fs from "fs";
 import path from "path";
 import { WA } from "../config/whatsapp.js";
 import { prisma, pickColor } from "../lib/prisma.js";
-import { sendText, sendButtons, fetchInboundMedia, getCompanyCreds } from "../lib/whatsappService.js";
+import { sendText, sendButtons, fetchInboundMedia, getCompanyCreds, assertLiveCreds } from "../lib/whatsappService.js";
 import { fireEvent } from "../lib/events.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
 const EXT = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf", "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3" };
 
 async function outboundChargeAndSend(companyId, to, sendFn, meta = {}) {
-  // Auto-replies / chatbot / away are Service (session) messages — no wallet debit.
   const creds = await getCompanyCreds(companyId);
+  assertLiveCreds(creds);
+  if (!creds) {
+    const err = new Error("WhatsApp is not connected");
+    err.status = 400;
+    throw err;
+  }
   return sendFn(creds);
 }
 
@@ -40,7 +45,7 @@ async function resolveCompanyId(value) {
   const phoneNumberId = value?.metadata?.phone_number_id || WA.phoneNumberId;
   if (phoneNumberId) {
     const acct = await prisma.whatsAppAccount.findFirst({
-      where: { phoneNumberId: String(phoneNumberId), isConnected: true },
+      where: { phoneNumberId: String(phoneNumberId) },
     });
     if (acct?.companyId) return acct.companyId;
   }
@@ -50,6 +55,16 @@ async function resolveCompanyId(value) {
     orderBy: { createdAt: "asc" },
   });
   return co?.id || null;
+}
+
+function keywordHit(lc, keyword) {
+  const t = String(keyword || "").trim().toLowerCase();
+  if (!t) return false;
+  if (t.length <= 3) {
+    const parts = lc.split(/[^a-z0-9]+/i).filter(Boolean);
+    return lc === t || parts.includes(t);
+  }
+  return lc.includes(t);
 }
 
 async function findAutoReply(text, companyId) {
@@ -62,7 +77,7 @@ async function findAutoReply(text, companyId) {
     if (a.matchType === "any") return true;
     if (!a.keyword) return false;
     const k = a.keyword.trim().toLowerCase();
-    return a.matchType === "exact" ? lc === k : lc.includes(k);
+    return a.matchType === "exact" ? lc === k : keywordHit(lc, k);
   });
 }
 
@@ -205,7 +220,7 @@ async function runChatbot(contact, m, text, companyId) {
   const flows = await prisma.flow.findMany({ where: { enabled: true, companyId: cid }, orderBy: { createdAt: "asc" } });
   for (const flow of flows) {
     if (!Array.isArray(flow.steps) || !flow.steps.length) continue;
-    const match = flow.triggerType === "any" || (flow.trigger && lc.includes(flow.trigger.toLowerCase()));
+    const match = flow.triggerType === "any" || keywordHit(lc, flow.trigger);
     if (match) { await sendStep(contact, flow, flow.steps[0], cid); return true; }
   }
   return false;
@@ -275,16 +290,18 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
         const value = change?.value;
         if (!value) continue;
         const companyId = await resolveCompanyId(value);
-        if (!companyId) {
+        if (!companyId && !(value.statuses || []).length) {
           console.warn("[wa] no company for phone_number_id", value?.metadata?.phone_number_id);
           continue;
         }
-        // Mark webhook activity
-        await prisma.whatsAppAccount.updateMany({
-          where: { companyId, phoneNumberId: String(value?.metadata?.phone_number_id || "") },
-          data: { lastWebhookAt: new Date(), webhookStatus: "connected" },
-        }).catch(() => {});
+        if (companyId) {
+          await prisma.whatsAppAccount.updateMany({
+            where: { companyId, phoneNumberId: String(value?.metadata?.phone_number_id || "") },
+            data: { lastWebhookAt: new Date(), webhookStatus: "connected" },
+          }).catch(() => {});
+        }
 
+        if (companyId) {
         const profileName = value?.contacts?.[0]?.profile?.name;
 
         for (const m of value.messages || []) {
@@ -393,10 +410,35 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             await maybeAway(contact, companyId);
           }
         }
+        }
 
         for (const s of value.statuses || []) {
-          await prisma.message.updateMany({ where: { waId: s.id, companyId }, data: { status: s.status } });
-          console.log("[wa] status", s.id, "->", s.status);
+          const next = String(s.status || "").toLowerCase();
+          if (!s.id || !next) continue;
+          const updated = await prisma.message.updateMany({
+            where: { waId: s.id },
+            data: { status: next },
+          });
+          if (updated.count === 0) {
+            console.log("[wa] status unmatched", s.id, next);
+            continue;
+          }
+          console.log("[wa] status", s.id, "->", next);
+          if (next === "delivered" || next === "read") {
+            const msg = await prisma.message.findFirst({ where: { waId: s.id } });
+            if (msg?.type === "template" && msg.companyId) {
+              const camp = await prisma.campaign.findFirst({
+                where: { companyId: msg.companyId, status: { in: ["running", "completed"] } },
+                orderBy: { updatedAt: "desc" },
+              });
+              if (camp) {
+                await prisma.campaign.update({
+                  where: { id: camp.id },
+                  data: next === "read" ? { read: { increment: 1 } } : { delivered: { increment: 1 } },
+                }).catch(() => {});
+              }
+            }
+          }
         }
       }
     }

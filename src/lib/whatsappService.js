@@ -51,13 +51,24 @@ async function send(payload, creds) {
   return data;
 }
 
+function waTo(to) {
+  return String(to || "").replace(/\D/g, "");
+}
+
+function waLang(code) {
+  const c = String(code || "en").trim();
+  if (c === "en") return "en_US";
+  if (c === "hi") return "hi_IN";
+  return c;
+}
+
 export function sendText(to, body, creds) {
-  return send({ to, type: "text", text: { body } }, creds);
+  return send({ to: waTo(to), type: "text", text: { body } }, creds);
 }
 
 export function sendButtons(to, bodyText, buttons, creds) {
   return send({
-    to,
+    to: waTo(to),
     type: "interactive",
     interactive: {
       type: "button",
@@ -73,7 +84,7 @@ export function sendButtons(to, bodyText, buttons, creds) {
 }
 
 export function sendTemplate(to, name, lang = "en", creds) {
-  return send({ to, type: "template", template: { name, language: { code: lang } } }, creds);
+  return send({ to: waTo(to), type: "template", template: { name, language: { code: waLang(lang) } } }, creds);
 }
 
 export async function uploadMedia(buffer, mimetype, filename, creds) {
@@ -104,30 +115,78 @@ export function sendTemplateWithParams(to, name, params = [], lang = "en", creds
     ? [{ type: "body", parameters: params.map((t) => ({ type: "text", text: String(t) })) }]
     : [];
   return send({
-    to,
+    to: waTo(to),
     type: "template",
-    template: { name, language: { code: lang }, components },
+    template: { name, language: { code: waLang(lang) }, components },
   }, creds);
 }
 
+function bodyExample(text) {
+  const nums = [...String(text || "").matchAll(/\{\{(\d+)\}\}/g)].map((m) => Number(m[1]));
+  if (!nums.length) return undefined;
+  const max = Math.max(...nums);
+  const row = Array.from({ length: max }, (_, i) => (i === 0 ? "Customer" : `Value ${i + 1}`));
+  return { body_text: [row] };
+}
+
+/** Map Nexwapi form fields to Meta Cloud API template create payload. */
+export function buildMetaTemplatePayload({
+  name, category, language, body, headerType, headerText, buttons,
+}) {
+  const components = [];
+  if (headerType === "text" && headerText) {
+    components.push({ type: "HEADER", format: "TEXT", text: headerText });
+  }
+  const example = bodyExample(body);
+  components.push({
+    type: "BODY",
+    text: body,
+    ...(example ? { example } : {}),
+  });
+  if (Array.isArray(buttons) && buttons.length) {
+    components.push({
+      type: "BUTTONS",
+      buttons: buttons.slice(0, 3).map((b) => {
+        const t = String(b.type || "QUICK_REPLY").toUpperCase();
+        if (t === "URL") return { type: "URL", text: String(b.text || "Open").slice(0, 25), url: b.url };
+        return { type: "QUICK_REPLY", text: String(b.text || "OK").slice(0, 25) };
+      }),
+    });
+  }
+  return {
+    name,
+    language: waLang(language),
+    category: String(category || "UTILITY").toUpperCase(),
+    components,
+  };
+}
+
 export async function createTemplate(payload, creds) {
-  const wabaId = creds?.wabaId || WA.wabaId;
-  const accessToken = creds?.accessToken || WA.accessToken;
-  if (!wabaId || !accessToken) throw new Error("WABA credentials missing");
+  if (creds?.incomplete) throw Object.assign(new Error("WhatsApp is not fully connected"), { status: 400 });
+  const wabaId = creds?.wabaId;
+  const accessToken = creds?.accessToken;
+  if (!wabaId || !accessToken) {
+    throw Object.assign(new Error("Connect WhatsApp first — then submit templates on your number."), { status: 400 });
+  }
   const version = WA.version || "v22.0";
+  const body = payload.components ? payload : buildMetaTemplatePayload(payload);
   const res = await fetch(`https://graph.facebook.com/${version}/${wabaId}/message_templates`, {
     method: "POST",
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(JSON.stringify(data));
-  return data;
+  if (!res.ok) {
+    const msg = data?.error?.error_user_msg || data?.error?.message || JSON.stringify(data);
+    throw new Error(msg);
+  }
+  return { ...data, language: body.language };
 }
 
 export async function listTemplates(creds) {
-  const wabaId = creds?.wabaId || WA.wabaId;
-  const accessToken = creds?.accessToken || WA.accessToken;
+  if (creds?.incomplete) return [];
+  const wabaId = creds?.wabaId;
+  const accessToken = creds?.accessToken;
   if (!wabaId || !accessToken) return [];
   const version = WA.version || "v22.0";
   const res = await fetch(

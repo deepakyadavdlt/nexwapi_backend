@@ -19,6 +19,7 @@ import {
 
 const UPLOAD_DIR = path.resolve("uploads");
 const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 16 * 1024 * 1024 } }); // 16MB (WhatsApp limit)
+const profileUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 // Map a mimetype to the WhatsApp media type.
 function waMediaType(mime) {
@@ -28,6 +29,10 @@ function waMediaType(mime) {
   return "document";
 }
 import { WA_LIVE } from "../config/whatsapp.js";
+import { ensureStarterMessaging } from "../lib/starterMessaging.js";
+import {
+  fetchBusinessProfile, updateBusinessProfile, uploadProfilePicture, VERTICALS,
+} from "../lib/waBusinessProfile.js";
 import { hashPassword, comparePassword, signToken, requireAuth } from "../lib/auth.js";
 import {
   attachCompany, companyIdOf, tenantWhere, publicCompanyUser, uniqueSlug,
@@ -260,7 +265,18 @@ router.post("/admin/clients/:id/plan", requireAuth, requireAdmin, async (req, re
   res.json(publicCompanyUser(owner || { id: req.user.id, name: company.name, email: company.email, role: "OWNER", companyId: company.id }, company));
 });
 
-/* ------------------------------ Billing -------------------------------- */
+function moneyInr(paise) {
+  return `₹${(Number(paise || 0) / 100).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+async function assignInvoiceNo(paymentId) {
+  const y = new Date();
+  const prefix = `NEX-${y.getFullYear()}${String(y.getMonth() + 1).padStart(2, "0")}-`;
+  const count = await prisma.payment.count({ where: { invoiceNo: { startsWith: prefix } } });
+  const invoiceNo = `${prefix}${String(count + 1).padStart(4, "0")}`;
+  await prisma.payment.update({ where: { id: paymentId }, data: { invoiceNo } }).catch(() => {});
+  return invoiceNo;
+}
 // Public billing config — tells the frontend if payments are live + the plan price.
 router.get("/billing/config", (_req, res) => {
   res.json({ enabled: RAZORPAY_ENABLED, keyId: RAZORPAY_KEY_ID, plans: PLAN_CATALOG, legacyPlans: PLANS });
@@ -322,6 +338,7 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
     where: { razorpayOrderId: razorpay_order_id },
     data: { status: "paid", razorpayPaymentId: razorpay_payment_id, paidAt: new Date() },
   });
+  if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
 
   let company;
   if (payment.type === "wallet_recharge") {
@@ -364,6 +381,74 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
   res.json({ ok: true, user: publicCompanyUser(user, company) });
 });
 
+function serializeInvoice(p, company) {
+  const planKey = normalizePlan(p.plan);
+  const planName = PLAN_CATALOG[planKey]?.name || planKey;
+  return {
+    id: p.id,
+    invoiceNo: p.invoiceNo,
+    type: p.type,
+    plan: planKey,
+    planName: p.type === "wallet_recharge" ? "Wallet recharge" : planName,
+    amount: p.amount,
+    amountLabel: moneyInr(p.amount),
+    currency: p.currency,
+    status: p.status,
+    razorpayPaymentId: p.razorpayPaymentId,
+    paidAt: p.paidAt ? p.paidAt.getTime() : p.createdAt.getTime(),
+    companyName: company?.name || null,
+  };
+}
+
+router.get("/billing/invoices", requireAuth, attachCompany, async (req, res) => {
+  const companyId = companyIdOf(req);
+  if (!companyId) return res.json([]);
+  const rows = await prisma.payment.findMany({
+    where: { companyId, status: "paid" },
+    orderBy: { paidAt: "desc" },
+  });
+  for (const p of rows) {
+    if (!p.invoiceNo) p.invoiceNo = await assignInvoiceNo(p.id);
+  }
+  res.json(rows.map((p) => serializeInvoice(p, req.company)));
+});
+
+router.get("/billing/invoices/:id", requireAuth, attachCompany, async (req, res) => {
+  const companyId = companyIdOf(req);
+  if (!companyId) return res.status(403).json({ error: "No company" });
+  const p = await prisma.payment.findFirst({ where: { id: req.params.id, companyId, status: "paid" } });
+  if (!p) return res.status(404).json({ error: "Invoice not found" });
+  if (!p.invoiceNo) p.invoiceNo = await assignInvoiceNo(p.id);
+  const inv = serializeInvoice(p, req.company);
+  const when = new Date(inv.paidAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>${inv.invoiceNo}</title>
+<style>
+  body{font-family:Segoe UI,Arial,sans-serif;color:#111;max-width:720px;margin:40px auto;padding:0 24px}
+  .row{display:flex;justify-content:space-between;align-items:flex-start}
+  h1{font-size:22px;margin:0} table{width:100%;border-collapse:collapse;margin-top:24px}
+  th,td{text-align:left;padding:10px 8px;border-bottom:1px solid #eee}
+  .muted{color:#666;font-size:13px} .total{font-size:18px;font-weight:800}
+  @media print { button{display:none} }
+</style></head><body>
+  <div class="row">
+    <div><h1>Nexwapi</h1><p class="muted">Tax invoice</p></div>
+    <div style="text-align:right"><b>${inv.invoiceNo}</b><div class="muted">${when}</div></div>
+  </div>
+  <p class="muted" style="margin-top:20px">Bill to<br><b>${inv.companyName || "Customer"}</b></p>
+  <table>
+    <thead><tr><th>Description</th><th>Payment ID</th><th>Amount</th></tr></thead>
+    <tbody>
+      <tr><td>${inv.planName} subscription</td><td class="muted">${inv.razorpayPaymentId || "—"}</td><td>${inv.amountLabel}</td></tr>
+    </tbody>
+  </table>
+  <p class="total" style="text-align:right;margin-top:16px">Paid ${inv.amountLabel}</p>
+  <p class="muted">This is a computer-generated invoice for Nexwapi software subscription. WhatsApp conversation charges are billed separately by Meta.</p>
+  <button onclick="window.print()" style="margin-top:24px;padding:10px 16px;border:0;border-radius:8px;background:#16a34a;color:#fff;font-weight:700;cursor:pointer">Download / Print</button>
+</body></html>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(html);
+});
+
 // Razorpay webhook — server-to-server confirmation. Reliable even if the client
 // closes the browser before /billing/verify runs. Needs express.raw (bypasses
 // the global JSON parser via the exclusion in index.js) so the HMAC matches.
@@ -385,6 +470,7 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
         where: { razorpayOrderId: orderId },
         data: { status: "paid", razorpayPaymentId: paymentId, paidAt: new Date() },
       });
+      if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
       if (payment.companyId) {
         if (payment.type === "wallet_recharge") {
           const { creditWallet, creditsFromPaise, getPlatformPricing } = await import("../lib/wallet.js");
@@ -1006,7 +1092,8 @@ router.get("/templates", async (req, res) => {
 });
 
 router.post("/templates", async (req, res) => {
-  const { name, category = "Utility", language = "en", body, headerType, headerText, headerImageUrl, buttons, format = "text", cards } = req.body || {};
+  const { name, category = "Utility", body, headerType, headerText, headerImageUrl, buttons, format = "text", cards } = req.body || {};
+  let language = req.body?.language || "en";
   if (!name || !body) return res.status(400).json({ error: "name and body required" });
   const cleanName = String(name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
 
@@ -1014,10 +1101,14 @@ router.post("/templates", async (req, res) => {
   let metaError = null;
   if (WA_LIVE) {
     try {
+      const creds = await getCompanyCreds(companyIdOf(req));
+      assertLiveCreds(creds);
+      if (!creds?.wabaId) throw new Error("WhatsApp is connected but WABA id is missing. Reconnect with Facebook.");
       const r = format === "carousel" && Array.isArray(cards) && cards.length
-        ? await createCarouselTemplate({ name: cleanName, category, language, body, cards })
-        : await createTemplate({ name: cleanName, category, language, body, headerType, headerText, headerImageUrl, buttons });
+        ? await createCarouselTemplate({ name: cleanName, category, language, body, cards }, creds)
+        : await createTemplate({ name: cleanName, category, language, body, headerType, headerText, headerImageUrl, buttons }, creds);
       status = (r.status || "pending").toLowerCase();
+      if (r.language) language = r.language;
     } catch (e) {
       metaError = e.message;
     }
@@ -1047,7 +1138,10 @@ router.post("/templates", async (req, res) => {
 router.post("/templates/sync", async (req, res) => {
   if (!WA_LIVE) return res.status(400).json({ error: "Not in live mode" });
   try {
-    const metaTemplates = await listTemplates();
+    const creds = await getCompanyCreds(companyIdOf(req));
+    assertLiveCreds(creds);
+    if (!creds?.wabaId) return res.status(400).json({ error: "Connect WhatsApp first, then sync templates." });
+    const metaTemplates = await listTemplates(creds);
     for (const mt of metaTemplates) {
       const status = (mt.status || "").toLowerCase();
       const existing = await prisma.template.findFirst({ where: { name: mt.name, ...tenantWhere(req) } });
@@ -1103,8 +1197,13 @@ router.post("/campaigns/:id/send", requireNotSuspended, async (req, res) => {
   const campaign = await prisma.campaign.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
   if (!campaign) return res.sendStatus(404);
   if (campaign.status === "running") return res.status(409).json({ error: "Campaign already running" });
-  res.json({ ok: true, status: "running" });
-  runCampaign(campaign.id).catch((e) => console.error("[campaign] run error:", e.message));
+  try {
+    const result = await runCampaign(campaign.id);
+    res.json({ ok: true, status: "completed", ...result });
+  } catch (e) {
+    console.error("[campaign] run error:", e.message);
+    res.status(400).json({ error: e.message || "Campaign failed" });
+  }
 });
 
 /* ----------------------------- Drip campaigns -------------------------- */
@@ -1311,6 +1410,9 @@ router.get("/whatsapp/account", async (req, res) => {
   const companyId = companyIdOf(req);
   const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
   if (!wa) return res.json({ connected: false, account: null });
+  if (wa.isConnected && wa.accessToken && wa.phoneNumberId) {
+    ensureStarterMessaging(companyId).catch((e) => console.warn("[starter]", e.message));
+  }
   res.json({
     connected: wa.isConnected,
     account: {
@@ -1481,6 +1583,71 @@ router.post("/whatsapp/refresh", async (req, res) => {
   }
 });
 
+async function loadWaForCompany(req) {
+  const companyId = companyIdOf(req);
+  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+  if (!wa?.phoneNumberId || !wa?.accessToken) {
+    const err = new Error("WhatsApp is not fully connected");
+    err.status = 400;
+    throw err;
+  }
+  return wa;
+}
+
+router.get("/whatsapp/profile", async (req, res) => {
+  try {
+    const wa = await loadWaForCompany(req);
+    const profile = await fetchBusinessProfile(wa.phoneNumberId, wa.accessToken);
+    res.json({
+      ...profile,
+      displayName: wa.businessName || wa.verifiedName || "",
+      verifiedName: wa.verifiedName || "",
+      phoneNumber: wa.displayPhoneNumber || wa.phoneNumber,
+      verticals: VERTICALS,
+    });
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e.message });
+  }
+});
+
+router.patch("/whatsapp/profile", async (req, res) => {
+  try {
+    const wa = await loadWaForCompany(req);
+    const { displayName, about, address, description, email, website, vertical } = req.body || {};
+    await updateBusinessProfile(wa.phoneNumberId, wa.accessToken, {
+      about, address, description, email, website, vertical,
+    });
+    if (displayName != null && String(displayName).trim()) {
+      await prisma.whatsAppAccount.update({
+        where: { id: wa.id },
+        data: { businessName: String(displayName).trim() },
+      });
+    }
+    const profile = await fetchBusinessProfile(wa.phoneNumberId, wa.accessToken).catch(() => ({}));
+    res.json({ ok: true, profile: { ...profile, displayName: displayName || wa.businessName } });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post("/whatsapp/profile/photo", profileUpload.single("file"), async (req, res) => {
+  try {
+    const wa = await loadWaForCompany(req);
+    if (!req.file?.buffer) return res.status(400).json({ error: "Image file required (JPG or PNG, max 5MB)" });
+    const handle = await uploadProfilePicture(
+      wa.accessToken,
+      req.file.buffer,
+      req.file.mimetype,
+      req.file.originalname
+    );
+    await updateBusinessProfile(wa.phoneNumberId, wa.accessToken, { profile_picture_handle: handle });
+    const profile = await fetchBusinessProfile(wa.phoneNumberId, wa.accessToken).catch(() => ({}));
+    res.json({ ok: true, profile });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 /* -------- Meta Embedded Signup (Facebook Login) -------- */
 router.get("/whatsapp/meta-config", (_req, res) => {
   const host = process.env.PUBLIC_API_URL || "";
@@ -1588,6 +1755,8 @@ router.post("/whatsapp/embedded-signup", async (req, res) => {
     const wa = existing
       ? await prisma.whatsAppAccount.update({ where: { id: existing.id }, data })
       : await prisma.whatsAppAccount.create({ data: { ...data, companyId, isDefault: true } });
+
+    ensureStarterMessaging(companyId).catch((e) => console.warn("[starter]", e.message));
 
     const host = process.env.PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`;
     res.json({

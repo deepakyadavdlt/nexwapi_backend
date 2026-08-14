@@ -42,8 +42,7 @@ export async function runCampaign(id) {
   const companyId = campaign.companyId;
   const company = await prisma.company.findUnique({ where: { id: companyId } });
   if (company?.status === "SUSPENDED") {
-    console.log(`[campaign] skip "${campaign.name}" — company SUSPENDED`);
-    return;
+    throw new Error("Account is suspended");
   }
   // Pay-as-you-go: allow EXPIRED if freeAccess OR has message credits
   if (
@@ -51,20 +50,25 @@ export async function runCampaign(id) {
     (company?.status === "EXPIRED" || company?.plan === "expired") &&
     (company?.messageCredits || 0) < 1
   ) {
-    console.log(`[campaign] skip "${campaign.name}" — EXPIRED with no credits`);
-    return;
+    throw new Error("Plan expired — add wallet credits or upgrade");
   }
 
-  const { getCompanyCreds } = await import("./whatsappService.js");
+  const { getCompanyCreds, assertLiveCreds } = await import("./whatsappService.js");
   const { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } = await import("./wallet.js");
   const creds = await getCompanyCreds(companyId);
+  assertLiveCreds(creds);
   const pricing = await getPlatformPricing();
   const creditsNeeded = pricing.creditPerOutbound || 1;
 
   const tpl = await prisma.template.findFirst({ where: { name: campaign.template, companyId } });
+  if (!tpl) throw new Error(`Template "${campaign.template}" not found. Create it under Templates first.`);
+  if (String(tpl.status).toLowerCase() !== "approved") {
+    throw new Error(`Template "${campaign.template}" is ${tpl.status}. Wait for Meta approval, then Sync from Meta.`);
+  }
   const varCount = tpl ? (tpl.body.match(/\{\{\d+\}\}/g) || []).length : 0;
   const lang = tpl?.language || "en";
   const contacts = await resolveAudienceContacts(campaign.audience, companyId);
+  if (!contacts.length) throw new Error("No opted-in contacts in this audience");
 
   await prisma.campaign.update({
     where: { id },
@@ -86,7 +90,7 @@ export async function runCampaign(id) {
       const r = params.length
         ? await sendTemplateWithParams(c.phone, campaign.template, params, lang, creds)
         : await sendTemplate(c.phone, campaign.template, lang, creds);
-      sent++; delivered++;
+      sent++;
       let text = tpl?.body || `[Template: ${campaign.template}]`;
       params.forEach((p, i) => { text = text.replace(`{{${i + 1}}}`, p); });
       await prisma.message.create({
@@ -100,7 +104,7 @@ export async function runCampaign(id) {
           status: "sent",
         },
       });
-      await prisma.campaign.update({ where: { id }, data: { sent, delivered } });
+      await prisma.campaign.update({ where: { id }, data: { sent } });
     } catch (e) {
       console.error("[campaign] failed to", c.phone, ":", e.message);
       if (debited) {
@@ -115,6 +119,7 @@ export async function runCampaign(id) {
   }
   await prisma.campaign.update({ where: { id }, data: { status: "completed", scheduledAt: null } });
   console.log(`[campaign] "${campaign.name}" done: ${sent}/${contacts.length} sent`);
+  return { sent, recipients: contacts.length };
 }
 
 export async function runDueCampaigns() {

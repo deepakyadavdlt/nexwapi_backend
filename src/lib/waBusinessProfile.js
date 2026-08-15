@@ -1,6 +1,12 @@
 // WhatsApp Cloud API — business profile (about, logo, contact details)
 import { WA } from "../config/whatsapp.js";
 
+export function platformWaCreds() {
+  if (!WA.phoneNumberId || !WA.accessToken) return null;
+  if (String(WA.accessToken).startsWith("EAAG...")) return null;
+  return { phoneNumberId: WA.phoneNumberId, accessToken: WA.accessToken };
+}
+
 const VERSION = WA.version || "v22.0";
 const APP_ID = process.env.WHATSAPP_APP_ID || WA.appId;
 

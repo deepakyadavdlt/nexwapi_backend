@@ -9,7 +9,7 @@ import { RAZORPAY_ENABLED } from "../lib/razorpay.js";
 import { creditWallet, getPlatformPricing } from "../lib/wallet.js";
 import multer from "multer";
 import {
-  fetchBusinessProfile, updateBusinessProfile, uploadProfilePicture, VERTICALS,
+  fetchBusinessProfile, updateBusinessProfile, uploadProfilePicture, VERTICALS, platformWaCreds,
 } from "../lib/waBusinessProfile.js";
 
 const router = express.Router();
@@ -737,6 +737,64 @@ router.get("/campaigns", async (_req, res) => {
     include: { company: { select: { name: true } } },
   });
   res.json(campaigns.map((c) => ({ ...c, companyName: c.company?.name })));
+});
+
+async function requirePlatformWa() {
+  const creds = platformWaCreds();
+  if (!creds) {
+    const err = new Error("Platform WhatsApp is not configured in backend .env (PHONE_NUMBER_ID + ACCESS_TOKEN).");
+    err.status = 400;
+    throw err;
+  }
+  return creds;
+}
+
+router.get("/platform-profile", async (_req, res) => {
+  try {
+    const creds = await requirePlatformWa();
+    const profile = await fetchBusinessProfile(creds.phoneNumberId, creds.accessToken);
+    res.json({
+      ...profile,
+      displayName: profile.about || "Nexwapi",
+      verifiedName: "",
+      phoneNumber: "",
+      verticals: VERTICALS,
+    });
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e.message });
+  }
+});
+
+router.patch("/platform-profile", async (req, res) => {
+  try {
+    const creds = await requirePlatformWa();
+    const { about, address, description, email, website, vertical } = req.body || {};
+    await updateBusinessProfile(creds.phoneNumberId, creds.accessToken, {
+      about, address, description, email, website, vertical,
+    });
+    const profile = await fetchBusinessProfile(creds.phoneNumberId, creds.accessToken).catch(() => ({}));
+    res.json({ ok: true, profile });
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e.message });
+  }
+});
+
+router.post("/platform-profile/photo", profileUpload.single("file"), async (req, res) => {
+  try {
+    const creds = await requirePlatformWa();
+    if (!req.file?.buffer) return res.status(400).json({ error: "Image file required (JPG or PNG, max 5MB)" });
+    const handle = await uploadProfilePicture(
+      creds.accessToken,
+      req.file.buffer,
+      req.file.mimetype,
+      req.file.originalname
+    );
+    await updateBusinessProfile(creds.phoneNumberId, creds.accessToken, { profile_picture_handle: handle });
+    const profile = await fetchBusinessProfile(creds.phoneNumberId, creds.accessToken).catch(() => ({}));
+    res.json({ ok: true, profile });
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e.message });
+  }
 });
 
 export default router;

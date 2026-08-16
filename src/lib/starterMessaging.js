@@ -42,7 +42,7 @@ export async function ensureStarterMessaging(companyId) {
         name: "Price keyword",
         keyword: "price",
         matchType: "contains",
-        reply: "Our plans start at ₹499/month. Reply HI to open the menu.",
+        reply: "Our plans start at ₹899/month for 2 team users. Reply HI to open the menu.",
         enabled: true,
       },
     });

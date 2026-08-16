@@ -23,11 +23,12 @@ enum CompanyStatus {
 }
 
 // Plan keys used in billing + feature gates
-// trial | starter (₹499) | growth (₹999) | expired
 enum PlanKey {
   trial
   starter
   growth
+  professional
+  enterprise
   expired
 }
 
@@ -434,7 +435,7 @@ model Setting {
   hoursEnd     Int      @default(18)
   days         String[] @default(["Mon", "Tue", "Wed", "Thu", "Fri"])
   businessName String   @default("Nexwapi")
-  autoAssign   Boolean  @default(false)
+  autoAssign   Boolean  @default(true)
   webhookUrl   String   @default("")
   csatEnabled  Boolean  @default(false)
   csatMessage  String   @default("Thanks for chatting with us! How would you rate your experience?")

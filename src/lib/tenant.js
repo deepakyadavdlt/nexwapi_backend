@@ -124,6 +124,8 @@ export function publicCompanyUser(user, company) {
     trialDaysLeft: daysLeft,
     trialExpired: expired,
     features,
+    agentLimit: planFeatures(plan).agentLimit,
+    unlimitedAgents: Boolean(planFeatures(plan).features.unlimitedAgents),
     walletBalancePaise: company?.walletBalancePaise ?? 0,
     messageCredits: company?.messageCredits ?? 0,
     isSuperAdmin: isSuperAdmin(user),
@@ -132,9 +134,11 @@ export function publicCompanyUser(user, company) {
 
 export async function ensureDefaultPlans() {
   const rows = [
-    { key: "trial", name: "Free Trial", amount: 0, api: true, unlimitedAgents: true, agentLimit: 99, contactLimit: 5000, messageLimit: 10000 },
-    { key: "starter", name: "Starter", amount: 49900, api: false, unlimitedAgents: false, agentLimit: 3, contactLimit: 2000, messageLimit: 5000 },
-    { key: "growth", name: "Growth", amount: 99900, api: true, unlimitedAgents: true, agentLimit: 99, contactLimit: 50000, messageLimit: 100000 },
+    { key: "trial", name: "Free Trial", amount: 0, api: true, unlimitedAgents: false, agentLimit: 2, contactLimit: 2000, messageLimit: 2000 },
+    { key: "starter", name: "Starter", amount: 89900, api: false, unlimitedAgents: false, agentLimit: 2, contactLimit: 5000, messageLimit: 10000 },
+    { key: "growth", name: "Growth", amount: 199900, api: true, unlimitedAgents: false, agentLimit: 5, contactLimit: 25000, messageLimit: 50000 },
+    { key: "professional", name: "Professional", amount: 499900, api: true, unlimitedAgents: false, agentLimit: 12, contactLimit: 100000, messageLimit: 200000 },
+    { key: "enterprise", name: "Enterprise", amount: 0, api: true, unlimitedAgents: true, agentLimit: 9999, contactLimit: 1000000, messageLimit: 10000000 },
     { key: "expired", name: "Expired", amount: 0, api: false, unlimitedAgents: false, agentLimit: 0, contactLimit: 0, messageLimit: 0, inbox: false, campaign: false, chatbot: false, automation: false },
   ];
   for (const r of rows) {

@@ -9,12 +9,12 @@ const KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
 export const RAZORPAY_ENABLED = Boolean(KEY_ID && KEY_SECRET);
 export const RAZORPAY_KEY_ID = KEY_ID || null;
 
-// Plans a client can buy. amount is in paise (₹499 = 49900, ₹999 = 99900).
-// "pro" kept as alias of growth for older frontend clients.
+// Plans a client can buy. amount is in paise.
 export const PLANS = {
-  starter: { name: "Starter", amount: 49900, currency: "INR", key: "starter" },
-  growth: { name: "Growth", amount: 99900, currency: "INR", key: "growth" },
-  pro: { name: "Growth", amount: 99900, currency: "INR", key: "growth" },
+  starter: { name: "Starter", amount: 89900, currency: "INR", key: "starter" },
+  growth: { name: "Growth", amount: 199900, currency: "INR", key: "growth" },
+  professional: { name: "Professional", amount: 499900, currency: "INR", key: "professional" },
+  pro: { name: "Growth", amount: 199900, currency: "INR", key: "growth" },
 };
 
 let instance = null;

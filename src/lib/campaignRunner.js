@@ -119,6 +119,18 @@ export async function runCampaign(id) {
   }
   await prisma.campaign.update({ where: { id }, data: { status: "completed", scheduledAt: null } });
   console.log(`[campaign] "${campaign.name}" done: ${sent}/${contacts.length} sent`);
+  try {
+    const owner = await prisma.user.findFirst({
+      where: { companyId: campaign.companyId, role: { in: ["OWNER", "ADMIN"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (owner?.email) {
+      const { sendCampaignStatus } = await import("./mailer.js");
+      await sendCampaignStatus(owner.email, campaign.name, "completed");
+    }
+  } catch (e) {
+    console.warn("[mail campaign]", e.message);
+  }
   return { sent, recipients: contacts.length };
 }
 

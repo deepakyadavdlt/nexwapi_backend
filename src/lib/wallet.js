@@ -136,6 +136,8 @@ export async function applyPlanCredits(companyId, planKey, createdBy = null) {
     trial: pricing.trialCredits,
     starter: pricing.starterCredits,
     growth: pricing.growthCredits,
+    professional: pricing.growthCredits,
+    enterprise: pricing.growthCredits,
   };
   const credits = map[planKey] || 0;
   if (!credits) return null;

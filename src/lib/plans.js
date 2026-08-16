@@ -5,30 +5,55 @@ export const PLAN_CATALOG = {
     name: "Free Trial",
     amount: 0,
     currency: "INR",
-    features: { inbox: true, campaign: true, chatbot: true, automation: true, api: true, unlimitedAgents: true },
-    agentLimit: 99,
-    contactLimit: 5000,
-    messageLimit: 10000,
+    period: "month",
+    features: { inbox: true, campaign: true, chatbot: true, automation: true, api: true, unlimitedAgents: false },
+    agentLimit: 2,
+    contactLimit: 2000,
+    messageLimit: 2000,
   },
   starter: {
     key: "starter",
     name: "Starter",
-    amount: 49900, // ₹499
+    amount: 89900,
     currency: "INR",
+    period: "month",
     features: { inbox: true, campaign: true, chatbot: true, automation: true, api: false, unlimitedAgents: false },
-    agentLimit: 3,
-    contactLimit: 2000,
-    messageLimit: 5000,
+    agentLimit: 2,
+    contactLimit: 5000,
+    messageLimit: 10000,
   },
   growth: {
     key: "growth",
     name: "Growth",
-    amount: 99900, // ₹999
+    amount: 199900,
     currency: "INR",
+    period: "month",
+    features: { inbox: true, campaign: true, chatbot: true, automation: true, api: true, unlimitedAgents: false },
+    agentLimit: 5,
+    contactLimit: 25000,
+    messageLimit: 50000,
+  },
+  professional: {
+    key: "professional",
+    name: "Professional",
+    amount: 499900,
+    currency: "INR",
+    period: "month",
+    features: { inbox: true, campaign: true, chatbot: true, automation: true, api: true, unlimitedAgents: false },
+    agentLimit: 12,
+    contactLimit: 100000,
+    messageLimit: 200000,
+  },
+  enterprise: {
+    key: "enterprise",
+    name: "Enterprise",
+    amount: 0,
+    currency: "INR",
+    period: "custom",
     features: { inbox: true, campaign: true, chatbot: true, automation: true, api: true, unlimitedAgents: true },
-    agentLimit: 99,
-    contactLimit: 50000,
-    messageLimit: 100000,
+    agentLimit: 9999,
+    contactLimit: 1000000,
+    messageLimit: 10000000,
   },
   expired: {
     key: "expired",
@@ -42,12 +67,18 @@ export const PLAN_CATALOG = {
   },
 };
 
-// Map legacy "pro" → growth for backward compat
+export const PAID_PLAN_KEYS = ["starter", "growth", "professional", "enterprise"];
+
 export function normalizePlan(plan) {
   if (!plan) return "trial";
   if (plan === "pro") return "growth";
+  if (plan === "advanced") return "professional";
   if (PLAN_CATALOG[plan]) return plan;
   return "trial";
+}
+
+export function isPaidPlan(plan) {
+  return PAID_PLAN_KEYS.includes(normalizePlan(plan));
 }
 
 export function planFeatures(plan) {
@@ -57,4 +88,10 @@ export function planFeatures(plan) {
 export function hasFeature(plan, feature) {
   const f = planFeatures(plan).features;
   return Boolean(f[feature]);
+}
+
+export function agentSeatLimit(plan) {
+  const p = planFeatures(plan);
+  if (p.features.unlimitedAgents) return Infinity;
+  return Number(p.agentLimit || 0);
 }

@@ -38,15 +38,32 @@ import {
   attachCompany, companyIdOf, tenantWhere, publicCompanyUser, uniqueSlug,
   requireNotSuspended, requireFeature, isSuperAdmin,
 } from "../lib/tenant.js";
-import { PLAN_CATALOG, normalizePlan, hasFeature } from "../lib/plans.js";
+import { PLAN_CATALOG, normalizePlan, hasFeature, isPaidPlan } from "../lib/plans.js";
+import { createAgentSeat, ensureOwnerAgent } from "../lib/teamSeats.js";
+import { digitsOnly, findCompanyContactByPhone } from "../lib/phone.js";
 import { RAZORPAY_ENABLED, RAZORPAY_KEY_ID, PLANS, razorpay, verifySignature, verifyWebhook } from "../lib/razorpay.js";
 import { runCampaign, resolveAudience } from "../lib/campaignRunner.js";
 import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
 import { loginLimiter, signupLimiter, apiMessageLimiter } from "../lib/rateLimit.js";
 import { findApiKeyByRaw, hashApiKey, keyPrefix, publicApiKeyRow } from "../lib/apiKey.js";
+import { mailConfigured, sendWelcome, sendInvoiceEmail, sendCampaignStatus, sendSuspension, sendTemplateStatus, sendSupportTicketAlert } from "../lib/mailer.js";
+import { issueOtp, verifyOtp, requireOtpOrSkip } from "../lib/otp.js";
+import { getLocalWaProfile, saveLocalWaProfile } from "../lib/localWaProfile.js";
 
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s);
+
+async function notifyOwnerTemplate(companyId, name, status) {
+  try {
+    const owner = await prisma.user.findFirst({
+      where: { companyId, role: { in: ["OWNER", "ADMIN"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (owner?.email) await sendTemplateStatus(owner.email, name, status);
+  } catch (e) {
+    console.warn("[mail template]", e.message);
+  }
+}
 
 const TRIAL_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -88,11 +105,19 @@ async function buildConversations(req) {
 /* -------------------------------- Auth --------------------------------- */
 // Create a new account (name, email, password) with a bcrypt-hashed password.
 router.post("/auth/signup", signupLimiter, async (req, res) => {
-  const { name, email, password, company: companyName } = req.body || {};
+  const { name, email, password, company: companyName, otp } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: "name, email and password required" });
   if (String(password).length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  const em = String(email).toLowerCase().trim();
+  if (mailConfigured()) {
+    if (!otp) {
+      await issueOtp(em, "signup", { name, email: em, password, company: companyName });
+      return res.json({ otpRequired: true });
+    }
+    const v = verifyOtp(em, "signup", otp);
+    if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
+  }
   try {
-    const em = String(email).toLowerCase().trim();
     const coName = String(companyName || name).trim();
     const slug = await uniqueSlug(coName);
     const trialEndsAt = new Date(Date.now() + TRIAL_DAYS * DAY_MS);
@@ -127,10 +152,8 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
     await prisma.subscription.create({
       data: { companyId: company.id, plan: "trial", status: "active", trialEndsAt },
     });
-    await prisma.setting.create({ data: { companyId: company.id, businessName: coName } });
-    await prisma.agent.create({
-      data: { companyId: company.id, name, email: user.email, role: "Owner" },
-    }).catch(() => {});
+    await prisma.setting.create({ data: { companyId: company.id, businessName: coName, autoAssign: true } });
+    await ensureOwnerAgent(company.id, { name, email: em }).catch(() => {});
     await prisma.walletTransaction.create({
       data: {
         companyId: company.id,
@@ -144,6 +167,7 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
       },
     }).catch(() => {});
 
+    sendWelcome(user.email, user.name).catch((e) => console.warn("[mail welcome]", e.message));
     res.status(201).json({ token: signToken(user), user: publicCompanyUser(user, company) });
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "An account with this email already exists" });
@@ -153,7 +177,7 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
 
 // Log in with email + password (bcrypt) against real database accounts only.
 router.post("/auth/login", loginLimiter, async (req, res) => {
-  const { email, password } = req.body || {};
+  const { email, password, otp } = req.body || {};
   const em = String(email || "").toLowerCase().trim();
 
   const user = await prisma.user.findUnique({
@@ -161,6 +185,14 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
     include: { company: { include: { subscription: true } } },
   });
   if (user?.password && (await comparePassword(password, user.password))) {
+    if (mailConfigured() && user.role !== "SUPER_ADMIN") {
+      if (!otp) {
+        await issueOtp(em, "login");
+        return res.json({ otpRequired: true });
+      }
+      const v = verifyOtp(em, "login", otp);
+      if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
+    }
     prisma.user.update({ where: { id: user.id }, data: { lastActiveAt: new Date(), lastLoginAt: new Date() } }).catch(() => {});
     if (user.companyId) {
       prisma.company.update({ where: { id: user.companyId }, data: { lastActiveAt: new Date() } }).catch(() => {});
@@ -169,6 +201,34 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
   }
 
   return res.status(401).json({ error: "Invalid email or password" });
+});
+
+router.post("/auth/forgot", signupLimiter, async (req, res) => {
+  const em = String(req.body?.email || "").toLowerCase().trim();
+  res.json({ ok: true });
+  if (!em) return;
+  const user = await prisma.user.findUnique({ where: { email: em } });
+  if (!user) return;
+  try {
+    const { sendPasswordResetLink } = await import("../lib/mailer.js");
+    await issueOtp(em, "reset");
+    await sendPasswordResetLink(em, em);
+  } catch (e) {
+    console.warn("[mail reset]", e.message);
+  }
+});
+
+router.post("/auth/reset", signupLimiter, async (req, res) => {
+  const em = String(req.body?.email || "").toLowerCase().trim();
+  const { code, password } = req.body || {};
+  if (!em || !code || !password) return res.status(400).json({ error: "email, code and password required" });
+  if (String(password).length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  const v = verifyOtp(em, "reset", code);
+  if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
+  const user = await prisma.user.findUnique({ where: { email: em } });
+  if (!user) return res.status(400).json({ error: "Account not found" });
+  await prisma.user.update({ where: { id: user.id }, data: { password: await hashPassword(password) } });
+  res.json({ ok: true });
 });
 
 router.get("/me", requireAuth, attachCompany, async (req, res) => {
@@ -183,6 +243,40 @@ router.get("/me", requireAuth, attachCompany, async (req, res) => {
       ? { impersonating: true, impersonatedBy: req.user.impersonatedBy }
       : {}),
   });
+});
+
+router.patch("/me", requireAuth, attachCompany, async (req, res) => {
+  const name = String(req.body?.name || "").trim();
+  const companyName = String(req.body?.company || req.body?.companyName || "").trim();
+  const data = {};
+  if (name) data.name = name;
+  const user = Object.keys(data).length
+    ? await prisma.user.update({
+      where: { id: req.user.id },
+      data,
+      include: { company: { include: { subscription: true } } },
+    })
+    : await prisma.user.findUnique({
+      where: { id: req.user.id },
+      include: { company: { include: { subscription: true } } },
+    });
+  if (companyName && user.companyId) {
+    await prisma.company.update({ where: { id: user.companyId }, data: { name: companyName } });
+    await prisma.setting.updateMany({ where: { companyId: user.companyId }, data: { businessName: companyName } });
+  }
+  const company = user.companyId
+    ? await prisma.company.findUnique({ where: { id: user.companyId }, include: { subscription: true } })
+    : user.company;
+  res.json(publicCompanyUser({ ...user, name: data.name || user.name }, company));
+});
+
+router.post("/otp/send", requireAuth, async (req, res) => {
+  try {
+    await issueOtp(req.user.email, req.body?.purpose || "login", req.body?.payload || {});
+    res.json({ ok: true, otpRequired: mailConfigured() });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 /* ------------------------- Admin: client management -------------------- */
@@ -247,11 +341,11 @@ router.post("/admin/clients/:id/plan", requireAuth, requireAdmin, async (req, re
   }
   const { plan } = req.body || {};
   const planKey = normalizePlan(plan);
-  if (!["trial", "starter", "growth", "expired"].includes(planKey)) {
+  if (!["trial", "starter", "growth", "professional", "enterprise", "expired"].includes(planKey)) {
     return res.status(400).json({ error: "invalid plan" });
   }
   const data = { plan: planKey };
-  if (planKey === "growth" || planKey === "starter") {
+  if (isPaidPlan(planKey)) {
     data.status = "ACTIVE";
     data.upgradedAt = new Date();
     data.trialEndsAt = null;
@@ -277,6 +371,22 @@ async function assignInvoiceNo(paymentId) {
   await prisma.payment.update({ where: { id: paymentId }, data: { invoiceNo } }).catch(() => {});
   return invoiceNo;
 }
+
+async function emailInvoiceFor(payment) {
+  try {
+    const fresh = await prisma.payment.findUnique({ where: { id: payment.id } });
+    if (!fresh?.companyId) return;
+    const owner = await prisma.user.findFirst({
+      where: { companyId: fresh.companyId, role: { in: ["OWNER", "ADMIN"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (owner?.email) {
+      await sendInvoiceEmail(owner.email, { invoiceNo: fresh.invoiceNo, amount: fresh.amount, plan: fresh.plan });
+    }
+  } catch (e) {
+    console.warn("[mail invoice]", e.message);
+  }
+}
 // Public billing config — tells the frontend if payments are live + the plan price.
 router.get("/billing/config", (_req, res) => {
   res.json({ enabled: RAZORPAY_ENABLED, keyId: RAZORPAY_KEY_ID, plans: PLAN_CATALOG, legacyPlans: PLANS });
@@ -286,8 +396,8 @@ router.get("/billing/config", (_req, res) => {
 router.post("/billing/create-order", requireAuth, attachCompany, async (req, res) => {
   if (!RAZORPAY_ENABLED) return res.status(503).json({ error: "Payments are not configured yet. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET." });
   const planKey = normalizePlan(req.body?.planKey || req.body?.plan || "growth");
-  if (!["starter", "growth"].includes(planKey)) {
-    return res.status(400).json({ error: "planKey must be starter or growth" });
+  if (!["starter", "growth", "professional"].includes(planKey)) {
+    return res.status(400).json({ error: "planKey must be starter, growth or professional" });
   }
   const plan = PLAN_CATALOG[planKey];
   const companyId = companyIdOf(req);
@@ -339,8 +449,7 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
     data: { status: "paid", razorpayPaymentId: razorpay_payment_id, paidAt: new Date() },
   });
   if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
-
-  let company;
+  emailInvoiceFor(payment);
   if (payment.type === "wallet_recharge") {
     const pricing = await getPlatformPricing();
     const credits = payment.creditsAdded || creditsFromPaise(payment.amount, pricing.creditsPerRupee);
@@ -471,6 +580,7 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
         data: { status: "paid", razorpayPaymentId: paymentId, paidAt: new Date() },
       });
       if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
+      emailInvoiceFor(payment);
       if (payment.companyId) {
         if (payment.type === "wallet_recharge") {
           const { creditWallet, creditsFromPaise, getPlatformPricing } = await import("../lib/wallet.js");
@@ -589,21 +699,52 @@ router.get("/contacts", async (req, res) => {
 router.post("/contacts", async (req, res) => {
   const { name, phone, tags = [] } = req.body || {};
   if (!name || !phone) return res.status(400).json({ error: "name and phone required" });
-  const cleanPhone = String(phone).replace(/[^\d]/g, "");
+  const cleanPhone = digitsOnly(phone);
+  const companyId = companyIdOf(req);
+  const tagList = Array.isArray(tags) ? tags : String(tags).split(",").map((t) => t.trim()).filter(Boolean);
+  const existing = await findCompanyContactByPhone(prisma, companyId, cleanPhone);
+  if (existing) {
+    const contact = await prisma.contact.update({
+      where: { id: existing.id },
+      data: { name: String(name).trim(), ...(tagList.length ? { tags: tagList } : {}) },
+    });
+    return res.json({ ...contact, createdAt: contact.createdAt.getTime() });
+  }
   const count = await prisma.contact.count({ where: tenantWhere(req) });
   try {
     const contact = await prisma.contact.create({
       data: {
-        companyId: companyIdOf(req),
-        name,
+        companyId,
+        name: String(name).trim(),
         phone: cleanPhone,
-        tags: Array.isArray(tags) ? tags : String(tags).split(",").map((t) => t.trim()).filter(Boolean),
+        tags: tagList,
         color: pickColor(count),
       },
     });
     res.status(201).json({ ...contact, createdAt: contact.createdAt.getTime() });
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "Contact with this number already exists" });
+    throw e;
+  }
+});
+
+router.patch("/contacts/:id", async (req, res) => {
+  const existing = await tenantContact(req, req.params.id);
+  if (!existing) return res.status(404).json({ error: "Contact not found" });
+  const data = {};
+  if (req.body?.name != null) data.name = String(req.body.name).trim();
+  if (req.body?.phone != null) data.phone = String(req.body.phone).replace(/[^\d]/g, "");
+  if (req.body?.tags != null) {
+    data.tags = Array.isArray(req.body.tags)
+      ? req.body.tags
+      : String(req.body.tags).split(",").map((t) => t.trim()).filter(Boolean);
+  }
+  if (req.body?.optedIn != null) data.optedIn = Boolean(req.body.optedIn);
+  try {
+    const contact = await prisma.contact.update({ where: { id: existing.id }, data });
+    res.json({ ...contact, createdAt: contact.createdAt.getTime() });
+  } catch (e) {
+    if (e.code === "P2002") return res.status(409).json({ error: "Another contact already uses this number" });
     throw e;
   }
 });
@@ -691,7 +832,7 @@ router.patch("/conversations/:id/status", async (req, res) => {
   try {
     const existing = await tenantContact(req, req.params.id);
     if (!existing) return res.sendStatus(404);
-    const c = await prisma.contact.update({ where: { id: existing.id }, data: { chatStatus: status } });
+    const c = await prisma.contact.update({ where: { id: existing.id }, data: { chatStatus: status, ...(status === "resolved" ? {} : {}) } });
     fireEvent("chat.status", { name: c.name, phone: c.phone, status }).catch(() => {});
     logActivity(c.id, "status", `Chat marked ${status}`);
 
@@ -756,27 +897,33 @@ router.get("/agents", async (req, res) => {
 });
 
 router.post("/agents", async (req, res) => {
-  const { name, email, role = "Agent" } = req.body || {};
+  const { name, email, role = "Agent", otp, password } = req.body || {};
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
-  const colors = ["#25D366", "#128C7E", "#34B7F1", "#7C3AED", "#F59E0B", "#EF4444"];
+  const gate = await requireOtpOrSkip(req.user.email, "user_add", otp);
+  if (gate.otpRequired) return res.json({ otpRequired: true });
+  if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
   try {
-    const count = await prisma.agent.count({ where: tenantWhere(req) });
-    const agent = await prisma.agent.create({
-      data: { companyId: companyIdOf(req), name, email, role, color: colors[count % colors.length] },
-    });
-    res.status(201).json({ ...agent, createdAt: agent.createdAt.getTime() });
+    const { agent, login } = await createAgentSeat(companyIdOf(req), { name, email, role, password });
+    res.status(201).json({ ...agent, loginEmail: login.email, tempPassword: login.password });
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "Agent with this email already exists" });
+    if (e.status) return res.status(e.status).json({ error: e.message, code: e.code, limit: e.limit, used: e.used });
     throw e;
   }
 });
 
 router.delete("/agents/:id", async (req, res) => {
   try {
+    const gate = await requireOtpOrSkip(req.user.email, "user_delete", req.body?.otp || req.query?.otp);
+    if (gate.otpRequired) return res.json({ otpRequired: true });
+    if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
     const agent = await prisma.agent.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (!agent) return res.sendStatus(404);
     await prisma.contact.updateMany({ where: { assignedAgentId: agent.id, ...tenantWhere(req) }, data: { assignedAgentId: null } });
     await prisma.agent.delete({ where: { id: agent.id } });
+    if (agent.role !== "Owner") {
+      await prisma.user.deleteMany({ where: { email: agent.email, companyId: companyIdOf(req), role: { in: ["AGENT", "ADMIN"] } } }).catch(() => {});
+    }
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -1146,7 +1293,11 @@ router.post("/templates/sync", async (req, res) => {
       const status = (mt.status || "").toLowerCase();
       const existing = await prisma.template.findFirst({ where: { name: mt.name, ...tenantWhere(req) } });
       if (existing) {
+        const prev = existing.status;
         await prisma.template.update({ where: { id: existing.id }, data: { status, category: cap(mt.category), language: mt.language } });
+        if (prev !== status && /approv|reject/i.test(status)) {
+          notifyOwnerTemplate(companyIdOf(req), mt.name, status);
+        }
       } else {
         await prisma.template.create({
           data: {
@@ -1526,6 +1677,9 @@ router.post("/whatsapp/connect", async (req, res) => {
 });
 
 router.post("/whatsapp/disconnect", async (req, res) => {
+  const gate = await requireOtpOrSkip(req.user.email, "wa_disconnect", req.body?.otp);
+  if (gate.otpRequired) return res.json({ otpRequired: true });
+  if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
   const companyId = companyIdOf(req);
   await prisma.whatsAppAccount.updateMany({
     where: { companyId },
@@ -1585,26 +1739,53 @@ router.post("/whatsapp/refresh", async (req, res) => {
 
 async function loadWaForCompany(req) {
   const companyId = companyIdOf(req);
-  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
-  if (!wa?.phoneNumberId || !wa?.accessToken) {
-    const err = new Error("WhatsApp is not fully connected");
-    err.status = 400;
-    throw err;
-  }
-  return wa;
+  if (!companyId) return null;
+  return prisma.whatsAppAccount.findFirst({
+    where: {
+      companyId,
+      phoneNumberId: { not: null },
+      accessToken: { not: null },
+    },
+    orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }],
+  });
 }
 
 router.get("/whatsapp/profile", async (req, res) => {
   try {
+    const companyId = companyIdOf(req);
     const wa = await loadWaForCompany(req);
-    const profile = await fetchBusinessProfile(wa.phoneNumberId, wa.accessToken);
-    res.json({
-      ...profile,
-      displayName: wa.businessName || wa.verifiedName || "",
-      verifiedName: wa.verifiedName || "",
-      phoneNumber: wa.displayPhoneNumber || wa.phoneNumber,
+    const setting = companyId ? await prisma.setting.findUnique({ where: { companyId } }).catch(() => null) : null;
+    const local = getLocalWaProfile(companyId);
+    const base = {
+      displayName: local.displayName || wa?.businessName || setting?.businessName || req.company?.name || "",
+      verifiedName: wa?.verifiedName || "",
+      phoneNumber: wa?.displayPhoneNumber || wa?.phoneNumber || "",
+      about: local.about || "",
+      address: local.address || "",
+      description: local.description || "",
+      email: local.email || "",
+      website: local.website || "",
+      vertical: local.vertical || "OTHER",
+      profilePictureUrl: local.profilePictureUrl || "",
       verticals: VERTICALS,
-    });
+      live: false,
+    };
+    if (!wa?.phoneNumberId || !wa?.accessToken) {
+      return res.json({ ...base, connected: false, hint: "Connect WhatsApp to sync this profile to Meta. You can still save it here." });
+    }
+    try {
+      const profile = await fetchBusinessProfile(wa.phoneNumberId, wa.accessToken);
+      return res.json({
+        ...base,
+        ...profile,
+        displayName: wa.businessName || profile.about || base.displayName,
+        website: profile.website || base.website,
+        live: true,
+        connected: true,
+      });
+    } catch (e) {
+      return res.json({ ...base, connected: true, live: false, hint: e.message });
+    }
   } catch (e) {
     res.status(e.status || 400).json({ error: e.message });
   }
@@ -1612,19 +1793,24 @@ router.get("/whatsapp/profile", async (req, res) => {
 
 router.patch("/whatsapp/profile", async (req, res) => {
   try {
-    const wa = await loadWaForCompany(req);
+    const companyId = companyIdOf(req);
     const { displayName, about, address, description, email, website, vertical } = req.body || {};
-    await updateBusinessProfile(wa.phoneNumberId, wa.accessToken, {
-      about, address, description, email, website, vertical,
-    });
-    if (displayName != null && String(displayName).trim()) {
-      await prisma.whatsAppAccount.update({
-        where: { id: wa.id },
-        data: { businessName: String(displayName).trim() },
-      });
+    const saved = saveLocalWaProfile(companyId, { displayName, about, address, description, email, website, vertical });
+    const wa = await loadWaForCompany(req);
+    if (displayName && wa) {
+      await prisma.whatsAppAccount.update({ where: { id: wa.id }, data: { businessName: String(displayName).trim() } });
     }
-    const profile = await fetchBusinessProfile(wa.phoneNumberId, wa.accessToken).catch(() => ({}));
-    res.json({ ok: true, profile: { ...profile, displayName: displayName || wa.businessName } });
+    if (displayName && companyId) {
+      await prisma.setting.updateMany({ where: { companyId }, data: { businessName: String(displayName).trim() } });
+    }
+    if (wa?.phoneNumberId && wa?.accessToken) {
+      await updateBusinessProfile(wa.phoneNumberId, wa.accessToken, {
+        about, address, description, email, website, vertical,
+      });
+      const profile = await fetchBusinessProfile(wa.phoneNumberId, wa.accessToken).catch(() => saved);
+      return res.json({ ok: true, live: true, profile: { ...profile, displayName: displayName || wa.businessName } });
+    }
+    res.json({ ok: true, live: false, profile: saved, hint: "Saved in Nexwapi. Connect WhatsApp to push this to Meta." });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -1633,6 +1819,9 @@ router.patch("/whatsapp/profile", async (req, res) => {
 router.post("/whatsapp/profile/photo", profileUpload.single("file"), async (req, res) => {
   try {
     const wa = await loadWaForCompany(req);
+    if (!wa?.phoneNumberId || !wa?.accessToken) {
+      return res.status(400).json({ error: "Connect WhatsApp first to upload a logo to Meta." });
+    }
     if (!req.file?.buffer) return res.status(400).json({ error: "Image file required (JPG or PNG, max 5MB)" });
     const handle = await uploadProfilePicture(
       wa.accessToken,
@@ -1867,6 +2056,9 @@ router.get("/api-keys", async (req, res) => {
 });
 
 router.post("/api-keys", requireFeature("api"), async (req, res) => {
+  const gate = await requireOtpOrSkip(req.user.email, "api_create", req.body?.otp);
+  if (gate.otpRequired) return res.json({ otpRequired: true });
+  if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
   const { name = "Default key" } = req.body || {};
   const rawKey = "nex_" + crypto.randomBytes(24).toString("hex");
   const hashed = `sha256:${hashApiKey(rawKey)}`;
@@ -1883,6 +2075,9 @@ router.post("/api-keys", requireFeature("api"), async (req, res) => {
 
 router.delete("/api-keys/:id", async (req, res) => {
   try {
+    const gate = await requireOtpOrSkip(req.user.email, "api_delete", req.body?.otp || req.query?.otp);
+    if (gate.otpRequired) return res.json({ otpRequired: true });
+    if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
     const deleted = await prisma.apiKey.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
@@ -1952,6 +2147,7 @@ router.get("/reports", async (req, res) => {
 /* ------------------------------ Analytics ------------------------------ */
 router.get("/analytics", async (req, res) => {
   const tw = tenantWhere(req);
+  const companyId = companyIdOf(req);
   const [contacts, agg, conversations] = await Promise.all([
     prisma.contact.count({ where: tw }),
     prisma.campaign.aggregate({ where: tw, _sum: { sent: true, delivered: true, read: true, replied: true }, _count: true }),
@@ -1961,30 +2157,168 @@ router.get("/analytics", async (req, res) => {
   const sent = agg._sum.sent || 0;
   const delivered = agg._sum.delivered || 0;
   const read = agg._sum.read || 0;
+  const replied = agg._sum.replied || 0;
   const openChats = conversations.filter((c) => c.unread > 0).length;
+  const unreadInbox = conversations.reduce((s, c) => s + (c.unread || 0), 0);
 
-  const series = [
-    { day: "Mon", sent: 620, delivered: 600, read: 480 },
-    { day: "Tue", sent: 810, delivered: 790, read: 610 },
-    { day: "Wed", sent: 540, delivered: 520, read: 410 },
-    { day: "Thu", sent: 980, delivered: 940, read: 760 },
-    { day: "Fri", sent: 1200, delivered: 1160, read: 905 },
-    { day: "Sat", sent: 760, delivered: 740, read: 590 },
-    { day: "Sun", sent: 430, delivered: 420, read: 330 },
-  ];
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const series = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - i);
+    const next = new Date(d);
+    next.setDate(next.getDate() + 1);
+    const [out, dels, reads] = await Promise.all([
+      prisma.message.count({ where: { ...tw, direction: "out", at: { gte: d, lt: next } } }),
+      prisma.message.count({ where: { ...tw, direction: "out", status: { in: ["delivered", "read"] }, at: { gte: d, lt: next } } }),
+      prisma.message.count({ where: { ...tw, direction: "out", status: "read", at: { gte: d, lt: next } } }),
+    ]);
+    series.push({
+      day: days[d.getDay()],
+      label: d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
+      sent: out,
+      delivered: dels,
+      read: reads,
+    });
+  }
+
+  const startToday = new Date();
+  startToday.setHours(0, 0, 0, 0);
+  const hourly = [];
+  for (const h of [0, 3, 6, 9, 12, 15, 18, 21]) {
+    const a = new Date(startToday);
+    a.setHours(h, 0, 0, 0);
+    const b = new Date(a);
+    b.setHours(h + 3, 0, 0, 0);
+    const [hs, hd] = await Promise.all([
+      prisma.message.count({ where: { ...tw, direction: "out", at: { gte: a, lt: b } } }),
+      prisma.message.count({ where: { ...tw, direction: "out", status: { in: ["delivered", "read"] }, at: { gte: a, lt: b } } }),
+    ]);
+    const label = h === 0 ? "12 AM" : h < 12 ? `${h} AM` : h === 12 ? "12 PM" : `${h - 12} PM`;
+    hourly.push({ hour: label, sent: hs, delivered: hd });
+  }
+
+  const [failed, templates, automations, flows, agents, integrations, lastMsgs, paid] = await Promise.all([
+    prisma.message.count({ where: { ...tw, direction: "out", status: "failed" } }),
+    prisma.template.count({ where: tw }),
+    prisma.automation.count({ where: tw }),
+    prisma.flow.count({ where: tw }),
+    prisma.agent.count({ where: tw }),
+    prisma.apiKey.count({ where: tw }).catch(() => 0),
+    prisma.message.findMany({
+      where: tw,
+      orderBy: { at: "desc" },
+      take: 8,
+      include: { contact: { select: { name: true, phone: true } } },
+    }),
+    prisma.payment.aggregate({ where: { companyId: companyId || "__none__", status: "paid" }, _sum: { amount: true } }).catch(() => ({ _sum: { amount: 0 } })),
+  ]);
+
+  const spark = (key) => series.map((s) => s[key] || 0);
 
   res.json({
     kpis: {
       contacts,
       sent,
-      deliveredRate: sent ? Math.round((delivered / sent) * 100) : 0,
-      readRate: sent ? Math.round((read / sent) * 100) : 0,
-      replied: agg._sum.replied || 0,
+      delivered,
+      deliveredRate: sent ? Math.round((delivered / sent) * 1000) / 10 : 0,
+      readRate: sent ? Math.round((read / sent) * 1000) / 10 : 0,
+      clickRate: sent ? Math.round((replied / sent) * 1000) / 10 : 0,
+      replied,
       openChats,
+      unreadInbox,
       campaigns: agg._count || 0,
+      failed,
+      revenuePaise: paid._sum?.amount || 0,
     },
     series,
+    hourly,
+    extras: { templates, automations, flows, agents, integrations, autoReplies: automations },
+    feed: lastMsgs.map((m) => ({
+      id: m.id,
+      type: m.direction === "in" ? "inbound" : m.status,
+      text: m.direction === "in" ? "New inbound message" : m.status === "read" ? "Message read" : m.status === "delivered" ? "Message delivered" : "Message sent",
+      who: m.contact?.name || (m.contact?.phone ? `+${m.contact.phone}` : ""),
+      at: m.at.getTime(),
+    })),
+    sparks: {
+      contacts: spark("sent"),
+      sent: spark("sent"),
+      delivered: spark("delivered"),
+      read: spark("read"),
+      replied: spark("read"),
+    },
+    liveAt: Date.now(),
   });
+});
+
+function serializeTicket(t) {
+  const company = t.company || null;
+  const user = t.user || null;
+  return {
+    id: t.id,
+    subject: t.subject,
+    body: t.body,
+    status: t.status,
+    priority: t.priority,
+    createdAt: t.createdAt.getTime(),
+    updatedAt: t.updatedAt.getTime(),
+    companyId: t.companyId,
+    userId: t.userId,
+    client: {
+      name: user?.name || company?.name || "—",
+      email: user?.email || company?.email || "—",
+      company: company?.name || "—",
+      plan: company?.plan || null,
+      phone: company?.phone || null,
+    },
+  };
+}
+
+router.get("/tickets", async (req, res) => {
+  const companyId = companyIdOf(req);
+  if (!companyId) return res.status(403).json({ error: "No workspace" });
+  const tickets = await prisma.ticket.findMany({
+    where: { companyId },
+    include: { company: true, user: true },
+    orderBy: { createdAt: "desc" },
+    take: 100,
+  });
+  res.json(tickets.map(serializeTicket));
+});
+
+router.post("/tickets", async (req, res) => {
+  const companyId = companyIdOf(req);
+  if (!companyId) return res.status(403).json({ error: "No workspace" });
+  const subject = String(req.body?.subject || "").trim();
+  const body = String(req.body?.body || req.body?.message || "").trim();
+  const priority = ["low", "normal", "high", "urgent"].includes(String(req.body?.priority || "").toLowerCase())
+    ? String(req.body.priority).toLowerCase()
+    : "normal";
+  if (!subject) return res.status(400).json({ error: "Subject is required" });
+  if (!body) return res.status(400).json({ error: "Message is required" });
+  const ticket = await prisma.ticket.create({
+    data: {
+      companyId,
+      userId: req.user.id,
+      subject: subject.slice(0, 200),
+      body: body.slice(0, 5000),
+      priority,
+      status: "open",
+    },
+    include: { company: true, user: true },
+  });
+  sendSupportTicketAlert({
+    subject: ticket.subject,
+    body: ticket.body,
+    priority: ticket.priority,
+    name: req.user.name,
+    email: req.user.email,
+    company: ticket.company?.name,
+    plan: ticket.company?.plan,
+  }).catch((e) => console.warn("[mail ticket]", e.message));
+  res.status(201).json(serializeTicket(ticket));
 });
 
 export default router;

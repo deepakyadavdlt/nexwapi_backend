@@ -3,7 +3,8 @@ import express from "express";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth, requireSuperAdmin, signImpersonationToken } from "../lib/auth.js";
 import { publicCompanyUser, uniqueSlug } from "../lib/tenant.js";
-import { PLAN_CATALOG, normalizePlan } from "../lib/plans.js";
+import { PLAN_CATALOG, normalizePlan, isPaidPlan } from "../lib/plans.js";
+import { createAgentSeat } from "../lib/teamSeats.js";
 import { WA_LIVE } from "../config/whatsapp.js";
 import { RAZORPAY_ENABLED } from "../lib/razorpay.js";
 import { creditWallet, getPlatformPricing } from "../lib/wallet.js";
@@ -71,6 +72,42 @@ router.get("/overview", async (_req, res) => {
   });
   const mrr = paidThisMonth.reduce((s, p) => s + p.amount, 0);
 
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const series = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - i);
+    const next = new Date(d);
+    next.setDate(next.getDate() + 1);
+    const [msgs, inbound, paid] = await Promise.all([
+      prisma.message.count({ where: { direction: "out", at: { gte: d, lt: next } } }),
+      prisma.message.count({ where: { direction: "in", at: { gte: d, lt: next } } }),
+      prisma.payment.aggregate({ where: { status: "paid", paidAt: { gte: d, lt: next } }, _sum: { amount: true } }),
+    ]);
+    series.push({
+      day: days[d.getDay()],
+      label: d.toLocaleDateString("en-IN", { day: "numeric", month: "short" }),
+      messages: msgs,
+      inbound,
+      revenue: paid._sum.amount || 0,
+      rupees: Math.round((paid._sum.amount || 0) / 100),
+    });
+  }
+
+  const startToday = new Date();
+  startToday.setHours(0, 0, 0, 0);
+  const [inboundToday, openTickets] = await Promise.all([
+    prisma.message.count({ where: { direction: "in", at: { gte: startToday } } }),
+    prisma.ticket.count({ where: { status: { in: ["open", "pending"] } } }).catch(() => 0),
+  ]);
+
+  const planMix = {};
+  for (const c of clients) {
+    const key = c.plan || "trial";
+    planMix[key] = (planMix[key] || 0) + 1;
+  }
+
   res.json({
     summary: {
       total: clients.length,
@@ -82,9 +119,13 @@ router.get("/overview", async (_req, res) => {
       mrr,
       arr: mrr * 12,
       messagesSentToday: messagesToday,
+      inboundToday,
+      openTickets,
       waConnected: clients.filter((c) => c.whatsappConnected).length,
+      campaigns: campaigns.length,
     },
-    topClients: [...clients].sort((a, b) => b.revenue - a.revenue).slice(0, 5),
+    planMix,
+    topClients: [...clients].sort((a, b) => b.revenue - a.revenue).slice(0, 6),
     topCampaigns: campaigns.map((c) => ({
       id: c.id,
       name: c.name,
@@ -94,6 +135,8 @@ router.get("/overview", async (_req, res) => {
       status: c.status,
       companyId: c.companyId,
     })),
+    series,
+    liveAt: Date.now(),
   });
 });
 
@@ -127,11 +170,11 @@ router.get("/clients", async (_req, res) => {
 router.post("/clients/:id/plan", async (req, res) => {
   let { plan } = req.body || {};
   plan = normalizePlan(plan === "pro" ? "growth" : plan);
-  if (!["trial", "starter", "growth", "expired"].includes(plan)) {
+  if (!["trial", "starter", "growth", "professional", "enterprise", "expired"].includes(plan)) {
     return res.status(400).json({ error: "invalid plan" });
   }
   const data = { plan };
-  if (plan === "starter" || plan === "growth") {
+  if (isPaidPlan(plan)) {
     data.status = "ACTIVE";
     data.upgradedAt = new Date();
     data.trialEndsAt = null;
@@ -154,7 +197,7 @@ router.post("/clients/:id/plan", async (req, res) => {
       trialEndsAt: company.trialEndsAt,
     },
   }).catch(() => {});
-  if (plan === "starter" || plan === "growth" || plan === "trial") {
+  if (isPaidPlan(plan) || plan === "trial") {
     const { applyPlanCredits } = await import("../lib/wallet.js");
     await applyPlanCredits(company.id, plan, req.user.id).catch(() => {});
   }
@@ -162,6 +205,27 @@ router.post("/clients/:id/plan", async (req, res) => {
     data: { companyId: company.id, userId: req.user.id, action: "plan_change", entity: "Company", entityId: company.id, meta: { plan } },
   }).catch(() => {});
   res.json(company);
+});
+
+router.post("/clients/:id/team-user", async (req, res) => {
+  const { name, email, role = "Agent", password } = req.body || {};
+  if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  try {
+    const { agent, login } = await createAgentSeat(req.params.id, { name, email, role, password });
+    res.status(201).json({
+      ok: true,
+      agent,
+      loginEmail: login.email,
+      tempPassword: login.password,
+      message: login.password
+        ? `Login created. Email: ${login.email}  Password: ${login.password}`
+        : "User already had a login. Agent seat added.",
+    });
+  } catch (e) {
+    if (e.code === "P2002") return res.status(409).json({ error: "This email is already a team member" });
+    if (e.status) return res.status(e.status).json({ error: e.message, code: e.code, limit: e.limit, used: e.used });
+    res.status(400).json({ error: e.message });
+  }
 });
 
 router.post("/clients/:id/suspend", async (req, res) => {
@@ -713,12 +777,38 @@ router.get("/system", async (_req, res) => {
 
 /* ---------- Tickets / logs ---------- */
 router.get("/tickets", async (_req, res) => {
-  const tickets = await prisma.ticket.findMany({ orderBy: { createdAt: "desc" }, take: 100 });
-  res.json(tickets);
+  const tickets = await prisma.ticket.findMany({
+    orderBy: { createdAt: "desc" },
+    take: 100,
+    include: { company: true, user: true },
+  });
+  res.json(tickets.map((t) => ({
+    id: t.id,
+    subject: t.subject,
+    body: t.body,
+    status: t.status,
+    priority: t.priority,
+    createdAt: t.createdAt.getTime(),
+    updatedAt: t.updatedAt.getTime(),
+    companyId: t.companyId,
+    userId: t.userId,
+    name: t.user?.name || t.company?.name,
+    email: t.user?.email || t.company?.email,
+    client: {
+      name: t.user?.name || t.company?.name || "—",
+      email: t.user?.email || t.company?.email || "—",
+      company: t.company?.name || "—",
+      plan: t.company?.plan || null,
+      phone: t.company?.phone || null,
+    },
+  })));
 });
 
 router.patch("/tickets/:id", async (req, res) => {
-  const ticket = await prisma.ticket.update({ where: { id: req.params.id }, data: req.body || {} });
+  const data = {};
+  if (["open", "pending", "closed"].includes(req.body?.status)) data.status = req.body.status;
+  if (["low", "normal", "high", "urgent"].includes(req.body?.priority)) data.priority = req.body.priority;
+  const ticket = await prisma.ticket.update({ where: { id: req.params.id }, data });
   res.json(ticket);
 });
 

@@ -10,6 +10,7 @@ import { WA } from "../config/whatsapp.js";
 import { prisma, pickColor } from "../lib/prisma.js";
 import { sendText, sendButtons, fetchInboundMedia, getCompanyCreds, assertLiveCreds } from "../lib/whatsappService.js";
 import { fireEvent } from "../lib/events.js";
+import { digitsOnly, findCompanyContactByPhone, looksLikePhone } from "../lib/phone.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
 const EXT = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf", "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3" };
@@ -81,20 +82,31 @@ async function findAutoReply(text, companyId) {
   });
 }
 
-async function autoAssignIfNeeded(contact, companyId) {
-  if (contact.assignedAgentId) return contact.assignedAgentId;
+async function autoAssignIfNeeded(contact, companyId, { force = false } = {}) {
+  if (!force && contact.assignedAgentId && contact.chatStatus !== "resolved") {
+    return contact.assignedAgentId;
+  }
   const s = await prisma.setting.findUnique({ where: { companyId } }).catch(() => null);
-  if (!s?.autoAssign) return null;
+  if (s && s.autoAssign === false) return null;
   const agents = await prisma.agent.findMany({ where: { companyId } });
   if (!agents.length) return null;
-  const counts = await Promise.all(
-    agents.map((a) => prisma.contact.count({ where: { assignedAgentId: a.id, companyId } }))
+  const loads = await Promise.all(
+    agents.map(async (a) => ({
+      id: a.id,
+      name: a.name,
+      n: await prisma.contact.count({
+        where: { assignedAgentId: a.id, companyId, chatStatus: { in: ["open", "pending"] } },
+      }),
+    }))
   );
-  const idx = counts.indexOf(Math.min(...counts));
-  const agentId = agents[idx].id;
-  await prisma.contact.update({ where: { id: contact.id }, data: { assignedAgentId: agentId } });
-  console.log("[wa] auto-assigned", contact.phone, "->", agents[idx].name);
-  return agentId;
+  loads.sort((a, b) => a.n - b.n);
+  const pick = loads[0];
+  await prisma.contact.update({
+    where: { id: contact.id },
+    data: { assignedAgentId: pick.id, chatStatus: "open" },
+  });
+  console.log("[wa] auto-assigned", contact.phone, "->", pick.name, "open load", pick.n);
+  return pick.id;
 }
 
 async function maybeAway(contact, companyId) {
@@ -290,6 +302,26 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
         const value = change?.value;
         if (!value) continue;
         const companyId = await resolveCompanyId(value);
+        if (change.field === "message_template_status_update" || value.message_template_name) {
+          const tName = value.message_template_name;
+          const tStatus = String(value.event || value.message_template_status || "").toLowerCase();
+          if (tName && tStatus) {
+            const tpl = await prisma.template.findFirst({
+              where: { name: tName, ...(companyId ? { companyId } : {}) },
+            });
+            if (tpl) {
+              await prisma.template.update({ where: { id: tpl.id }, data: { status: tStatus } });
+              const owner = await prisma.user.findFirst({
+                where: { companyId: tpl.companyId, role: { in: ["OWNER", "ADMIN"] } },
+                orderBy: { createdAt: "asc" },
+              });
+              if (owner?.email) {
+                const { sendTemplateStatus } = await import("../lib/mailer.js");
+                sendTemplateStatus(owner.email, tName, tStatus).catch(() => {});
+              }
+            }
+          }
+        }
         if (!companyId && !(value.statuses || []).length) {
           console.warn("[wa] no company for phone_number_id", value?.metadata?.phone_number_id);
           continue;
@@ -305,18 +337,26 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
         const profileName = value?.contacts?.[0]?.profile?.name;
 
         for (const m of value.messages || []) {
-          const count = await prisma.contact.count({ where: { companyId } });
-          const contact = await prisma.contact.upsert({
-            where: { companyId_phone: { companyId, phone: m.from } },
-            update: {},
-            create: {
-              companyId,
-              name: profileName || `+${m.from}`,
-              phone: m.from,
-              tags: ["inbound"],
-              color: pickColor(count),
-            },
-          });
+          const phone = digitsOnly(m.from);
+          let contact = await findCompanyContactByPhone(prisma, companyId, phone);
+          if (contact) {
+            const betterName = profileName && !looksLikePhone(profileName) ? profileName : null;
+            if (betterName && looksLikePhone(contact.name)) {
+              contact = await prisma.contact.update({ where: { id: contact.id }, data: { name: betterName } });
+            }
+          } else {
+            const count = await prisma.contact.count({ where: { companyId } });
+            const name = profileName && !looksLikePhone(profileName) ? profileName : `+${phone}`;
+            contact = await prisma.contact.create({
+              data: {
+                companyId,
+                name,
+                phone,
+                tags: ["inbound"],
+                color: pickColor(count),
+              },
+            });
+          }
           const bodyText = textOf(m);
 
           let mediaUrl = null;
@@ -349,7 +389,8 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
           console.log("[wa] incoming from", m.from, ":", bodyText);
 
           fireEvent("message.received", { from: m.from, name: contact.name, text: bodyText, type: m.type }).catch(() => {});
-          await autoAssignIfNeeded(contact, companyId).catch(() => {});
+          const force = contact.chatStatus === "resolved" || !contact.assignedAgentId;
+          await autoAssignIfNeeded(contact, companyId, { force }).catch(() => {});
 
           const btnId0 = m.interactive?.button_reply?.id;
           if (btnId0?.startsWith("csat:")) {

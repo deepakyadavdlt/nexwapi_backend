@@ -28,6 +28,8 @@ export const toMessage = (m) => ({
   mediaUrl: m.mediaUrl || null,
   filename: m.filename || null,
   status: m.status,
+  senderName: m.senderName || null,
+  senderUserId: m.senderUserId || null,
   at: m.at.getTime(),
 });
 

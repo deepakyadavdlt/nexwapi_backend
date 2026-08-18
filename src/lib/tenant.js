@@ -112,6 +112,7 @@ export function publicCompanyUser(user, company) {
     id: user.id,
     name: user.name,
     email: user.email,
+    phone: user.phone || "",
     role: user.role,
     companyId: company?.id || user.companyId || null,
     companyName: company?.name || null,
@@ -129,6 +130,9 @@ export function publicCompanyUser(user, company) {
     walletBalancePaise: company?.walletBalancePaise ?? 0,
     messageCredits: company?.messageCredits ?? 0,
     isSuperAdmin: isSuperAdmin(user),
+    isPlatformStaff: isSuperAdmin(user) || ((user.role === "ADMIN" || user.role === "Admin") && !user.companyId),
+    isActive: user.isActive !== false,
+    permissions: Array.isArray(user.permissions) ? user.permissions : [],
   };
 }
 

@@ -48,7 +48,8 @@ import { fireEvent, logActivity } from "../lib/events.js";
 import { loginLimiter, signupLimiter, apiMessageLimiter } from "../lib/rateLimit.js";
 import { findApiKeyByRaw, hashApiKey, keyPrefix, publicApiKeyRow } from "../lib/apiKey.js";
 import { mailConfigured, sendWelcome, sendInvoiceEmail, sendCampaignStatus, sendSuspension, sendTemplateStatus, sendSupportTicketAlert } from "../lib/mailer.js";
-import { issueOtp, verifyOtp, requireOtpOrSkip } from "../lib/otp.js";
+import { issueOtp, verifyOtp, requireOtpOrSkip, otpGate } from "../lib/otp.js";
+import { notify } from "../lib/notify.js";
 import { getLocalWaProfile, saveLocalWaProfile } from "../lib/localWaProfile.js";
 
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s);
@@ -185,7 +186,10 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
     include: { company: { include: { subscription: true } } },
   });
   if (user?.password && (await comparePassword(password, user.password))) {
-    if (mailConfigured() && user.role !== "SUPER_ADMIN") {
+    if (user.isActive === false) {
+      return res.status(403).json({ error: "This account has been deactivated" });
+    }
+    if (mailConfigured()) {
       if (!otp) {
         await issueOtp(em, "login");
         return res.json({ otpRequired: true });
@@ -197,6 +201,24 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
     if (user.companyId) {
       prisma.company.update({ where: { id: user.companyId }, data: { lastActiveAt: new Date() } }).catch(() => {});
     }
+    prisma.auditLog.create({
+      data: {
+        companyId: user.companyId,
+        userId: user.id,
+        action: "login",
+        entity: "User",
+        entityId: user.id,
+        meta: { email: user.email, role: user.role },
+      },
+    }).catch(() => {});
+    notify({
+      audience: user.role === "SUPER_ADMIN" ? "admin" : "client",
+      companyId: user.companyId,
+      userId: user.id,
+      title: "New sign-in",
+      body: `${user.name || user.email} signed in`,
+      href: user.role === "SUPER_ADMIN" ? "/admin" : "/dashboard",
+    }).catch(() => {});
     return res.json({ token: signToken(user), user: publicCompanyUser(user, user.company) });
   }
 
@@ -237,6 +259,7 @@ router.get("/me", requireAuth, attachCompany, async (req, res) => {
     include: { company: { include: { subscription: true } } },
   });
   if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.isActive === false) return res.status(403).json({ error: "Account disabled" });
   res.json({
     ...publicCompanyUser(user, req.company || user.company),
     ...(req.user.impersonating
@@ -248,8 +271,21 @@ router.get("/me", requireAuth, attachCompany, async (req, res) => {
 router.patch("/me", requireAuth, attachCompany, async (req, res) => {
   const name = String(req.body?.name || "").trim();
   const companyName = String(req.body?.company || req.body?.companyName || "").trim();
+  const phone = req.body?.phone != null ? String(req.body.phone).trim() : null;
   const data = {};
   if (name) data.name = name;
+  if (phone != null) data.phone = phone || null;
+  if (req.body?.password) {
+    const next = String(req.body.password);
+    if (next.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+    const current = String(req.body.currentPassword || "");
+    const row = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (row?.password && current) {
+      const ok = await comparePassword(current, row.password);
+      if (!ok) return res.status(400).json({ error: "Current password is incorrect" });
+    }
+    data.password = await hashPassword(next);
+  }
   const user = Object.keys(data).length
     ? await prisma.user.update({
       where: { id: req.user.id },
@@ -388,8 +424,13 @@ async function emailInvoiceFor(payment) {
   }
 }
 // Public billing config — tells the frontend if payments are live + the plan price.
-router.get("/billing/config", (_req, res) => {
-  res.json({ enabled: RAZORPAY_ENABLED, keyId: RAZORPAY_KEY_ID, plans: PLAN_CATALOG, legacyPlans: PLANS });
+router.get("/billing/config", async (_req, res) => {
+  const rows = await prisma.plan.findMany().catch(() => []);
+  const plans = { ...PLAN_CATALOG };
+  for (const row of rows) {
+    if (plans[row.key]) plans[row.key] = { ...plans[row.key], amount: row.amount, name: row.name };
+  }
+  res.json({ enabled: RAZORPAY_ENABLED, keyId: RAZORPAY_KEY_ID, plans, legacyPlans: PLANS });
 });
 
 // Create a Razorpay order for starter or growth plan.
@@ -399,7 +440,10 @@ router.post("/billing/create-order", requireAuth, attachCompany, async (req, res
   if (!["starter", "growth", "professional"].includes(planKey)) {
     return res.status(400).json({ error: "planKey must be starter, growth or professional" });
   }
-  const plan = PLAN_CATALOG[planKey];
+  const planRow = await prisma.plan.findUnique({ where: { key: planKey } }).catch(() => null);
+  const plan = planRow
+    ? { ...PLAN_CATALOG[planKey], amount: planRow.amount, name: planRow.name }
+    : PLAN_CATALOG[planKey];
   const companyId = companyIdOf(req);
   if (!companyId) return res.status(403).json({ error: "No company linked to this account" });
   try {
@@ -487,6 +531,19 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
   }
 
   const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+  notify({
+    audience: "client",
+    companyId,
+    title: payment.type === "wallet_recharge" ? "Wallet recharged" : "Payment successful",
+    body: payment.type === "wallet_recharge" ? "Credits were added to your wallet." : `Your ${payment.plan} plan is active.`,
+    href: "/dashboard/upgrade",
+  }).catch(() => {});
+  notify({
+    audience: "admin",
+    title: "New payment",
+    body: `${user?.email || "Client"} · ${payment.plan}`,
+    href: "/admin/payments",
+  }).catch(() => {});
   res.json({ ok: true, user: publicCompanyUser(user, company) });
 });
 
@@ -687,8 +744,94 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
   }
 });
 
+router.post("/sales-leads", async (req, res) => {
+  const name = String(req.body?.name || "").trim();
+  const email = String(req.body?.email || "").toLowerCase().trim();
+  const phone = String(req.body?.phone || "").trim();
+  const company = String(req.body?.company || "").trim();
+  const message = String(req.body?.message || "").trim();
+  if (!name || !email || !message) {
+    return res.status(400).json({ error: "name, email and message are required" });
+  }
+  const lead = await prisma.salesLead.create({
+    data: { name, email, phone, company, message },
+  });
+  notify({
+    audience: "admin",
+    title: "New Talk to Sales lead",
+    body: `${name} (${email})${company ? " · " + company : ""}`,
+    href: "/admin/sales",
+  }).catch(() => {});
+  res.status(201).json({ ok: true, id: lead.id });
+});
+
+router.use((req, res, next) => {
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 router.use(requireAuth);
 router.use(attachCompany);
+
+function outboundTextWithAgent(req, text) {
+  const raw = String(text || "");
+  const name = String(req.user?.name || "").trim();
+  const role = String(req.user?.role || "");
+  if (name && (role === "AGENT" || role === "Agent")) return `*${name}:*\n${raw}`;
+  return raw;
+}
+
+router.get("/notifications", async (req, res) => {
+  const isAdmin = req.user?.role === "SUPER_ADMIN";
+  const where = isAdmin
+    ? { audience: "admin", OR: [{ userId: req.user.id }, { userId: null }] }
+    : {
+        audience: "client",
+        OR: [
+          { userId: req.user.id },
+          { companyId: companyIdOf(req), userId: null },
+        ],
+      };
+  const rows = await prisma.notification.findMany({
+    where,
+    orderBy: { createdAt: "desc" },
+    take: 200,
+  });
+  res.json(rows.map((n) => ({ ...n, createdAt: n.createdAt.getTime() })));
+});
+
+router.patch("/notifications/:id/read", async (req, res) => {
+  const n = await prisma.notification.updateMany({
+    where: { id: req.params.id, OR: [{ userId: req.user.id }, { userId: null, companyId: companyIdOf(req) }, { userId: null, audience: "admin" }] },
+    data: { read: true },
+  });
+  if (!n.count) return res.sendStatus(404);
+  res.json({ ok: true });
+});
+
+router.post("/notifications/read-all", async (req, res) => {
+  const isAdmin = req.user?.role === "SUPER_ADMIN";
+  await prisma.notification.updateMany({
+    where: isAdmin
+      ? { audience: "admin", read: false, OR: [{ userId: req.user.id }, { userId: null }] }
+      : { audience: "client", read: false, OR: [{ userId: req.user.id }, { companyId: companyIdOf(req), userId: null }] },
+    data: { read: true },
+  });
+  res.json({ ok: true });
+});
+
+router.delete("/me", async (req, res) => {
+  if (!(await otpGate(req, res, "account_delete"))) return;
+  const role = String(req.user?.role || "");
+  if (role === "SUPER_ADMIN") return res.status(400).json({ error: "Super Admin accounts cannot be deleted here" });
+  if (role !== "AGENT" && role !== "Agent") {
+    return res.status(400).json({ error: "Only agent profiles can be deleted from settings. Ask an owner to remove other seats." });
+  }
+  const email = req.user.email;
+  const companyId = companyIdOf(req);
+  await prisma.agent.deleteMany({ where: { email, companyId } }).catch(() => {});
+  await prisma.user.delete({ where: { id: req.user.id } });
+  res.json({ ok: true });
+});
 
 /* ------------------------------ Contacts ------------------------------- */
 router.get("/contacts", async (req, res) => {
@@ -751,6 +894,9 @@ router.patch("/contacts/:id", async (req, res) => {
 
 router.delete("/contacts/:id", async (req, res) => {
   try {
+    const gate = await requireOtpOrSkip(req.user.email, "contact_delete", req.body?.otp || req.query?.otp);
+    if (gate.otpRequired) return res.json({ otpRequired: true });
+    if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
     const deleted = await prisma.contact.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
@@ -882,6 +1028,7 @@ router.post("/quick-replies", async (req, res) => {
 
 router.delete("/quick-replies/:id", async (req, res) => {
   try {
+    if (!(await otpGate(req, res, "quick_reply_delete"))) return;
     const deleted = await prisma.quickReply.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
@@ -984,6 +1131,7 @@ router.post("/conversations/:id/notes", async (req, res) => {
 
 router.delete("/notes/:id", async (req, res) => {
   try {
+    if (!(await otpGate(req, res, "note_delete"))) return;
     await prisma.note.delete({ where: { id: req.params.id } });
     res.sendStatus(204);
   } catch {
@@ -1019,6 +1167,7 @@ router.post("/products", async (req, res) => {
 
 router.delete("/products/:id", async (req, res) => {
   try {
+    if (!(await otpGate(req, res, "product_delete"))) return;
     const deleted = await prisma.product.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
@@ -1051,6 +1200,7 @@ router.post("/segments", async (req, res) => {
 
 router.delete("/segments/:id", async (req, res) => {
   try {
+    if (!(await otpGate(req, res, "segment_delete"))) return;
     const deleted = await prisma.segment.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
@@ -1074,6 +1224,7 @@ router.post("/labels", async (req, res) => {
 
 router.delete("/labels/:id", async (req, res) => {
   try {
+    if (!(await otpGate(req, res, "label_delete"))) return;
     const deleted = await prisma.label.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
@@ -1155,11 +1306,12 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
   const { text } = req.body || {};
   if (!text) return res.status(400).json({ error: "text required" });
   const companyId = companyIdOf(req);
+  const sendTextBody = outboundTextWithAgent(req, text);
   const creds = await getCompanyCreds(companyId);
   let waId = null;
   try {
     assertLiveCreds(creds);
-    const result = await sendText(contact.phone, text, creds);
+    const result = await sendText(contact.phone, sendTextBody, creds);
     waId = result.messages?.[0]?.id || null;
   } catch (e) {
     const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" ? 400 : 502);
@@ -1173,8 +1325,10 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
       waId,
       direction: "out",
       type: "text",
-      text,
+      text: sendTextBody,
       status: "sent",
+      senderName: req.user?.name || null,
+      senderUserId: req.user?.id || null,
     },
   });
   res.status(201).json(toMessage(msg));
@@ -1227,6 +1381,8 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
       type: "template",
       text,
       status: "sent",
+      senderName: req.user?.name || null,
+      senderUserId: req.user?.id || null,
     },
   });
   res.status(201).json(toMessage(msg));
@@ -1275,10 +1431,45 @@ router.post("/templates", async (req, res) => {
       },
     });
     res.status(201).json({ ...tpl, createdAt: tpl.createdAt.getTime(), metaError });
+    notify({
+      audience: "admin",
+      title: "Template submitted",
+      body: `${cleanName} from ${req.company?.name || req.user?.email}`,
+      href: "/admin/templates",
+    }).catch(() => {});
+    notify({
+      audience: "client",
+      companyId: companyIdOf(req),
+      title: "Template submitted",
+      body: `${cleanName} is pending approval`,
+      href: "/dashboard/templates",
+    }).catch(() => {});
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "Template name already exists" });
     throw e;
   }
+});
+
+router.patch("/templates/:id", async (req, res) => {
+  const existing = await prisma.template.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.sendStatus(404);
+  const data = {};
+  if (req.body?.body != null) data.body = String(req.body.body);
+  if (req.body?.category != null) data.category = String(req.body.category);
+  if (req.body?.language != null) data.language = String(req.body.language);
+  if (req.body?.format != null) data.format = String(req.body.format);
+  if (req.body?.cards !== undefined) data.cards = req.body.cards;
+  if (req.body?.name) data.name = String(req.body.name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
+  const tpl = await prisma.template.update({ where: { id: existing.id }, data });
+  res.json({ ...tpl, createdAt: tpl.createdAt.getTime() });
+});
+
+router.delete("/templates/:id", async (req, res) => {
+  if (!(await otpGate(req, res, "template_delete"))) return;
+  const existing = await prisma.template.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.sendStatus(404);
+  await prisma.template.delete({ where: { id: existing.id } });
+  res.sendStatus(204);
 });
 
 // Pull the latest template statuses from Meta and reconcile the local list.
@@ -1397,6 +1588,7 @@ router.patch("/drips/:id", async (req, res) => {
 
 router.delete("/drips/:id", async (req, res) => {
   try {
+    if (!(await otpGate(req, res, "drip_delete"))) return;
     const existing = await prisma.drip.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (!existing) return res.sendStatus(404);
     await prisma.drip.delete({ where: { id: existing.id } });
@@ -1453,6 +1645,7 @@ router.patch("/automations/:id", async (req, res) => {
 
 router.delete("/automations/:id", async (req, res) => {
   try {
+    if (!(await otpGate(req, res, "automation_delete"))) return;
     const deleted = await prisma.automation.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
@@ -1510,6 +1703,7 @@ router.patch("/flows/:id", async (req, res) => {
 
 router.delete("/flows/:id", async (req, res) => {
   try {
+    if (!(await otpGate(req, res, "flow_delete"))) return;
     const existing = await prisma.flow.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (!existing) return res.sendStatus(404);
     await prisma.contact.updateMany({ where: { activeFlowId: existing.id, ...tenantWhere(req) }, data: { activeFlowId: null, activeFlowStep: null } });
@@ -2089,6 +2283,13 @@ router.delete("/api-keys/:id", async (req, res) => {
 /* -------------------------- Reports (deep) ----------------------------- */
 router.get("/reports", async (req, res) => {
   const tw = tenantWhere(req);
+  const from = req.query.from ? new Date(String(req.query.from)) : null;
+  const to = req.query.to ? new Date(String(req.query.to)) : null;
+  const end = to ? new Date(to) : null;
+  if (end) end.setHours(23, 59, 59, 999);
+  const atRange = (from || end) ? { at: { ...(from ? { gte: from } : {}), ...(end ? { lte: end } : {}) } } : {};
+  const createdRange = (from || end) ? { createdAt: { ...(from ? { gte: from } : {}), ...(end ? { lte: end } : {}) } } : {};
+
   const agents = await prisma.agent.findMany({ where: tw, orderBy: { createdAt: "asc" } });
   const agentStats = await Promise.all(
     agents.map(async (a) => ({
@@ -2104,8 +2305,8 @@ router.get("/reports", async (req, res) => {
     prisma.contact.count({ where: { chatStatus: "pending", ...tw } }),
     prisma.contact.count({ where: { chatStatus: "resolved", ...tw } }),
     prisma.contact.count({ where: tw }),
-    prisma.message.count({ where: { direction: "in", ...tw } }),
-    prisma.message.count({ where: { direction: "out", ...tw } }),
+    prisma.message.count({ where: { direction: "in", ...tw, ...atRange } }),
+    prisma.message.count({ where: { direction: "out", ...tw, ...atRange } }),
   ]);
 
   const contacts = await prisma.contact.findMany({ where: tw, select: { tags: true } });
@@ -2113,7 +2314,7 @@ router.get("/reports", async (req, res) => {
   contacts.forEach((c) => (c.tags || []).forEach((t) => (tagMap[t] = (tagMap[t] || 0) + 1)));
   const topTags = Object.entries(tagMap).map(([tag, count]) => ({ tag, count })).sort((a, b) => b.count - a.count).slice(0, 8);
 
-  const campaigns = await prisma.campaign.findMany({ where: tw, orderBy: { createdAt: "desc" }, take: 6 });
+  const campaigns = await prisma.campaign.findMany({ where: { ...tw, ...createdRange }, orderBy: { createdAt: "desc" }, take: 20 });
 
   const withMsgs = await prisma.contact.findMany({ where: tw, include: { messages: { orderBy: { at: "asc" } } } });
   let totalRespMin = 0, responded = 0, inboundContacts = 0;
@@ -2141,6 +2342,10 @@ router.get("/reports", async (req, res) => {
     messageVolume: { inbound, outbound },
     topTags,
     campaigns: campaigns.map((c) => ({ name: c.name, sent: c.sent, delivered: c.delivered, read: c.read, replied: c.replied })),
+    range: {
+      from: from ? from.toISOString().slice(0, 10) : null,
+      to: to ? to.toISOString().slice(0, 10) : null,
+    },
   });
 });
 
@@ -2266,6 +2471,8 @@ function serializeTicket(t) {
     updatedAt: t.updatedAt.getTime(),
     companyId: t.companyId,
     userId: t.userId,
+    origin: t.origin || "client",
+    adminReply: t.adminReply || "",
     client: {
       name: user?.name || company?.name || "—",
       email: user?.email || company?.email || "—",
@@ -2318,6 +2525,20 @@ router.post("/tickets", async (req, res) => {
     company: ticket.company?.name,
     plan: ticket.company?.plan,
   }).catch((e) => console.warn("[mail ticket]", e.message));
+  notify({
+    audience: "admin",
+    title: "New support ticket",
+    body: `${ticket.subject} · ${req.user.name || req.user.email}`,
+    href: "/admin/tickets",
+  }).catch(() => {});
+  notify({
+    audience: "client",
+    companyId,
+    userId: req.user.id,
+    title: "Ticket opened",
+    body: ticket.subject,
+    href: "/dashboard/support",
+  }).catch(() => {});
   res.status(201).json(serializeTicket(ticket));
 });
 

@@ -11,6 +11,7 @@ import { prisma, pickColor } from "../lib/prisma.js";
 import { sendText, sendButtons, fetchInboundMedia, getCompanyCreds, assertLiveCreds } from "../lib/whatsappService.js";
 import { fireEvent } from "../lib/events.js";
 import { digitsOnly, findCompanyContactByPhone, looksLikePhone } from "../lib/phone.js";
+import { notify } from "../lib/notify.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
 const EXT = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf", "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3" };
@@ -387,8 +388,14 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             },
           });
           console.log("[wa] incoming from", m.from, ":", bodyText);
-
           fireEvent("message.received", { from: m.from, name: contact.name, text: bodyText, type: m.type }).catch(() => {});
+          notify({
+            audience: "client",
+            companyId,
+            title: `New message from ${contact.name}`,
+            body: String(bodyText || m.type || "Incoming WhatsApp").slice(0, 180),
+            href: "/dashboard/inbox",
+          }).catch(() => {});
           const force = contact.chatStatus === "resolved" || !contact.assignedAgentId;
           await autoAssignIfNeeded(contact, companyId, { force }).catch(() => {});
 

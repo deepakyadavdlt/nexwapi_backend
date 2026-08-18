@@ -66,3 +66,17 @@ export async function requireOtpOrSkip(email, purpose, code) {
   }
   return verifyOtp(email, purpose, code);
 }
+
+/** Returns true if the request may continue. Sends OTP JSON / 400 when not. */
+export async function otpGate(req, res, purpose) {
+  const gate = await requireOtpOrSkip(req.user?.email, purpose, req.body?.otp || req.query?.otp);
+  if (gate.otpRequired) {
+    res.json({ otpRequired: true });
+    return false;
+  }
+  if (!gate.ok) {
+    res.status(400).json({ error: gate.error || "Invalid OTP" });
+    return false;
+  }
+  return true;
+}

@@ -1,13 +1,16 @@
 // routes/superAdmin.js — platform Super Admin APIs
 import express from "express";
 import { prisma } from "../lib/prisma.js";
-import { requireAuth, requireSuperAdmin, signImpersonationToken } from "../lib/auth.js";
+import { requireAuth, requireSuperAdmin, signImpersonationToken, hashPassword } from "../lib/auth.js";
 import { publicCompanyUser, uniqueSlug } from "../lib/tenant.js";
+import { createAgentSeat, ensureOwnerAgent } from "../lib/teamSeats.js";
+import { razorpay, RAZORPAY_ENABLED } from "../lib/razorpay.js";
 import { PLAN_CATALOG, normalizePlan, isPaidPlan } from "../lib/plans.js";
-import { createAgentSeat } from "../lib/teamSeats.js";
 import { WA_LIVE } from "../config/whatsapp.js";
-import { RAZORPAY_ENABLED } from "../lib/razorpay.js";
 import { creditWallet, getPlatformPricing } from "../lib/wallet.js";
+import { otpGate } from "../lib/otp.js";
+import { notify } from "../lib/notify.js";
+import { hasPermission, permissionForPath, normalizePermissions, PERMISSIONS } from "../lib/permissions.js";
 import multer from "multer";
 import {
   fetchBusinessProfile, updateBusinessProfile, uploadProfilePicture, VERTICALS, platformWaCreds,
@@ -15,6 +18,25 @@ import {
 
 const router = express.Router();
 router.use(requireAuth, requireSuperAdmin);
+router.use(async (req, res, next) => {
+  try {
+    const row = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { permissions: true, isActive: true, companyId: true, role: true },
+    });
+    if (!row || row.isActive === false) return res.status(403).json({ error: "Account disabled" });
+    req.user.permissions = row.permissions;
+    req.user.companyId = row.companyId;
+    req.user.role = row.role;
+    const key = permissionForPath(req.path);
+    if (key && !hasPermission(req.user, key)) {
+      return res.status(403).json({ error: "You do not have access to this section" });
+    }
+    next();
+  } catch (e) {
+    next(e);
+  }
+});
 const profileUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 const DAY_MS = 86400000;
@@ -49,6 +71,8 @@ function mapClient(c) {
     onboardedAt: c.createdAt.getTime(),
     upgradedAt: c.upgradedAt ? c.upgradedAt.getTime() : null,
     lastActiveAt: c.lastActiveAt ? c.lastActiveAt.getTime() : null,
+    phone: c.phone || "",
+    website: c.website || "",
   };
 }
 
@@ -165,6 +189,117 @@ router.get("/clients", async (_req, res) => {
     revenue: clients.reduce((s, c) => s + c.revenue, 0),
   };
   res.json({ clients, summary });
+});
+
+router.post("/clients", async (req, res) => {
+  const name = String(req.body?.name || "").trim();
+  const email = String(req.body?.email || "").toLowerCase().trim();
+  const password = String(req.body?.password || "");
+  const companyName = String(req.body?.company || req.body?.companyName || name).trim();
+  const phone = String(req.body?.phone || "").trim();
+  const plan = normalizePlan(req.body?.plan || "trial");
+  const credits = Math.max(0, Number(req.body?.credits) || 0);
+  if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  if (password && password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) return res.status(409).json({ error: "An account with this email already exists" });
+  try {
+    const pricing = await getPlatformPricing();
+    const slug = await uniqueSlug(companyName);
+    const paid = isPaidPlan(plan);
+    const trialEndsAt = paid ? null : new Date(Date.now() + 7 * DAY_MS);
+    const company = await prisma.company.create({
+      data: {
+        name: companyName,
+        slug,
+        email,
+        phone: phone || null,
+        status: paid ? "ACTIVE" : "TRIAL",
+        plan: ["trial", "starter", "growth", "professional", "enterprise"].includes(plan) ? plan : "trial",
+        trialEndsAt,
+        trialStartedAt: paid ? null : new Date(),
+        messageCredits: credits || pricing.trialCredits,
+        walletBalancePaise: 0,
+        freeAccess: Boolean(req.body?.freeAccess),
+      },
+    });
+    const user = await prisma.user.create({
+      data: {
+        name,
+        email,
+        password: await hashPassword(password || Math.random().toString(36).slice(-10) + "Aa1"),
+        phone: phone || null,
+        role: "OWNER",
+        companyId: company.id,
+      },
+    });
+    await prisma.subscription.create({
+      data: {
+        companyId: company.id,
+        plan: company.plan,
+        status: "active",
+        trialEndsAt,
+        amount: PLAN_CATALOG[company.plan]?.amount || 0,
+      },
+    });
+    await prisma.setting.create({ data: { companyId: company.id, businessName: companyName, autoAssign: true } });
+    await ensureOwnerAgent(company.id, { name, email }).catch(() => {});
+    await prisma.auditLog.create({
+      data: {
+        companyId: company.id,
+        userId: req.user.id,
+        action: "client_create",
+        entity: "Company",
+        entityId: company.id,
+        meta: { email, plan: company.plan },
+      },
+    }).catch(() => {});
+    notify({
+      audience: "admin",
+      title: "New client created",
+      body: `${company.name} · ${email}`,
+      href: "/admin/clients",
+    }).catch(() => {});
+    res.status(201).json({ ok: true, company, owner: { id: user.id, email: user.email, name: user.name } });
+  } catch (e) {
+    if (e.code === "P2002") return res.status(409).json({ error: "Email or company already exists" });
+    res.status(400).json({ error: e.message || "Could not create client" });
+  }
+});
+
+router.patch("/clients/:id", async (req, res) => {
+  const company = await prisma.company.findUnique({ where: { id: req.params.id }, include: { users: { orderBy: { createdAt: "asc" } } } });
+  if (!company) return res.status(404).json({ error: "not found" });
+  const data = {};
+  if (req.body?.name != null) data.name = String(req.body.name).trim();
+  if (req.body?.email != null) data.email = String(req.body.email).toLowerCase().trim();
+  if (req.body?.phone != null) data.phone = String(req.body.phone).trim() || null;
+  if (req.body?.website != null) data.website = String(req.body.website).trim() || null;
+  const updated = await prisma.company.update({ where: { id: company.id }, data });
+  const owner = company.users.find((u) => u.role === "OWNER" || u.role === "ADMIN") || company.users[0];
+  if (owner) {
+    const ud = {};
+    if (req.body?.ownerName) ud.name = String(req.body.ownerName).trim();
+    if (req.body?.email) ud.email = String(req.body.email).toLowerCase().trim();
+    if (req.body?.phone != null) ud.phone = String(req.body.phone).trim() || null;
+    if (req.body?.password && String(req.body.password).length >= 6) ud.password = await hashPassword(String(req.body.password));
+    if (Object.keys(ud).length) await prisma.user.update({ where: { id: owner.id }, data: ud });
+  }
+  await prisma.auditLog.create({
+    data: { companyId: company.id, userId: req.user.id, action: "client_update", entity: "Company", entityId: company.id, meta: data },
+  }).catch(() => {});
+  res.json(updated);
+});
+
+router.delete("/clients/:id", async (req, res) => {
+  if (!(await otpGate(req, res, "client_delete"))) return;
+  const company = await prisma.company.findUnique({ where: { id: req.params.id } });
+  if (!company) return res.status(404).json({ error: "not found" });
+  await prisma.company.delete({ where: { id: company.id } });
+  await prisma.auditLog.create({
+    data: { userId: req.user.id, action: "client_delete", entity: "Company", entityId: company.id, meta: { name: company.name, email: company.email } },
+  }).catch(() => {});
+  res.json({ ok: true });
 });
 
 router.post("/clients/:id/plan", async (req, res) => {
@@ -580,35 +715,36 @@ router.get("/plans", async (_req, res) => {
 router.patch("/plans/:key", async (req, res) => {
   const key = normalizePlan(req.params.key);
   const body = req.body || {};
+  const update = {};
+  if (body.name != null) update.name = String(body.name);
+  if (body.amount != null) update.amount = Number(body.amount);
+  if (typeof body.inbox === "boolean") update.inbox = body.inbox;
+  if (typeof body.campaign === "boolean") update.campaign = body.campaign;
+  if (typeof body.chatbot === "boolean") update.chatbot = body.chatbot;
+  if (typeof body.automation === "boolean") update.automation = body.automation;
+  if (typeof body.api === "boolean") update.api = body.api;
+  if (typeof body.unlimitedAgents === "boolean") update.unlimitedAgents = body.unlimitedAgents;
+  if (body.agentLimit != null) update.agentLimit = Number(body.agentLimit);
+  if (body.contactLimit != null) update.contactLimit = Number(body.contactLimit);
+  if (body.messageLimit != null) update.messageLimit = Number(body.messageLimit);
+  if (typeof body.active === "boolean") update.active = body.active;
+  const cat = PLAN_CATALOG[key] || PLAN_CATALOG.starter;
   const plan = await prisma.plan.upsert({
     where: { key },
-    update: {
-      name: body.name,
-      amount: body.amount,
-      inbox: body.inbox,
-      campaign: body.campaign,
-      chatbot: body.chatbot,
-      automation: body.automation,
-      api: body.api,
-      unlimitedAgents: body.unlimitedAgents,
-      agentLimit: body.agentLimit,
-      contactLimit: body.contactLimit,
-      messageLimit: body.messageLimit,
-      active: body.active,
-    },
+    update,
     create: {
       key,
-      name: body.name || key,
-      amount: body.amount ?? 0,
-      inbox: body.inbox !== false,
-      campaign: body.campaign !== false,
-      chatbot: body.chatbot !== false,
-      automation: body.automation !== false,
-      api: Boolean(body.api),
-      unlimitedAgents: Boolean(body.unlimitedAgents),
-      agentLimit: body.agentLimit ?? 3,
-      contactLimit: body.contactLimit ?? 1000,
-      messageLimit: body.messageLimit ?? 5000,
+      name: update.name || cat.name || key,
+      amount: update.amount ?? cat.amount ?? 0,
+      inbox: update.inbox ?? cat.features?.inbox !== false,
+      campaign: update.campaign ?? cat.features?.campaign !== false,
+      chatbot: update.chatbot ?? cat.features?.chatbot !== false,
+      automation: update.automation ?? cat.features?.automation !== false,
+      api: update.api ?? Boolean(cat.features?.api),
+      unlimitedAgents: update.unlimitedAgents ?? Boolean(cat.features?.unlimitedAgents),
+      agentLimit: update.agentLimit ?? cat.agentLimit ?? 3,
+      contactLimit: update.contactLimit ?? cat.contactLimit ?? 1000,
+      messageLimit: update.messageLimit ?? cat.messageLimit ?? 5000,
     },
   });
   res.json(plan);
@@ -639,6 +775,8 @@ router.get("/payments", async (req, res) => {
       invoiceNo: p.invoiceNo,
       razorpayOrderId: p.razorpayOrderId,
       razorpayPaymentId: p.razorpayPaymentId,
+      refundId: p.refundId,
+      transactionId: p.razorpayPaymentId || p.invoiceNo || p.id,
       couponCode: p.couponCode,
       paidAt: p.paidAt ? p.paidAt.getTime() : null,
       createdAt: p.createdAt.getTime(),
@@ -650,32 +788,84 @@ router.post("/payments/:id/refund", async (req, res) => {
   const payment = await prisma.payment.findUnique({ where: { id: req.params.id } });
   if (!payment) return res.status(404).json({ error: "not found" });
   if (payment.status !== "paid") return res.status(400).json({ error: "Only paid payments can be refunded" });
+  let refundId = `manual_${Date.now()}`;
+  if (RAZORPAY_ENABLED && payment.razorpayPaymentId) {
+    try {
+      const rf = await razorpay().payments.refund(payment.razorpayPaymentId, {
+        amount: payment.amount,
+        notes: { nexwapiPaymentId: payment.id, reason: req.body?.reason || "admin_refund" },
+      });
+      refundId = rf.id || refundId;
+    } catch (e) {
+      return res.status(400).json({ error: e?.error?.description || e.message || "Razorpay refund failed" });
+    }
+  }
   const updated = await prisma.payment.update({
     where: { id: payment.id },
-    data: { status: "refunded", refundId: `manual_${Date.now()}` },
+    data: { status: "refunded", refundId },
   });
-  res.json(updated);
+  await prisma.auditLog.create({
+    data: {
+      companyId: payment.companyId,
+      userId: req.user.id,
+      action: "payment_refund",
+      entity: "Payment",
+      entityId: payment.id,
+      meta: { refundId, transactionId: payment.razorpayPaymentId || payment.invoiceNo || payment.id, amount: payment.amount },
+    },
+  }).catch(() => {});
+  res.json({ ...updated, transactionId: payment.razorpayPaymentId || payment.invoiceNo || payment.id });
 });
 
 /* ---------- Revenue ---------- */
-router.get("/revenue", async (_req, res) => {
+router.get("/revenue", async (req, res) => {
+  const from = req.query.from ? new Date(String(req.query.from)) : null;
+  const to = req.query.to ? new Date(String(req.query.to)) : null;
   const paid = await prisma.payment.findMany({ where: { status: "paid" } });
+  const refunded = await prisma.payment.findMany({ where: { status: "refunded" } });
   const now = new Date();
   const startOfDay = new Date(now); startOfDay.setHours(0, 0, 0, 0);
   const startOfWeek = new Date(now); startOfWeek.setDate(now.getDate() - now.getDay()); startOfWeek.setHours(0, 0, 0, 0);
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
   const startOfYear = new Date(now.getFullYear(), 0, 1);
 
-  const sum = (from) => paid.filter((p) => (p.paidAt || p.createdAt) >= from).reduce((s, p) => s + p.amount, 0);
-  const mrr = sum(startOfMonth);
+  const inRange = (p, start, end) => {
+    const d = p.paidAt || p.createdAt;
+    if (start && d < start) return false;
+    if (end) {
+      const e = new Date(end);
+      e.setHours(23, 59, 59, 999);
+      if (d > e) return false;
+    }
+    return true;
+  };
+  const sum = (list, start, end) => list.filter((p) => inRange(p, start, end)).reduce((s, p) => s + p.amount, 0);
+  const mrr = sum(paid, startOfMonth);
+  const rangePayments = paid.filter((p) => inRange(p, from, to)).map((p) => ({
+    id: p.id,
+    transactionId: p.razorpayPaymentId || p.invoiceNo || p.id,
+    amount: p.amount,
+    type: p.type,
+    plan: p.plan,
+    paidAt: (p.paidAt || p.createdAt).getTime(),
+    companyId: p.companyId,
+  }));
   res.json({
-    daily: sum(startOfDay),
-    weekly: sum(startOfWeek),
-    monthly: sum(startOfMonth),
-    yearly: sum(startOfYear),
+    daily: sum(paid, startOfDay),
+    weekly: sum(paid, startOfWeek),
+    monthly: sum(paid, startOfMonth),
+    yearly: sum(paid, startOfYear),
     mrr,
     arr: mrr * 12,
     total: paid.reduce((s, p) => s + p.amount, 0),
+    range: {
+      from: from ? from.toISOString().slice(0, 10) : null,
+      to: to ? to.toISOString().slice(0, 10) : null,
+      paid: sum(paid, from, to),
+      refunded: sum(refunded, from, to),
+      count: rangePayments.length,
+      payments: rangePayments,
+    },
   });
 });
 
@@ -701,11 +891,20 @@ router.post("/coupons", async (req, res) => {
 });
 
 router.patch("/coupons/:id", async (req, res) => {
-  const coupon = await prisma.coupon.update({ where: { id: req.params.id }, data: req.body || {} });
+  const body = req.body || {};
+  const data = {};
+  if (body.code != null) data.code = String(body.code).toUpperCase().trim();
+  if (body.description != null) data.description = String(body.description);
+  if (body.discountPct != null) data.discountPct = Number(body.discountPct) || 0;
+  if (body.freeDays != null) data.freeDays = Number(body.freeDays) || 0;
+  if (body.maxRedemptions !== undefined) data.maxRedemptions = body.maxRedemptions === null || body.maxRedemptions === "" ? null : Number(body.maxRedemptions);
+  if (body.active != null) data.active = Boolean(body.active);
+  const coupon = await prisma.coupon.update({ where: { id: req.params.id }, data });
   res.json(coupon);
 });
 
 router.delete("/coupons/:id", async (req, res) => {
+  if (!(await otpGate(req, res, "coupon_delete"))) return;
   await prisma.coupon.delete({ where: { id: req.params.id } });
   res.status(204).end();
 });
@@ -792,6 +991,8 @@ router.get("/tickets", async (_req, res) => {
     updatedAt: t.updatedAt.getTime(),
     companyId: t.companyId,
     userId: t.userId,
+    origin: t.origin || "client",
+    adminReply: t.adminReply || "",
     name: t.user?.name || t.company?.name,
     email: t.user?.email || t.company?.email,
     client: {
@@ -808,16 +1009,141 @@ router.patch("/tickets/:id", async (req, res) => {
   const data = {};
   if (["open", "pending", "closed"].includes(req.body?.status)) data.status = req.body.status;
   if (["low", "normal", "high", "urgent"].includes(req.body?.priority)) data.priority = req.body.priority;
+  if (req.body?.adminReply != null) data.adminReply = String(req.body.adminReply).slice(0, 5000);
   const ticket = await prisma.ticket.update({ where: { id: req.params.id }, data });
+  if (data.adminReply) {
+    notify({
+      audience: "client",
+      companyId: ticket.companyId,
+      title: "Support replied",
+      body: ticket.subject,
+      href: "/dashboard/support",
+    }).catch(() => {});
+  }
   res.json(ticket);
 });
 
-router.get("/logs", async (req, res) => {
-  const logs = await prisma.auditLog.findMany({
-    orderBy: { createdAt: "desc" },
-    take: Number(req.query.limit) || 100,
+router.post("/tickets", async (req, res) => {
+  const companyId = String(req.body?.companyId || "").trim();
+  const subject = String(req.body?.subject || "").trim();
+  const body = String(req.body?.body || req.body?.message || "").trim();
+  const priority = ["low", "normal", "high", "urgent"].includes(String(req.body?.priority || "").toLowerCase())
+    ? String(req.body.priority).toLowerCase()
+    : "normal";
+  if (!companyId) return res.status(400).json({ error: "companyId required" });
+  if (!subject) return res.status(400).json({ error: "Subject is required" });
+  if (!body) return res.status(400).json({ error: "Message is required" });
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  if (!company) return res.status(404).json({ error: "Client not found" });
+  const ticket = await prisma.ticket.create({
+    data: {
+      companyId,
+      userId: req.user.id,
+      subject: subject.slice(0, 200),
+      body: body.slice(0, 5000),
+      priority,
+      status: "open",
+      origin: "admin",
+    },
   });
-  res.json(logs);
+  await prisma.auditLog.create({
+    data: { companyId, userId: req.user.id, action: "ticket_create", entity: "Ticket", entityId: ticket.id, meta: { subject } },
+  }).catch(() => {});
+  res.status(201).json(ticket);
+});
+
+router.get("/logs", async (req, res) => {
+  try {
+    const logs = await prisma.auditLog.findMany({
+      orderBy: { createdAt: "desc" },
+      take: Math.min(500, Number(req.query.limit) || 200),
+      include: { company: { select: { name: true, email: true } } },
+    });
+    const userIds = [...new Set(logs.map((l) => l.userId).filter(Boolean))];
+    const users = userIds.length
+      ? await prisma.user.findMany({ where: { id: { in: userIds } }, select: { id: true, name: true, email: true } })
+      : [];
+    const byId = Object.fromEntries(users.map((u) => [u.id, u]));
+    res.json(logs.map((l) => ({
+      id: l.id,
+      action: l.action,
+      entity: l.entity,
+      entityId: l.entityId,
+      meta: l.meta,
+      ip: l.ip,
+      companyId: l.companyId,
+      companyName: l.company?.name || "—",
+      userId: l.userId,
+      userName: byId[l.userId]?.name || "—",
+      userEmail: byId[l.userId]?.email || "—",
+      createdAt: l.createdAt.getTime(),
+    })));
+  } catch (e) {
+    console.error("[logs]", e);
+    res.status(500).json({ error: e.message || "Could not load logs" });
+  }
+});
+
+router.get("/templates", async (_req, res) => {
+  const templates = await prisma.template.findMany({
+    orderBy: { createdAt: "desc" },
+    take: 300,
+    include: { company: { select: { name: true, email: true } } },
+  });
+  res.json(templates.map((t) => ({
+    id: t.id,
+    name: t.name,
+    category: t.category,
+    language: t.language,
+    status: t.status,
+    body: t.body,
+    format: t.format,
+    companyId: t.companyId,
+    companyName: t.company?.name || "—",
+    companyEmail: t.company?.email || "—",
+    createdAt: t.createdAt.getTime(),
+  })));
+});
+
+router.patch("/templates/:id", async (req, res) => {
+  const status = String(req.body?.status || "").toLowerCase();
+  if (!["approved", "rejected", "pending"].includes(status)) {
+    return res.status(400).json({ error: "status must be approved, rejected, or pending" });
+  }
+  const template = await prisma.template.update({
+    where: { id: req.params.id },
+    data: { status },
+  });
+  await prisma.auditLog.create({
+    data: {
+      companyId: template.companyId,
+      userId: req.user.id,
+      action: "template_" + status,
+      entity: "Template",
+      entityId: template.id,
+      meta: { name: template.name, status },
+    },
+  }).catch(() => {});
+  res.json(template);
+});
+
+router.get("/sales-leads", async (_req, res) => {
+  const leads = await prisma.salesLead.findMany({ orderBy: { createdAt: "desc" }, take: 300 });
+  res.json(leads.map((l) => ({ ...l, createdAt: l.createdAt.getTime(), updatedAt: l.updatedAt.getTime() })));
+});
+
+router.patch("/sales-leads/:id", async (req, res) => {
+  const data = {};
+  if (req.body?.status) data.status = String(req.body.status);
+  if (req.body?.note != null) data.note = String(req.body.note);
+  const lead = await prisma.salesLead.update({ where: { id: req.params.id }, data });
+  res.json({ ...lead, createdAt: lead.createdAt.getTime(), updatedAt: lead.updatedAt.getTime() });
+});
+
+router.delete("/sales-leads/:id", async (req, res) => {
+  if (!(await otpGate(req, res, "sales_lead_delete"))) return;
+  await prisma.salesLead.delete({ where: { id: req.params.id } });
+  res.json({ ok: true });
 });
 
 router.get("/campaigns", async (_req, res) => {
@@ -885,6 +1211,171 @@ router.post("/platform-profile/photo", profileUpload.single("file"), async (req,
   } catch (e) {
     res.status(e.status || 400).json({ error: e.message });
   }
+});
+
+const USER_ROLES = ["SUPER_ADMIN", "OWNER", "ADMIN", "AGENT", "MEMBER"];
+
+function serializeManagedUser(u) {
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    phone: u.phone || "",
+    role: u.role,
+    isActive: u.isActive !== false,
+    companyId: u.companyId,
+    companyName: u.company?.name || null,
+    permissions: normalizePermissions(u.permissions),
+    lastLoginAt: u.lastLoginAt ? u.lastLoginAt.getTime() : null,
+    createdAt: u.createdAt.getTime(),
+  };
+}
+
+router.get("/users/permissions", (_req, res) => {
+  res.json({ permissions: PERMISSIONS });
+});
+
+router.get("/users", async (req, res) => {
+  const { role, status, search } = req.query;
+  const where = {
+    ...(USER_ROLES.includes(String(role)) ? { role: String(role) } : {}),
+    ...(status === "active" ? { isActive: true } : status === "inactive" ? { isActive: false } : {}),
+    ...(search
+      ? {
+          OR: [
+            { name: { contains: String(search), mode: "insensitive" } },
+            { email: { contains: String(search), mode: "insensitive" } },
+            { phone: { contains: String(search), mode: "insensitive" } },
+          ],
+        }
+      : {}),
+  };
+  const [users, total, superAdmins, owners, admins, agents, inactive, platform] = await Promise.all([
+    prisma.user.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: 300,
+      include: { company: { select: { name: true } } },
+    }),
+    prisma.user.count(),
+    prisma.user.count({ where: { role: "SUPER_ADMIN" } }),
+    prisma.user.count({ where: { role: "OWNER" } }),
+    prisma.user.count({ where: { role: "ADMIN" } }),
+    prisma.user.count({ where: { role: "AGENT" } }),
+    prisma.user.count({ where: { isActive: false } }),
+    prisma.user.count({ where: { role: { in: ["SUPER_ADMIN", "ADMIN"] }, companyId: null } }),
+  ]);
+  res.json({
+    users: users.map(serializeManagedUser),
+    stats: { total, superAdmins, owners, admins, agents, inactive, platform },
+  });
+});
+
+router.post("/users", async (req, res) => {
+  if (req.user.role !== "SUPER_ADMIN") {
+    return res.status(403).json({ error: "Only Super Admin can create staff" });
+  }
+  const name = String(req.body?.name || "").trim();
+  const email = String(req.body?.email || "").toLowerCase().trim();
+  const password = String(req.body?.password || "");
+  const phone = String(req.body?.phone || "").trim();
+  let role = String(req.body?.role || "ADMIN");
+  if (!["SUPER_ADMIN", "ADMIN"].includes(role)) role = "ADMIN";
+  if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) return res.status(409).json({ error: "An account with this email already exists" });
+  const user = await prisma.user.create({
+    data: {
+      name,
+      email,
+      phone: phone || null,
+      password: await hashPassword(password),
+      role,
+      companyId: null,
+      isActive: true,
+      permissions: role === "SUPER_ADMIN" ? [] : normalizePermissions(req.body?.permissions),
+    },
+    include: { company: { select: { name: true } } },
+  });
+  await prisma.auditLog.create({
+    data: { userId: req.user.id, action: "user_create", entity: "User", entityId: user.id, meta: { email, role } },
+  }).catch(() => {});
+  res.status(201).json(serializeManagedUser(user));
+});
+
+router.patch("/users/:id/role", async (req, res) => {
+  if (req.user.role !== "SUPER_ADMIN") {
+    return res.status(403).json({ error: "Only Super Admin can change roles" });
+  }
+  const role = String(req.body?.role || "");
+  if (!USER_ROLES.includes(role)) return res.status(400).json({ error: "Invalid role" });
+  if (req.params.id === req.user.id) return res.status(400).json({ error: "You cannot change your own role" });
+  const target = await prisma.user.findUnique({ where: { id: req.params.id } });
+  if (!target) return res.status(404).json({ error: "User not found" });
+  const data = { role };
+  if (role === "SUPER_ADMIN") data.companyId = null;
+  if ((role === "OWNER" || role === "AGENT" || role === "MEMBER") && !target.companyId) {
+    return res.status(400).json({ error: "This role needs a client workspace. Create them from Clients instead." });
+  }
+  const updated = await prisma.user.update({
+    where: { id: target.id },
+    data,
+    include: { company: { select: { name: true } } },
+  });
+  await prisma.auditLog.create({
+    data: { userId: req.user.id, action: "user_role", entity: "User", entityId: updated.id, meta: { role } },
+  }).catch(() => {});
+  res.json(serializeManagedUser(updated));
+});
+
+router.patch("/users/:id/permissions", async (req, res) => {
+  if (req.user.role !== "SUPER_ADMIN") {
+    return res.status(403).json({ error: "Only Super Admin can set access" });
+  }
+  const target = await prisma.user.findUnique({ where: { id: req.params.id } });
+  if (!target) return res.status(404).json({ error: "User not found" });
+  if (target.role === "SUPER_ADMIN") {
+    return res.status(400).json({ error: "Super Admin already has full access" });
+  }
+  const updated = await prisma.user.update({
+    where: { id: target.id },
+    data: { permissions: normalizePermissions(req.body?.permissions) },
+    include: { company: { select: { name: true } } },
+  });
+  res.json(serializeManagedUser(updated));
+});
+
+router.patch("/users/:id/active", async (req, res) => {
+  if (req.params.id === req.user.id) {
+    return res.status(400).json({ error: "You cannot deactivate your own account" });
+  }
+  const target = await prisma.user.findUnique({ where: { id: req.params.id } });
+  if (!target) return res.status(404).json({ error: "User not found" });
+  if (target.role === "SUPER_ADMIN" && req.user.role !== "SUPER_ADMIN") {
+    return res.status(403).json({ error: "Only Super Admin can manage Super Admin accounts" });
+  }
+  const updated = await prisma.user.update({
+    where: { id: target.id },
+    data: { isActive: Boolean(req.body?.isActive) },
+    include: { company: { select: { name: true } } },
+  });
+  res.json(serializeManagedUser(updated));
+});
+
+router.delete("/users/:id", async (req, res) => {
+  if (req.user.role !== "SUPER_ADMIN") {
+    return res.status(403).json({ error: "Only Super Admin can delete users" });
+  }
+  if (!(await otpGate(req, res, "user_delete"))) return;
+  if (req.params.id === req.user.id) return res.status(400).json({ error: "You cannot delete your own account" });
+  const target = await prisma.user.findUnique({ where: { id: req.params.id } });
+  if (!target) return res.status(404).json({ error: "User not found" });
+  await prisma.user.delete({ where: { id: target.id } });
+  await prisma.auditLog.create({
+    data: { userId: req.user.id, action: "user_delete", entity: "User", entityId: target.id, meta: { email: target.email } },
+  }).catch(() => {});
+  res.json({ ok: true });
 });
 
 export default router;

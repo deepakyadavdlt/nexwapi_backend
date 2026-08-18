@@ -46,7 +46,9 @@ export function corsAllowedOrigins() {
     "https://nexwapi.com",
     "https://www.nexwapi.com",
     "http://localhost:3000",
+    "http://localhost:3001",
     "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
     ...fromEnv,
   ];
 }
@@ -56,5 +58,6 @@ export function corsOriginCheck(origin, cb) {
   const allowed = corsAllowedOrigins();
   if (allowed.includes(origin)) return cb(null, true);
   if (/^https?:\/\/([a-z0-9-]+\.)*nexwapi\.com(:\d+)?$/i.test(origin)) return cb(null, true);
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return cb(null, true);
   return cb(null, false);
 }

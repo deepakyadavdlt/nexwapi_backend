@@ -25,6 +25,7 @@ export function signToken(user, extras = {}) {
       name: user.name,
       role: user.role,
       companyId: user.companyId || null,
+      permissions: Array.isArray(user.permissions) ? user.permissions : [],
       ...extras,
     },
     secret(),
@@ -74,10 +75,9 @@ export function requireAuth(req, res, next) {
 
 export function requireSuperAdmin(req, res, next) {
   if (!req.user) return res.status(401).json({ error: "Authentication required" });
-  if (req.user.role !== "SUPER_ADMIN" && req.user.role !== "SuperAdmin") {
-    return res.status(403).json({ error: "Super Admin access only" });
-  }
-  next();
+  if (req.user.role === "SUPER_ADMIN" || req.user.role === "SuperAdmin") return next();
+  if ((req.user.role === "ADMIN" || req.user.role === "Admin") && !req.user.companyId) return next();
+  return res.status(403).json({ error: "Super Admin access only" });
 }
 
 export function requireAdmin(req, res, next) {

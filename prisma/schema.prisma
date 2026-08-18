@@ -92,6 +92,7 @@ model User {
   company      Company?  @relation(fields: [companyId], references: [id], onDelete: Cascade)
   lastLoginAt  DateTime?
   lastActiveAt DateTime?
+  permissions  Json?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   payments     Payment[]
@@ -287,19 +288,50 @@ model AuditLog {
 }
 
 model Ticket {
-  id        String   @id @default(cuid())
-  companyId String?
-  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
-  userId    String?
-  user      User?    @relation("TicketUser", fields: [userId], references: [id], onDelete: SetNull)
-  subject   String
-  body      String   @default("")
-  status    String   @default("open") // open | pending | closed
-  priority  String   @default("normal")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id         String   @id @default(cuid())
+  companyId  String?
+  company    Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  userId     String?
+  user       User?    @relation("TicketUser", fields: [userId], references: [id], onDelete: SetNull)
+  subject    String
+  body       String   @default("")
+  adminReply String   @default("")
+  origin     String   @default("client") // client | admin
+  status     String   @default("open") // open | pending | closed
+  priority   String   @default("normal")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
   @@index([status])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  audience  String   @default("client") // client | admin
+  userId    String?
+  companyId String?
+  title     String
+  body      String   @default("")
+  href      String   @default("")
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([audience, createdAt])
+  @@index([companyId, createdAt])
+  @@index([userId, read])
+}
+
+model SalesLead {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  phone     String   @default("")
+  company   String   @default("")
+  message   String
+  status    String   @default("new")
+  note      String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model Agent {
@@ -483,6 +515,8 @@ model Message {
   mediaUrl  String?
   filename  String?
   status    String   @default("sent")
+  senderName String?
+  senderUserId String?
   at        DateTime @default(now())
 
   @@index([contactId])

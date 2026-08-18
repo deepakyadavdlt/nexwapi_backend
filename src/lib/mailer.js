@@ -8,7 +8,11 @@ export const APP_URL = (process.env.APP_URL || process.env.CORS_ORIGIN || "https
 let transporter = null;
 
 export function mailConfigured() {
-  return Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+  return Boolean(
+    String(process.env.SMTP_HOST || "").trim() &&
+    String(process.env.SMTP_USER || "").trim() &&
+    String(process.env.SMTP_PASS || "").trim()
+  );
 }
 
 function getTransport() {
@@ -18,7 +22,10 @@ function getTransport() {
       host: process.env.SMTP_HOST,
       port: Number(process.env.SMTP_PORT || 587),
       secure: String(process.env.SMTP_PORT) === "465",
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      auth: {
+        user: String(process.env.SMTP_USER).trim(),
+        pass: String(process.env.SMTP_PASS).replace(/\s/g, ""),
+      },
     });
   }
   return transporter;
@@ -69,7 +76,7 @@ export async function sendOtpEmail(to, code, purpose) {
     api_delete: "Delete API key",
   };
   const title = labels[purpose] || "Verification code";
-  return sendMail({
+  const r = await sendMail({
     to,
     subject: `${code} is your Nexwapi ${title} code`,
     text: `Your Nexwapi code is ${code}. It expires in 10 minutes.`,
@@ -77,6 +84,10 @@ export async function sendOtpEmail(to, code, purpose) {
       <p style="font-size:32px;font-weight:800;letter-spacing:8px;color:#075E54">${code}</p>
       <p>This code expires in 10 minutes. If you did not request it, ignore this email or write to ${MAIL_SUPPORT}.</p>`),
   });
+  if (r?.skipped || r?.dryRun) {
+    throw new Error("OTP email could not be sent. SMTP is not configured.");
+  }
+  return r;
 }
 
 export async function sendWelcome(to, name) {

@@ -110,14 +110,17 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
   if (!name || !email || !password) return res.status(400).json({ error: "name, email and password required" });
   if (String(password).length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
   const em = String(email).toLowerCase().trim();
-  if (mailConfigured()) {
-    if (!otp) {
+  if (!otp) {
+    try {
       await issueOtp(em, "signup", { name, email: em, password, company: companyName });
-      return res.json({ otpRequired: true });
+    } catch (e) {
+      console.error("[signup otp]", e?.message || e);
+      return res.status(503).json({ error: "Could not send OTP to your email. Check SMTP or try again." });
     }
-    const v = verifyOtp(em, "signup", otp);
-    if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
+    return res.json({ otpRequired: true });
   }
+  const v = verifyOtp(em, "signup", otp);
+  if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
   try {
     const coName = String(companyName || name).trim();
     const slug = await uniqueSlug(coName);
@@ -189,14 +192,17 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
     if (user.isActive === false) {
       return res.status(403).json({ error: "This account has been deactivated" });
     }
-    if (mailConfigured()) {
-      if (!otp) {
+    if (!otp) {
+      try {
         await issueOtp(em, "login");
-        return res.json({ otpRequired: true });
+      } catch (e) {
+        console.error("[login otp]", e?.message || e);
+        return res.status(503).json({ error: "Could not send OTP to your email. Check SMTP or try again." });
       }
-      const v = verifyOtp(em, "login", otp);
-      if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
+      return res.json({ otpRequired: true });
     }
+    const v = verifyOtp(em, "login", otp);
+    if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
     prisma.user.update({ where: { id: user.id }, data: { lastActiveAt: new Date(), lastLoginAt: new Date() } }).catch(() => {});
     if (user.companyId) {
       prisma.company.update({ where: { id: user.companyId }, data: { lastActiveAt: new Date() } }).catch(() => {});

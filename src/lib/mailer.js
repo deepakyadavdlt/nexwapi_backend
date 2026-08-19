@@ -6,6 +6,7 @@ export const MAIL_SUPPORT = process.env.MAIL_SUPPORT || "hello@nexwapi.com";
 export const APP_URL = (process.env.APP_URL || process.env.CORS_ORIGIN || "https://nexwapi.com").split(",")[0].trim();
 
 let transporter = null;
+let activeTransportKey = null;
 
 export function mailConfigured() {
   return Boolean(
@@ -15,27 +16,47 @@ export function mailConfigured() {
   );
 }
 
+function transportProfiles() {
+  const primaryPort = Number(process.env.SMTP_PORT || 587);
+  const primarySecure = primaryPort === 465 || String(process.env.SMTP_SECURE || "").toLowerCase() === "true";
+  const profiles = [{ port: primaryPort, secure: primarySecure }];
+  if (primaryPort !== 465 && String(process.env.SMTP_DISABLE_465_FALLBACK || "").toLowerCase() !== "true") {
+    profiles.push({ port: 465, secure: true });
+  }
+  return profiles;
+}
+
+function buildTransport({ port, secure }) {
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port,
+    secure,
+    requireTLS: !secure && port === 587,
+    auth: {
+      user: String(process.env.SMTP_USER).trim(),
+      pass: String(process.env.SMTP_PASS).replace(/\s/g, ""),
+    },
+    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT || 25000),
+    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT || 25000),
+    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT || 35000),
+    tls: {
+      minVersion: "TLSv1.2",
+    },
+  });
+}
+
+function resetTransport() {
+  transporter = null;
+  activeTransportKey = null;
+}
+
 function getTransport() {
   if (!mailConfigured()) return null;
-  if (!transporter) {
-    const port = Number(process.env.SMTP_PORT || 587);
-    const secure = port === 465 || String(process.env.SMTP_SECURE || "").toLowerCase() === "true";
-    transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port,
-      secure,
-      requireTLS: !secure && port === 587,
-      auth: {
-        user: String(process.env.SMTP_USER).trim(),
-        pass: String(process.env.SMTP_PASS).replace(/\s/g, ""),
-      },
-      connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT || 20000),
-      greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT || 20000),
-      socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT || 30000),
-      tls: {
-        minVersion: "TLSv1.2",
-      },
-    });
+  const profile = transportProfiles()[0];
+  const key = `${profile.port}:${profile.secure}`;
+  if (!transporter || activeTransportKey !== key) {
+    transporter = buildTransport(profile);
+    activeTransportKey = key;
   }
   return transporter;
 }
@@ -57,28 +78,53 @@ function wrap(title, bodyHtml) {
 
 export async function sendMail({ to, subject, html, text }) {
   if (!to) return { skipped: true };
-  const t = getTransport();
-  if (!t) {
+  if (!mailConfigured()) {
     console.log(`[mail:dry-run] to=${to} subject=${subject}\n${text || ""}`);
     return { skipped: true, dryRun: true };
   }
-  try {
-    await t.sendMail({
-      from: `Nexwapi <${MAIL_FROM}>`,
-      replyTo: MAIL_SUPPORT,
-      to,
-      subject,
-      html,
-      text: text || subject,
-    });
-  } catch (e) {
-    const msg = String(e?.message || e);
-    if (/timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND/i.test(msg)) {
-      throw new Error(`SMTP connection failed (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587}). Check firewall, host, port, and app password.`);
+
+  const payload = {
+    from: `Nexwapi <${MAIL_FROM}>`,
+    replyTo: MAIL_SUPPORT,
+    to,
+    subject,
+    html,
+    text: text || subject,
+  };
+
+  const profiles = transportProfiles();
+  let lastErr = null;
+
+  for (let i = 0; i < profiles.length; i++) {
+    const profile = profiles[i];
+    try {
+      const t = buildTransport(profile);
+      activeTransportKey = `${profile.port}:${profile.secure}`;
+      transporter = t;
+      await t.sendMail(payload);
+      if (i > 0) {
+        console.log(`[mail] sent via SMTP port ${profile.port} (fallback)`);
+      }
+      return { ok: true };
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      const retryable = /timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ECONNRESET/i.test(msg);
+      if (retryable && i < profiles.length - 1) {
+        console.warn(`[mail] SMTP ${profile.port} failed, trying fallback…`);
+        resetTransport();
+        continue;
+      }
+      if (retryable) {
+        throw new Error(
+          `SMTP connection failed (${process.env.SMTP_HOST}:${profile.port}). VM may block outbound mail — set SMTP_PORT=465 and SMTP_SECURE=true, or open firewall for 587/465.`
+        );
+      }
+      throw e;
     }
-    throw e;
   }
-  return { ok: true };
+
+  throw lastErr || new Error("SMTP send failed");
 }
 
 export async function sendOtpEmail(to, code, purpose) {

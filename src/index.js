@@ -10,6 +10,7 @@ import { WA_LIVE } from "./config/whatsapp.js";
 import { attachUser } from "./lib/auth.js";
 import { validateEnv, corsOriginCheck } from "./lib/env.js";
 import { ensureDefaultPlans, ensureDefaultCoupons } from "./lib/tenant.js";
+import { ensureDatabaseReady } from "./lib/ensureDb.js";
 import fs from "fs";
 import path from "path";
 
@@ -82,12 +83,20 @@ async function ensureAdmin() {
 }
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, async () => {
-  console.log(`\n  Nexwapi backend up on http://localhost:${PORT}`);
-  console.log(`  WhatsApp mode: ${WA_LIVE ? "LIVE (Meta)" : "DEMO (simulated sends)"}`);
-  await ensureAdmin();
-  console.log("");
-});
+
+ensureDatabaseReady()
+  .then(() => {
+    app.listen(PORT, async () => {
+      console.log(`\n  Nexwapi backend up on http://localhost:${PORT}`);
+      console.log(`  WhatsApp mode: ${WA_LIVE ? "LIVE (Meta)" : "DEMO (simulated sends)"}`);
+      await ensureAdmin();
+      console.log("");
+    });
+  })
+  .catch((e) => {
+    console.error("[startup] database init failed:", e?.message || e);
+    process.exit(1);
+  });
 
 // Scheduler: every 30s, run due scheduled campaigns and drip-campaign steps.
 Promise.all([import("./lib/campaignRunner.js"), import("./lib/dripRunner.js"), import("./lib/lifecycleEmails.js")]).then(([cr, dr, life]) => {

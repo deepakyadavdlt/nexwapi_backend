@@ -18,13 +18,22 @@ export function mailConfigured() {
 function getTransport() {
   if (!mailConfigured()) return null;
   if (!transporter) {
+    const port = Number(process.env.SMTP_PORT || 587);
+    const secure = port === 465 || String(process.env.SMTP_SECURE || "").toLowerCase() === "true";
     transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: String(process.env.SMTP_PORT) === "465",
+      port,
+      secure,
+      requireTLS: !secure && port === 587,
       auth: {
         user: String(process.env.SMTP_USER).trim(),
         pass: String(process.env.SMTP_PASS).replace(/\s/g, ""),
+      },
+      connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT || 20000),
+      greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT || 20000),
+      socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT || 30000),
+      tls: {
+        minVersion: "TLSv1.2",
       },
     });
   }
@@ -53,14 +62,22 @@ export async function sendMail({ to, subject, html, text }) {
     console.log(`[mail:dry-run] to=${to} subject=${subject}\n${text || ""}`);
     return { skipped: true, dryRun: true };
   }
-  await t.sendMail({
-    from: `Nexwapi <${MAIL_FROM}>`,
-    replyTo: MAIL_SUPPORT,
-    to,
-    subject,
-    html,
-    text: text || subject,
-  });
+  try {
+    await t.sendMail({
+      from: `Nexwapi <${MAIL_FROM}>`,
+      replyTo: MAIL_SUPPORT,
+      to,
+      subject,
+      html,
+      text: text || subject,
+    });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (/timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND/i.test(msg)) {
+      throw new Error(`SMTP connection failed (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587}). Check firewall, host, port, and app password.`);
+    }
+    throw e;
+  }
   return { ok: true };
 }
 

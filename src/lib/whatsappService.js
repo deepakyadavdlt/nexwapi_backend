@@ -83,6 +83,79 @@ export function sendButtons(to, bodyText, buttons, creds) {
   }, creds);
 }
 
+/** Interactive list message (e.g. product collections). */
+export function sendList(to, bodyText, buttonText, sections, creds) {
+  return send({
+    to: waTo(to),
+    type: "interactive",
+    interactive: {
+      type: "list",
+      body: { text: String(bodyText || "").slice(0, 1024) },
+      action: {
+        button: String(buttonText || "Options").slice(0, 20),
+        sections: (sections || []).slice(0, 10).map((s) => ({
+          title: String(s.title || "Menu").slice(0, 24),
+          rows: (s.rows || []).slice(0, 10).map((r) => ({
+            id: String(r.id).slice(0, 200),
+            title: String(r.title).slice(0, 24),
+            ...(r.description ? { description: String(r.description).slice(0, 72) } : {}),
+          })),
+        })),
+      },
+    },
+  }, creds);
+}
+
+/**
+ * Multi-product message (product_list) — requires Meta catalog linked to the WABA.
+ * sections: [{ title, product_items: [{ product_retailer_id }] }]
+ */
+export function sendProductList(to, { catalogId, header, body, footer, sections }, creds) {
+  const interactive = {
+    type: "product_list",
+    header: { type: "text", text: String(header || "Catalog").slice(0, 60) },
+    body: { text: String(body || "Browse products").slice(0, 1024) },
+    action: {
+      catalog_id: String(catalogId),
+      sections: (sections || []).slice(0, 10).map((s) => ({
+        title: String(s.title || "Items").slice(0, 24),
+        product_items: (s.product_items || s.productItems || []).slice(0, 30).map((p) => ({
+          product_retailer_id: String(p.product_retailer_id || p.productRetailerId || p),
+        })),
+      })),
+    },
+  };
+  if (footer) interactive.footer = { text: String(footer).slice(0, 60) };
+  return send({ to: waTo(to), type: "interactive", interactive }, creds);
+}
+
+/** Full catalog message (single catalog button). */
+export function sendCatalogMessage(to, { body, footer }, creds) {
+  const interactive = {
+    type: "catalog_message",
+    body: { text: String(body || "View our catalog").slice(0, 1024) },
+    action: { name: "catalog_message" },
+  };
+  if (footer) interactive.footer = { text: String(footer).slice(0, 60) };
+  return send({ to: waTo(to), type: "interactive", interactive }, creds);
+}
+
+/** Single product message. */
+export function sendSingleProduct(to, { catalogId, productRetailerId, body }, creds) {
+  return send({
+    to: waTo(to),
+    type: "interactive",
+    interactive: {
+      type: "product",
+      body: body ? { text: String(body).slice(0, 1024) } : undefined,
+      action: {
+        catalog_id: String(catalogId),
+        product_retailer_id: String(productRetailerId),
+      },
+    },
+  }, creds);
+}
+
 export function sendTemplate(to, name, lang = "en", creds) {
   return send({ to: waTo(to), type: "template", template: { name, language: { code: waLang(lang) } } }, creds);
 }

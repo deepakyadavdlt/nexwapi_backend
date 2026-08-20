@@ -136,7 +136,7 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
       return res.json({ otpRequired: true, otpHint: otpResult.otpHint });
     } catch (e) {
       console.error("[signup otp]", e?.message || e);
-      return res.status(503).json({ error: "Could not send OTP to your email. Check SMTP or try again." });
+      return res.status(503).json({ error: "Could not send OTP to your email. Check RESEND_API_KEY or SMTP settings." });
     }
   }
   const v = verifyOtp(em, "signup", otp);
@@ -222,7 +222,7 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
           otpResult = await issueOtp(em, "login");
         } catch (e) {
           console.error("[login otp]", e?.message || e);
-          return res.status(503).json({ error: "Could not send OTP to your email. Check SMTP settings or try again." });
+          return res.status(503).json({ error: "Could not send OTP to your email. Check RESEND_API_KEY or SMTP settings." });
         }
         const { emailDeliveryConfigured } = await import("../lib/mailer.js");
         if (!otpResult.emailSent && !otpResult.devConsole && !emailDeliveryConfigured()) {

@@ -28,7 +28,10 @@ export function randomOtp() {
 }
 
 function devOtpConsoleAllowed() {
-  return !isProduction() || String(process.env.OTP_DEV_CONSOLE || "").toLowerCase() === "true";
+  if (isProduction()) {
+    return String(process.env.OTP_DEV_CONSOLE || "").toLowerCase() === "true";
+  }
+  return String(process.env.OTP_DEV_CONSOLE || "").toLowerCase() !== "false";
 }
 
 export async function issueOtp(email, purpose, payload = {}) {

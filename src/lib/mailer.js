@@ -1,6 +1,7 @@
 import nodemailer from "nodemailer";
+import { isProduction } from "./env.js";
 // SMTP From: hello@nexwapi.com (Google App Password in .env)
-// Optional: RESEND_API_KEY for HTTP email when SMTP ports are blocked.
+// Production VMs often block SMTP 587/465 — use RESEND_API_KEY (HTTPS port 443).
 
 export const MAIL_FROM = process.env.MAIL_FROM || "hello@nexwapi.com";
 export const MAIL_SUPPORT = process.env.MAIL_SUPPORT || "hello@nexwapi.com";
@@ -24,6 +25,51 @@ export function resendConfigured() {
 /** True when any outbound email channel is configured (SMTP or Resend). */
 export function emailDeliveryConfigured() {
   return mailConfigured() || resendConfigured();
+}
+
+/** auto | resend | smtp — auto prefers Resend when RESEND_API_KEY is set. */
+export function emailProvider() {
+  const mode = String(process.env.EMAIL_PROVIDER || "auto").toLowerCase();
+  if (mode === "resend") return resendConfigured() ? "resend" : "none";
+  if (mode === "smtp") return mailConfigured() ? "smtp" : "none";
+  if (resendConfigured()) return "resend";
+  if (mailConfigured()) return "smtp";
+  return "none";
+}
+
+function smtpAllowed() {
+  if (String(process.env.SMTP_DISABLED || "").toLowerCase() === "true") return false;
+  return emailProvider() === "smtp";
+}
+
+function smtpTimeouts() {
+  const fast = isProduction() && emailProvider() === "smtp";
+  return {
+    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT || (fast ? 3500 : 8000)),
+    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT || (fast ? 3500 : 8000)),
+    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT || (fast ? 5000 : 12000)),
+  };
+}
+
+export function logEmailConfig() {
+  const provider = emailProvider();
+  if (provider === "none") {
+    console.warn(`  Email: NOT configured${isProduction() ? " — OTP/login emails will fail" : ""}`);
+    return;
+  }
+  if (provider === "resend") {
+    console.log("  Email: Resend (HTTPS) — SMTP skipped on this server");
+    if (mailConfigured()) {
+      console.log("  Email: SMTP credentials present but unused (set EMAIL_PROVIDER=smtp to force SMTP)");
+    }
+    return;
+  }
+  console.log(`  Email: SMTP ${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587}`);
+  if (isProduction()) {
+    console.warn(
+      "  Email: WARNING — production uses SMTP only. Most VMs block ports 587/465. Add RESEND_API_KEY to .env."
+    );
+  }
 }
 
 async function sendViaResend(payload) {
@@ -59,6 +105,7 @@ function transportProfiles() {
 }
 
 function buildTransport({ port, secure }) {
+  const timeouts = smtpTimeouts();
   return nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port,
@@ -68,9 +115,7 @@ function buildTransport({ port, secure }) {
       user: String(process.env.SMTP_USER).trim(),
       pass: String(process.env.SMTP_PASS).replace(/\s/g, ""),
     },
-    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT || 8000),
-    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT || 8000),
-    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT || 12000),
+    ...timeouts,
     tls: {
       minVersion: "TLSv1.2",
     },
@@ -125,17 +170,28 @@ export async function sendMail({ to, subject, html, text, attachments }) {
     ...(attachments?.length ? { attachments } : {}),
   };
 
-  if (resendConfigured() && !attachments?.length) {
+  const provider = emailProvider();
+  const tryResend = provider === "resend" && resendConfigured() && !attachments?.length;
+  const trySmtp = smtpAllowed() && mailConfigured();
+
+  if (tryResend) {
     try {
       return await sendViaResend(payload);
     } catch (e) {
       console.warn("[mail] Resend failed:", e?.message || e);
-      if (!mailConfigured()) throw e;
+      if (!trySmtp) throw e;
     }
   }
 
-  if (!mailConfigured()) {
-    throw new Error("Email delivery is not configured. Set RESEND_API_KEY or SMTP credentials.");
+  if (!trySmtp) {
+    if (attachments?.length) {
+      throw new Error("Attachments require SMTP (set EMAIL_PROVIDER=smtp) or extend Resend attachment support.");
+    }
+    throw new Error(
+      isProduction()
+        ? "Email delivery failed. Add RESEND_API_KEY to production .env (HTTPS works when SMTP ports are blocked)."
+        : "Email delivery is not configured. Set RESEND_API_KEY or SMTP credentials."
+    );
   }
 
   const profiles = transportProfiles();
@@ -163,7 +219,7 @@ export async function sendMail({ to, subject, html, text, attachments }) {
       }
       if (retryable) {
         throw new Error(
-          `SMTP connection failed (${process.env.SMTP_HOST}:${profile.port}). VM may block outbound mail — set SMTP_PORT=465 and SMTP_SECURE=true, or open firewall for 587/465.`
+          `SMTP connection failed (${process.env.SMTP_HOST}:${profile.port}). VM blocks outbound mail — add RESEND_API_KEY to .env (uses HTTPS port 443).`
         );
       }
       throw e;
@@ -194,7 +250,7 @@ export async function sendOtpEmail(to, code, purpose) {
       <p>This code expires in 10 minutes. If you did not request it, ignore this email or write to ${MAIL_SUPPORT}.</p>`),
   });
   if (r?.skipped || r?.dryRun) {
-    throw new Error("OTP email could not be sent. SMTP is not configured.");
+    throw new Error("OTP email could not be sent. Configure RESEND_API_KEY or SMTP in backend .env.");
   }
   return r;
 }

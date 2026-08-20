@@ -2,7 +2,13 @@
 const DEV_JWT_FALLBACK = "nexwapi_dev_secret_change_me";
 
 export function isProduction() {
-  return process.env.NODE_ENV === "production";
+  if (process.env.NODE_ENV === "production") return true;
+  if (String(process.env.NEXWAPI_ENV || "").toLowerCase() === "production") return true;
+  const urls = [process.env.APP_URL, process.env.PUBLIC_API_URL, process.env.CORS_ORIGIN]
+    .filter(Boolean)
+    .join(" ");
+  if (/nexwapi\.com/i.test(urls) && !/localhost|127\.0\.0\.1/i.test(urls)) return true;
+  return false;
 }
 
 export function getJwtSecret() {

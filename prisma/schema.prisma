@@ -72,6 +72,9 @@ model Company {
   drips            Drip[]
   segments         Segment[]
   products         Product[]
+  commerceSetting  CommerceSetting?
+  catalogCollections CatalogCollection[]
+  commerceOrders   CommerceOrder[]
   labels           Label[]
   assignmentRules  AssignmentRule[]
   apiKeys          ApiKey[]
@@ -462,9 +465,88 @@ model Product {
   price       String   @default("")
   description String   @default("")
   imageUrl    String   @default("")
+  retailerId  String   @default("") // Meta product retailer_id
+  currency    String   @default("INR")
+  availability String  @default("in stock")
+  source      String   @default("local") // local | meta | sample | csv
+  collectionMetaId String @default("")
+  metaProductId String @default("")
   createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   @@index([companyId])
+  @@index([companyId, retailerId])
+}
+
+/** Per-tenant WhatsApp Commerce / Catalog settings (Interakt-style). */
+model CommerceSetting {
+  id                    String    @id @default(cuid())
+  companyId             String    @unique
+  company               Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  catalogId             String    @default("")
+  catalogName           String    @default("")
+  connectedAt           DateTime?
+  lastSyncAt            DateTime?
+  sandboxMode           Boolean   @default(true)
+  partnerAccessGranted  Boolean   @default(false)
+  collectionsBody       String    @default("Hey there, check out our top product collections")
+  collectionsButton     String    @default("View Collections")
+  catalogInCampaigns    Boolean   @default(false)
+  catalogInAutoReplies  Boolean   @default(false)
+  autocheckoutEnabled   Boolean   @default(false)
+  autocheckoutFlowId    String    @default("")
+  paymentLinkBase       String    @default("")
+  shippingPrompt        String    @default("Thanks for your cart! Please share your full shipping address (name, street, city, pincode, phone).")
+  paymentPrompt         String    @default("Great — here is your payment link. Once paid, we will confirm your order.")
+  orderConfirmMessage   String    @default("Your order is confirmed! We will update you when it ships.")
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+}
+
+model CatalogCollection {
+  id                 String   @id @default(cuid())
+  companyId          String
+  company            Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  metaSetId          String   @default("")
+  name               String
+  includeInTop10     Boolean  @default(true)
+  headerText         String   @default("")
+  bodyText           String   @default("")
+  footerText         String   @default("")
+  imageUrl           String   @default("")
+  productCount       Int      @default(0)
+  productRetailerIds Json     @default("[]")
+  sortOrder          Int      @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([companyId])
+  @@unique([companyId, metaSetId])
+}
+
+model CommerceOrder {
+  id              String   @id @default(cuid())
+  companyId       String
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contactId       String?
+  contactPhone    String   @default("")
+  contactName     String   @default("")
+  waMessageId     String?
+  catalogId       String   @default("")
+  status          String   @default("enquiry") // enquiry | pending_address | pending_payment | paid | fulfilled | cancelled
+  currency        String   @default("INR")
+  totalAmount     String   @default("0")
+  items           Json     @default("[]")
+  shippingAddress Json?
+  paymentLink     String   @default("")
+  notes           String   @default("")
+  source          String   @default("whatsapp_cart") // whatsapp_cart | manual | enquiry
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([companyId, createdAt])
+  @@index([companyId, status])
+  @@index([contactId])
 }
 
 model Setting {

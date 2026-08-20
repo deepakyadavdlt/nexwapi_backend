@@ -8,7 +8,8 @@ import api from "./routes/api.js";
 import superAdmin from "./routes/superAdmin.js";
 import { WA_LIVE } from "./config/whatsapp.js";
 import { attachUser } from "./lib/auth.js";
-import { validateEnv, corsOriginCheck } from "./lib/env.js";
+import { validateEnv, corsOriginCheck, isProduction } from "./lib/env.js";
+import { logEmailConfig } from "./lib/mailer.js";
 import { ensureDefaultPlans, ensureDefaultCoupons } from "./lib/tenant.js";
 import { ensureDatabaseReady } from "./lib/ensureDb.js";
 import fs from "fs";
@@ -88,7 +89,9 @@ ensureDatabaseReady()
   .then(() => {
     app.listen(PORT, async () => {
       console.log(`\n  Nexwapi backend up on http://localhost:${PORT}`);
+      console.log(`  Environment: ${isProduction() ? "production" : "development"} (NODE_ENV=${process.env.NODE_ENV || "unset"})`);
       console.log(`  WhatsApp mode: ${WA_LIVE ? "LIVE (Meta)" : "DEMO (simulated sends)"}`);
+      logEmailConfig();
       await ensureAdmin();
       console.log("");
     });

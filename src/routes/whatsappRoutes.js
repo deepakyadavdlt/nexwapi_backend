@@ -218,6 +218,10 @@ function textOf(m) {
     case "button": return m.button?.text || "";
     case "interactive":
       return m.interactive?.button_reply?.title || m.interactive?.list_reply?.title || "";
+    case "order": {
+      const items = m.order?.product_items || [];
+      return `🛒 Cart · ${items.length} item(s)`;
+    }
     case "image": return m.image?.caption || "📷 Photo";
     case "document": return m.document?.filename || "📄 Document";
     case "audio": return "🎤 Voice message";
@@ -404,6 +408,51 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             } catch {}
             console.log("[csat] rating from", contact.phone, "=", rating);
             continue;
+          }
+
+          // WhatsApp Commerce: inbound cart / order
+          if (m.type === "order" && m.order) {
+            try {
+              const { handleInboundOrder } = await import("../lib/commerce.js");
+              const order = await handleInboundOrder(companyId, contact, m.order, m.id);
+              notify({
+                audience: "client",
+                companyId,
+                title: `New WhatsApp cart from ${contact.name}`,
+                body: `Order ${order.id.slice(-6).toUpperCase()} · ${order.currency} ${order.totalAmount}`,
+                href: "/dashboard/orders",
+              }).catch(() => {});
+              console.log("[commerce] cart order", order.id, "from", contact.phone);
+            } catch (e) {
+              console.error("[commerce] order handler:", e.message);
+            }
+            continue;
+          }
+
+          // Collection list reply → send product catalog for that collection
+          const listId = m.interactive?.list_reply?.id;
+          if (listId?.startsWith("col:")) {
+            try {
+              const { sendCollectionCatalog } = await import("../lib/commerce.js");
+              await sendCollectionCatalog(companyId, contact.phone, listId.slice(4));
+              console.log("[commerce] collection catalog sent", listId.slice(4));
+            } catch (e) {
+              console.error("[commerce] collection reply:", e.message);
+            }
+            continue;
+          }
+
+          // Autocheckout address / payment replies (also button Yes/No)
+          try {
+            const { continueAutocheckout } = await import("../lib/commerce.js");
+            const btnAc = m.interactive?.button_reply?.id || null;
+            const handledCheckout = await continueAutocheckout(companyId, contact, bodyText, btnAc);
+            if (handledCheckout) {
+              console.log("[commerce] autocheckout step", contact.phone, btnAc || bodyText);
+              continue;
+            }
+          } catch (e) {
+            console.error("[commerce] autocheckout:", e.message);
           }
 
           let handled = false;

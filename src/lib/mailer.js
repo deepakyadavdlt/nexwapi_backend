@@ -1,11 +1,11 @@
 import nodemailer from "nodemailer";
 import { isProduction } from "./env.js";
-// SMTP From: hello@nexwapi.com (Google App Password in .env)
-// Production VMs often block SMTP 587/465 — use RESEND_API_KEY (HTTPS port 443).
+// Production VMs often block SMTP 587/465 — prefer ZeptoMail or Resend (HTTPS :443).
 
-export const MAIL_FROM = process.env.MAIL_FROM || "hello@nexwapi.com";
+export const MAIL_FROM = process.env.MAIL_FROM || "no-reply@nexwapi.com";
 export const MAIL_SUPPORT = process.env.MAIL_SUPPORT || "hello@nexwapi.com";
 export const APP_URL = (process.env.APP_URL || process.env.CORS_ORIGIN || "https://nexwapi.com").split(",")[0].trim();
+const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || "Nexwapi";
 
 let transporter = null;
 let activeTransportKey = null;
@@ -22,16 +22,25 @@ export function resendConfigured() {
   return Boolean(String(process.env.RESEND_API_KEY || "").trim());
 }
 
-/** True when any outbound email channel is configured (SMTP or Resend). */
-export function emailDeliveryConfigured() {
-  return mailConfigured() || resendConfigured();
+export function zeptomailConfigured() {
+  return Boolean(String(process.env.ZEPTOMAIL_TOKEN || "").trim());
 }
 
-/** auto | resend | smtp — auto prefers Resend when RESEND_API_KEY is set. */
+/** True when any outbound email channel is configured. */
+export function emailDeliveryConfigured() {
+  return zeptomailConfigured() || resendConfigured() || mailConfigured();
+}
+
+/**
+ * auto | zeptomail | resend | smtp
+ * auto: ZeptoMail → Resend → SMTP
+ */
 export function emailProvider() {
   const mode = String(process.env.EMAIL_PROVIDER || "auto").toLowerCase();
+  if (mode === "zeptomail") return zeptomailConfigured() ? "zeptomail" : "none";
   if (mode === "resend") return resendConfigured() ? "resend" : "none";
   if (mode === "smtp") return mailConfigured() ? "smtp" : "none";
+  if (zeptomailConfigured()) return "zeptomail";
   if (resendConfigured()) return "resend";
   if (mailConfigured()) return "smtp";
   return "none";
@@ -57,25 +66,62 @@ export function logEmailConfig() {
     console.warn(`  Email: NOT configured${isProduction() ? " — OTP/login emails will fail" : ""}`);
     return;
   }
-  if (provider === "resend") {
-    console.log("  Email: Resend (HTTPS) — SMTP skipped on this server");
-    if (mailConfigured()) {
-      console.log("  Email: SMTP credentials present but unused (set EMAIL_PROVIDER=smtp to force SMTP)");
-    }
+  if (provider === "zeptomail") {
+    const host = process.env.ZEPTOMAIL_API_URL || "https://api.zeptomail.in/v1.1/email";
+    console.log(`  Email: ZeptoMail (HTTPS) from ${MAIL_FROM} → ${host}`);
     return;
   }
-  console.log(`  Email: SMTP ${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587}`);
+  if (provider === "resend") {
+    console.log(`  Email: Resend (HTTPS) from ${MAIL_FROM}`);
+    return;
+  }
+  console.log(`  Email: SMTP ${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587} from ${MAIL_FROM}`);
   if (isProduction()) {
     console.warn(
-      "  Email: WARNING — production uses SMTP only. Most VMs block ports 587/465. Add RESEND_API_KEY to .env."
+      "  Email: WARNING — production uses SMTP only. VMs often block 587/465. Prefer ZEPTOMAIL_TOKEN (HTTPS)."
     );
   }
+}
+
+async function sendViaZeptoMail(payload) {
+  const token = String(process.env.ZEPTOMAIL_TOKEN || "").trim();
+  if (!token) return null;
+  const endpoint = String(process.env.ZEPTOMAIL_API_URL || "https://api.zeptomail.in/v1.1/email").trim();
+  const fromAddress = MAIL_FROM;
+  const fromName = MAIL_FROM_NAME;
+  const replyTo = MAIL_SUPPORT;
+
+  const body = {
+    from: { address: fromAddress, name: fromName },
+    to: [{ email_address: { address: payload.to, name: payload.to } }],
+    subject: payload.subject,
+    htmlbody: payload.html || payload.text || "",
+    textbody: payload.text || payload.subject,
+  };
+  if (replyTo) {
+    body.reply_to = [{ address: replyTo, name: "Nexwapi Support" }];
+  }
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Zoho-enczapikey ${token}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`ZeptoMail API failed (${res.status}): ${errBody.slice(0, 240)}`);
+  }
+  return { ok: true, via: "zeptomail" };
 }
 
 async function sendViaResend(payload) {
   const key = String(process.env.RESEND_API_KEY || "").trim();
   if (!key) return null;
-  const from = process.env.RESEND_FROM || `Nexwapi <${MAIL_FROM}>`;
+  const from = process.env.RESEND_FROM || `${MAIL_FROM_NAME} <${MAIL_FROM}>`;
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -161,7 +207,7 @@ export async function sendMail({ to, subject, html, text, attachments }) {
   }
 
   const payload = {
-    from: `Nexwapi <${MAIL_FROM}>`,
+    from: `${MAIL_FROM_NAME} <${MAIL_FROM}>`,
     replyTo: MAIL_SUPPORT,
     to,
     subject,
@@ -170,63 +216,77 @@ export async function sendMail({ to, subject, html, text, attachments }) {
     ...(attachments?.length ? { attachments } : {}),
   };
 
-  const provider = emailProvider();
-  const tryResend = provider === "resend" && resendConfigured() && !attachments?.length;
-  const trySmtp = smtpAllowed() && mailConfigured();
-
-  if (tryResend) {
-    try {
-      return await sendViaResend(payload);
-    } catch (e) {
-      console.warn("[mail] Resend failed:", e?.message || e);
-      if (!trySmtp) throw e;
-    }
+  const mode = String(process.env.EMAIL_PROVIDER || "auto").toLowerCase();
+  const chain = [];
+  if ((mode === "zeptomail" || mode === "auto") && zeptomailConfigured() && !attachments?.length) {
+    chain.push("zeptomail");
+  }
+  if ((mode === "resend" || mode === "auto") && resendConfigured() && !attachments?.length) {
+    chain.push("resend");
+  }
+  if (
+    mailConfigured()
+    && String(process.env.SMTP_DISABLED || "").toLowerCase() !== "true"
+    && (mode === "smtp" || (mode === "auto" && !chain.length) || mode === "smtp")
+  ) {
+    if (!chain.includes("smtp")) chain.push("smtp");
+  }
+  if (mode === "smtp" && mailConfigured() && !chain.includes("smtp")) chain.push("smtp");
+  // auto: also allow SMTP as last resort after HTTPS fails
+  if (mode === "auto" && mailConfigured() && String(process.env.SMTP_DISABLED || "").toLowerCase() !== "true" && !chain.includes("smtp")) {
+    chain.push("smtp");
   }
 
-  if (!trySmtp) {
-    if (attachments?.length) {
-      throw new Error("Attachments require SMTP (set EMAIL_PROVIDER=smtp) or extend Resend attachment support.");
-    }
-    throw new Error(
-      isProduction()
-        ? "Email delivery failed. Add RESEND_API_KEY to production .env (HTTPS works when SMTP ports are blocked)."
-        : "Email delivery is not configured. Set RESEND_API_KEY or SMTP credentials."
-    );
-  }
-
-  const profiles = transportProfiles();
   let lastErr = null;
-
-  for (let i = 0; i < profiles.length; i++) {
-    const profile = profiles[i];
+  for (const step of chain) {
     try {
-      const t = buildTransport(profile);
-      activeTransportKey = `${profile.port}:${profile.secure}`;
-      transporter = t;
-      await t.sendMail(payload);
-      if (i > 0) {
-        console.log(`[mail] sent via SMTP port ${profile.port} (fallback)`);
+      if (step === "zeptomail") return await sendViaZeptoMail(payload);
+      if (step === "resend") return await sendViaResend(payload);
+      if (step === "smtp") {
+        const profiles = transportProfiles();
+        let smtpErr = null;
+        for (let i = 0; i < profiles.length; i++) {
+          const profile = profiles[i];
+          try {
+            const t = buildTransport(profile);
+            activeTransportKey = `${profile.port}:${profile.secure}`;
+            transporter = t;
+            await t.sendMail(payload);
+            if (i > 0) console.log(`[mail] sent via SMTP port ${profile.port} (fallback)`);
+            return { ok: true, via: "smtp" };
+          } catch (e) {
+            smtpErr = e;
+            const msg = String(e?.message || e);
+            const retryable = /timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ECONNRESET/i.test(msg);
+            if (retryable && i < profiles.length - 1) {
+              console.warn(`[mail] SMTP ${profile.port} failed, trying fallback…`);
+              resetTransport();
+              continue;
+            }
+            if (retryable) {
+              throw new Error(
+                `SMTP connection failed (${process.env.SMTP_HOST}:${profile.port}). Set ZEPTOMAIL_TOKEN (HTTPS :443).`
+              );
+            }
+            throw e;
+          }
+        }
+        throw smtpErr || new Error("SMTP send failed");
       }
-      return { ok: true };
     } catch (e) {
       lastErr = e;
-      const msg = String(e?.message || e);
-      const retryable = /timeout|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ECONNRESET/i.test(msg);
-      if (retryable && i < profiles.length - 1) {
-        console.warn(`[mail] SMTP ${profile.port} failed, trying fallback…`);
-        resetTransport();
-        continue;
-      }
-      if (retryable) {
-        throw new Error(
-          `SMTP connection failed (${process.env.SMTP_HOST}:${profile.port}). VM blocks outbound mail — add RESEND_API_KEY to .env (uses HTTPS port 443).`
-        );
-      }
-      throw e;
+      console.warn(`[mail] ${step} failed:`, e?.message || e);
     }
   }
 
-  throw lastErr || new Error("SMTP send failed");
+  if (attachments?.length && !mailConfigured()) {
+    throw new Error("Attachments require SMTP credentials.");
+  }
+  throw lastErr || new Error(
+    isProduction()
+      ? "Email delivery failed. Set ZEPTOMAIL_TOKEN in production .env."
+      : "Email delivery is not configured. Set ZEPTOMAIL_TOKEN or SMTP credentials."
+  );
 }
 
 export async function sendOtpEmail(to, code, purpose) {
@@ -250,7 +310,7 @@ export async function sendOtpEmail(to, code, purpose) {
       <p>This code expires in 10 minutes. If you did not request it, ignore this email or write to ${MAIL_SUPPORT}.</p>`),
   });
   if (r?.skipped || r?.dryRun) {
-    throw new Error("OTP email could not be sent. Configure RESEND_API_KEY or SMTP in backend .env.");
+    throw new Error("OTP email could not be sent. Configure ZEPTOMAIL_TOKEN or SMTP in backend .env.");
   }
   return r;
 }

@@ -50,6 +50,15 @@ export async function maybeWelcome(contact, companyId, { isNewContact = false } 
 
   try {
     await sendAutoText({ companyId, contact, text: s.welcomeMessage, automationSource: "welcome" });
+    try {
+      const commerce = await prisma.commerceSetting.findUnique({ where: { companyId } });
+      if (commerce?.catalogInAutoReplies) {
+        const { sendCollectionsList } = await import("./commerce.js");
+        await sendCollectionsList(companyId, contact.phone);
+      }
+    } catch (e) {
+      console.warn("[automation] catalog after welcome:", e.message);
+    }
     const attrs = { ...(contact.attributes || {}), welcome_sent_at: new Date().toISOString() };
     await prisma.contact.update({ where: { id: contact.id }, data: { attributes: attrs } });
     console.log("[automation] welcome sent to", contact.phone);

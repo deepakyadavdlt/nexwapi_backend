@@ -75,6 +75,7 @@ model Company {
   commerceSetting  CommerceSetting?
   catalogCollections CatalogCollection[]
   commerceOrders   CommerceOrder[]
+  integrations     Integration[]
   labels           Label[]
   assignmentRules  AssignmentRule[]
   apiKeys          ApiKey[]
@@ -499,6 +500,23 @@ model CommerceSetting {
   shippingPrompt        String    @default("Thanks for your cart! Please share your full shipping address (name, street, city, pincode, phone).")
   paymentPrompt         String    @default("Great — here is your payment link. Once paid, we will confirm your order.")
   orderConfirmMessage   String    @default("Your order is confirmed! We will update you when it ships.")
+  // Autocheckout workflow (Interakt-style)
+  shippingMode          String    @default("free") // free | fixed | threshold
+  shippingAmount        String    @default("0") // rupees as string
+  freeShippingAbove     String    @default("2000")
+  discountEnabled       Boolean   @default(false)
+  discountType          String    @default("none") // none | percent | flat
+  discountValue         String    @default("0")
+  paymentMethod         String    @default("cod") // cod | link | both
+  proceedMessage        String    @default("Thanks for your cart! {{shipping_note}} Your total order value is {{total_order_value}}. Would you like to go ahead with the order?")
+  askNameMessage        String    @default("Great! We will require some details to ship the order. Please provide your full name.")
+  askPincodeMessage     String    @default("Please provide the Pincode/Postcode/Zipcode of the delivery location.")
+  askAddressMessage     String    @default("Please enter your street address, building name/number, flat number, floor etc. For example: 123, MG Road, Kusum Apartments, Flat no. 123, 1st floor.")
+  confirmOrderMessage   String    @default("Thanks for providing the details! We have noted your address as: {{address}}. {{payment_note}} Would you like to confirm the order?")
+  cancelMessage         String    @default("No problem! Your cart is saved. Message us anytime when you are ready to order.")
+  shippingConfirmed     Boolean   @default(false)
+  discountsConfirmed    Boolean   @default(false)
+  paymentConfirmed      Boolean   @default(false)
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
 }
@@ -533,7 +551,11 @@ model CommerceOrder {
   contactName     String   @default("")
   waMessageId     String?
   catalogId       String   @default("")
-  status          String   @default("enquiry") // enquiry | pending_address | pending_payment | paid | fulfilled | cancelled
+  status          String   @default("enquiry") // legacy pipeline status
+  // Interakt-style Order Panel fields
+  orderStatus       String @default("cart_received") // cart_received | on_hold | confirmed | cancelled
+  paymentStatus     String @default("unpaid") // unpaid | paid | partially_paid
+  fulfillmentStatus String @default("not_scheduled") // not_scheduled | scheduled | partially_shipped | shipped | partially_delivered | pending | delivered | cancelled
   currency        String   @default("INR")
   totalAmount     String   @default("0")
   items           Json     @default("[]")
@@ -546,7 +568,32 @@ model CommerceOrder {
 
   @@index([companyId, createdAt])
   @@index([companyId, status])
+  @@index([companyId, orderStatus])
+  @@index([companyId, paymentStatus])
+  @@index([companyId, fulfillmentStatus])
   @@index([contactId])
+}
+
+/** Third-party app connections (Interakt-style Integrations). */
+model Integration {
+  id           String   @id @default(cuid())
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  provider     String   // woocommerce | shopify | google_sheets | facebook_leads | own_api | razorpay | ...
+  name         String   @default("")
+  status       String   @default("disconnected") // disconnected | connected | error
+  config       Json     @default("{}") // credentials / settings (secrets stored here for MVP)
+  webhookSecret String  @default("")
+  lastSyncAt   DateTime?
+  lastError    String   @default("")
+  eventCount   Int      @default(0)
+  connectedAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([companyId, provider])
+  @@index([companyId])
+  @@index([provider, status])
 }
 
 model Setting {

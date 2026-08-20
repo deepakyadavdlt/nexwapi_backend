@@ -47,7 +47,18 @@ import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
 import { loginLimiter, signupLimiter, apiMessageLimiter } from "../lib/rateLimit.js";
 import { findApiKeyByRaw, hashApiKey, keyPrefix, publicApiKeyRow } from "../lib/apiKey.js";
-import { mailConfigured, sendWelcome, sendInvoiceEmail, sendCampaignStatus, sendCampaignReportEmail, sendSuspension, sendTemplateStatus, sendSupportTicketAlert } from "../lib/mailer.js";
+import { mailConfigured, emailDeliveryConfigured, sendWelcome, sendInvoiceEmail, sendCampaignStatus, sendCampaignReportEmail, sendSuspension, sendTemplateStatus, sendSupportTicketAlert } from "../lib/mailer.js";
+import {
+  commerceOverview, connectCatalog, syncCatalog, getOrCreateCommerceSetting,
+  parseProductsCsv, sendCollectionsList, sendCollectionCatalog, commerceUserError,
+  checkoutBotOverview, listCommerceOrders, orderPanelMeta, ordersToCsv, serializeCommerceOrder,
+} from "../lib/commerce.js";
+import {
+  listIntegrationsOverview, connectIntegration, disconnectIntegration, getOrCreateIntegration,
+  serializeIntegration, handleWooWebhook, handleShopifyWebhook, handleGoogleSheetRow,
+  handleFacebookLead, syncWooProducts, syncShopifyProducts, resolveHookCompany,
+  rotateIntegrationSecret,
+} from "../lib/integrations.js";
 import { issueOtp, verifyOtp, requireOtpOrSkip, otpGate } from "../lib/otp.js";
 import { notify } from "../lib/notify.js";
 import { getLocalWaProfile, saveLocalWaProfile } from "../lib/localWaProfile.js";
@@ -347,7 +358,7 @@ router.patch("/me", requireAuth, attachCompany, async (req, res) => {
 router.post("/otp/send", requireAuth, async (req, res) => {
   try {
     await issueOtp(req.user.email, req.body?.purpose || "login", req.body?.payload || {});
-    res.json({ ok: true, otpRequired: mailConfigured() });
+    res.json({ ok: true, otpRequired: emailDeliveryConfigured() });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -801,6 +812,53 @@ router.post("/sales-leads", async (req, res) => {
     href: "/admin/sales",
   }).catch(() => {});
   res.status(201).json({ ok: true, id: lead.id });
+});
+
+/* -------- Public integration webhooks (no JWT — verified by companyId + secret) -------- */
+router.get("/integrations/hooks/facebook_leads/:companyId", (req, res) => {
+  // Meta webhook verification
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  const expected = process.env.WHATSAPP_VERIFY_TOKEN || process.env.FB_LEADS_VERIFY_TOKEN || "nexwapi_leads";
+  if (mode === "subscribe" && token === expected) return res.status(200).send(challenge);
+  return res.sendStatus(403);
+});
+
+router.post("/integrations/hooks/:provider/:companyId", async (req, res) => {
+  const provider = String(req.params.provider || "");
+  const companyId = String(req.params.companyId || "");
+  try {
+    await resolveHookCompany(provider, companyId, req);
+    let result = { ok: true };
+    if (provider === "woocommerce") {
+      const topic = req.headers["x-wc-webhook-topic"] || req.query.topic || "order";
+      result = await handleWooWebhook(companyId, String(topic), req.body || {});
+    } else if (provider === "shopify") {
+      const topic = req.headers["x-shopify-topic"] || req.query.topic || "orders/create";
+      result = await handleShopifyWebhook(companyId, String(topic), req.body || {});
+    } else if (provider === "google_sheets") {
+      result = await handleGoogleSheetRow(companyId, req.body || {});
+    } else if (provider === "facebook_leads") {
+      // Meta sends entry[].changes[].value
+      const entry = req.body?.entry || [];
+      for (const e of entry) {
+        for (const change of e.changes || []) {
+          if (change.field === "leadgen") {
+            await handleFacebookLead(companyId, change.value || {});
+          }
+        }
+      }
+      // Also accept direct flattened leads
+      if (!entry.length) result = await handleFacebookLead(companyId, req.body || {});
+    } else {
+      return res.status(404).json({ error: "Unknown provider" });
+    }
+    res.json(result);
+  } catch (e) {
+    console.error("[integrations hook]", provider, e?.message || e);
+    res.status(e.status || 400).json({ error: e?.message || "Webhook failed" });
+  }
 });
 
 router.use((req, res, next) => {
@@ -1426,9 +1484,19 @@ router.get("/products", async (req, res) => {
 });
 
 router.post("/products", async (req, res) => {
-  const { name, price = "", description = "", imageUrl = "" } = req.body || {};
+  const { name, price = "", description = "", imageUrl = "", retailerId = "" } = req.body || {};
   if (!name) return res.status(400).json({ error: "name required" });
-  const product = await prisma.product.create({ data: { companyId: companyIdOf(req), name, price, description, imageUrl } });
+  const product = await prisma.product.create({
+    data: {
+      companyId: companyIdOf(req),
+      name,
+      price,
+      description,
+      imageUrl,
+      retailerId: retailerId || "",
+      source: "local",
+    },
+  });
   res.status(201).json({ ...product, createdAt: product.createdAt.getTime() });
 });
 
@@ -1440,6 +1508,343 @@ router.delete("/products/:id", async (req, res) => {
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
+  }
+});
+
+/* ------------------------ WhatsApp Commerce ---------------------------- */
+router.get("/commerce/overview", async (req, res) => {
+  try {
+    const data = await commerceOverview(companyIdOf(req));
+    res.json(data);
+  } catch (e) {
+    console.error("[commerce overview]", e?.message || e);
+    res.status(500).json({ error: commerceUserError(e) });
+  }
+});
+
+router.get("/commerce/checkout-bot", async (req, res) => {
+  try {
+    const data = await checkoutBotOverview(companyIdOf(req));
+    res.json(data);
+  } catch (e) {
+    console.error("[checkout-bot]", e?.message || e);
+    res.status(500).json({ error: commerceUserError(e) });
+  }
+});
+
+router.post("/commerce/checkout-bot/go-live", async (req, res) => {
+  try {
+    const cid = companyIdOf(req);
+    const setting = await getOrCreateCommerceSetting(cid);
+    if (!setting.shippingConfirmed || !setting.discountsConfirmed || !setting.paymentConfirmed) {
+      return res.status(400).json({
+        error: "Complete mandatory steps first: Shipping Cost, Discounts, and Payment Options.",
+      });
+    }
+    const updated = await prisma.commerceSetting.update({
+      where: { companyId: cid },
+      data: { autocheckoutEnabled: true },
+    });
+    res.json({
+      ok: true,
+      setting: {
+        ...updated,
+        connectedAt: updated.connectedAt?.getTime?.() || null,
+        lastSyncAt: updated.lastSyncAt?.getTime?.() || null,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: commerceUserError(e) });
+  }
+});
+
+router.post("/commerce/checkout-bot/pause", async (req, res) => {
+  try {
+    const cid = companyIdOf(req);
+    await getOrCreateCommerceSetting(cid);
+    const updated = await prisma.commerceSetting.update({
+      where: { companyId: cid },
+      data: { autocheckoutEnabled: false },
+    });
+    res.json({ ok: true, setting: updated });
+  } catch (e) {
+    res.status(500).json({ error: commerceUserError(e) });
+  }
+});
+
+router.patch("/commerce/settings", async (req, res) => {
+  try {
+    const cid = companyIdOf(req);
+    await getOrCreateCommerceSetting(cid);
+    const allowed = [
+      "collectionsBody", "collectionsButton", "catalogInCampaigns", "catalogInAutoReplies",
+      "autocheckoutEnabled", "autocheckoutFlowId", "paymentLinkBase",
+      "shippingPrompt", "paymentPrompt", "orderConfirmMessage", "partnerAccessGranted",
+      "shippingMode", "shippingAmount", "freeShippingAbove",
+      "discountEnabled", "discountType", "discountValue", "paymentMethod",
+      "proceedMessage", "askNameMessage", "askPincodeMessage", "askAddressMessage",
+      "confirmOrderMessage", "cancelMessage",
+      "shippingConfirmed", "discountsConfirmed", "paymentConfirmed",
+    ];
+    const data = {};
+    for (const k of allowed) {
+      if (req.body?.[k] !== undefined) data[k] = req.body[k];
+    }
+    const setting = await prisma.commerceSetting.update({ where: { companyId: cid }, data });
+    res.json({
+      ...setting,
+      connectedAt: setting.connectedAt?.getTime?.() || null,
+      lastSyncAt: setting.lastSyncAt?.getTime?.() || null,
+    });
+  } catch (e) {
+    console.error("[commerce settings]", e?.message || e);
+    res.status(500).json({ error: commerceUserError(e) });
+  }
+});
+
+router.post("/commerce/connect-catalog", async (req, res) => {
+  try {
+    const setting = await connectCatalog(companyIdOf(req), req.body?.catalogId);
+    res.json({
+      ok: true,
+      setting: {
+        ...setting,
+        connectedAt: setting.connectedAt?.getTime?.() || null,
+        lastSyncAt: setting.lastSyncAt?.getTime?.() || null,
+      },
+    });
+  } catch (e) {
+    console.error("[commerce connect]", e?.message || e);
+    res.status(e.status || 400).json({ error: commerceUserError(e) });
+  }
+});
+
+router.post("/commerce/sync", async (req, res) => {
+  try {
+    const result = await syncCatalog(companyIdOf(req));
+    res.json(result);
+  } catch (e) {
+    console.error("[commerce sync]", e?.message || e);
+    res.status(e.status || 400).json({ error: commerceUserError(e) });
+  }
+});
+
+router.patch("/commerce/collections/:id", async (req, res) => {
+  const cid = companyIdOf(req);
+  const existing = await prisma.catalogCollection.findFirst({ where: { id: req.params.id, companyId: cid } });
+  if (!existing) return res.status(404).json({ error: "Collection not found" });
+  const { includeInTop10, headerText, bodyText, footerText, name } = req.body || {};
+  const updated = await prisma.catalogCollection.update({
+    where: { id: existing.id },
+    data: {
+      ...(includeInTop10 !== undefined ? { includeInTop10: Boolean(includeInTop10) } : {}),
+      ...(headerText !== undefined ? { headerText: String(headerText) } : {}),
+      ...(bodyText !== undefined ? { bodyText: String(bodyText) } : {}),
+      ...(footerText !== undefined ? { footerText: String(footerText) } : {}),
+      ...(name !== undefined ? { name: String(name) } : {}),
+    },
+  });
+  res.json({
+    ...updated,
+    productRetailerIds: Array.isArray(updated.productRetailerIds) ? updated.productRetailerIds : [],
+    createdAt: updated.createdAt.getTime(),
+    updatedAt: updated.updatedAt.getTime(),
+  });
+});
+
+router.post("/commerce/products/csv", async (req, res) => {
+  try {
+    const csv = req.body?.csv || req.body?.content || "";
+    const rows = await parseProductsCsv(csv);
+    if (!rows.length) return res.status(400).json({ error: "No products found in CSV. Need header: name,price,description,image_url,retailer_id" });
+    const cid = companyIdOf(req);
+    const created = [];
+    for (const row of rows) {
+      const p = await prisma.product.create({ data: { companyId: cid, ...row } });
+      created.push({ ...p, createdAt: p.createdAt.getTime() });
+    }
+    await getOrCreateCommerceSetting(cid);
+    res.status(201).json({ ok: true, count: created.length, products: created });
+  } catch (e) {
+    res.status(400).json({ error: e?.message || "CSV import failed" });
+  }
+});
+
+router.post("/commerce/send-collections", async (req, res) => {
+  try {
+    const phone = String(req.body?.phone || "").replace(/\D/g, "");
+    if (!phone) return res.status(400).json({ error: "phone required" });
+    const result = await sendCollectionsList(companyIdOf(req), phone);
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e?.message || "Send failed" });
+  }
+});
+
+router.post("/commerce/send-collection", async (req, res) => {
+  try {
+    const phone = String(req.body?.phone || "").replace(/\D/g, "");
+    const collectionId = req.body?.collectionId;
+    if (!phone || !collectionId) return res.status(400).json({ error: "phone and collectionId required" });
+    const result = await sendCollectionCatalog(companyIdOf(req), phone, collectionId);
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e?.message || "Send failed" });
+  }
+});
+
+router.get("/commerce/orders/meta", async (req, res) => {
+  try {
+    res.json(await orderPanelMeta(companyIdOf(req)));
+  } catch (e) {
+    res.status(500).json({ error: commerceUserError(e) });
+  }
+});
+
+router.get("/commerce/orders/export", async (req, res) => {
+  try {
+    const orders = await listCommerceOrders(companyIdOf(req), req.query);
+    const csv = ordersToCsv(orders);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="nexwapi-orders-${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (e) {
+    res.status(500).json({ error: commerceUserError(e) });
+  }
+});
+
+router.get("/commerce/orders", async (req, res) => {
+  try {
+    const orders = await listCommerceOrders(companyIdOf(req), req.query);
+    res.json(orders);
+  } catch (e) {
+    res.status(500).json({ error: commerceUserError(e) });
+  }
+});
+
+router.patch("/commerce/orders/:id", async (req, res) => {
+  try {
+    const cid = companyIdOf(req);
+    const existing = await prisma.commerceOrder.findFirst({ where: { id: req.params.id, companyId: cid } });
+    if (!existing) return res.status(404).json({ error: "Order not found" });
+    const { status, notes, paymentLink, orderStatus, paymentStatus, fulfillmentStatus } = req.body || {};
+    const data = {};
+    if (status) data.status = String(status);
+    if (notes !== undefined) data.notes = String(notes);
+    if (paymentLink !== undefined) data.paymentLink = String(paymentLink);
+    if (orderStatus) data.orderStatus = String(orderStatus);
+    if (paymentStatus) data.paymentStatus = String(paymentStatus);
+    if (fulfillmentStatus) data.fulfillmentStatus = String(fulfillmentStatus);
+
+    // Keep legacy status roughly in sync
+    if (orderStatus === "cancelled") data.status = "cancelled";
+    if (orderStatus === "confirmed" && !status) data.status = paymentStatus === "paid" || existing.paymentStatus === "paid" ? "paid" : "pending_payment";
+    if (paymentStatus === "paid" && !status) data.status = "paid";
+    if (fulfillmentStatus === "delivered") data.status = "fulfilled";
+
+    const updated = await prisma.commerceOrder.update({ where: { id: existing.id }, data });
+    res.json(serializeCommerceOrder(updated));
+  } catch (e) {
+    res.status(500).json({ error: commerceUserError(e) });
+  }
+});
+
+/* --------------------------- Integrations marketplace --------------------------- */
+router.get("/integrations", async (req, res) => {
+  try {
+    const apps = await listIntegrationsOverview(companyIdOf(req));
+    res.json({ apps });
+  } catch (e) {
+    console.error("[integrations list]", e?.message || e);
+    res.status(500).json({ error: e?.message || "Failed to load integrations" });
+  }
+});
+
+router.post("/integrations/:provider/connect", async (req, res) => {
+  try {
+    const provider = String(req.params.provider || "");
+    const data = await connectIntegration(companyIdOf(req), provider, req.body?.config || req.body || {});
+    res.json({ ok: true, connection: data });
+  } catch (e) {
+    console.error("[integrations connect]", e?.message || e);
+    res.status(e.status || 400).json({ error: e?.message || "Connect failed" });
+  }
+});
+
+router.post("/integrations/:provider/disconnect", async (req, res) => {
+  try {
+    const data = await disconnectIntegration(companyIdOf(req), String(req.params.provider || ""));
+    res.json({ ok: true, connection: data });
+  } catch (e) {
+    res.status(400).json({ error: e?.message || "Disconnect failed" });
+  }
+});
+
+router.get("/integrations/:provider", async (req, res) => {
+  try {
+    const row = await getOrCreateIntegration(companyIdOf(req), String(req.params.provider || ""));
+    res.json(serializeIntegration(row));
+  } catch (e) {
+    res.status(400).json({ error: e?.message || "Not found" });
+  }
+});
+
+router.post("/integrations/:provider/rotate-secret", async (req, res) => {
+  try {
+    const data = await rotateIntegrationSecret(companyIdOf(req), String(req.params.provider || ""));
+    res.json({ ok: true, connection: data });
+  } catch (e) {
+    res.status(400).json({ error: e?.message || "Rotate failed" });
+  }
+});
+
+router.post("/integrations/:provider/sync-products", async (req, res) => {
+  try {
+    const provider = String(req.params.provider || "");
+    let result;
+    if (provider === "woocommerce") result = await syncWooProducts(companyIdOf(req));
+    else if (provider === "shopify") result = await syncShopifyProducts(companyIdOf(req));
+    else return res.status(400).json({ error: "Product sync not supported for this app" });
+    res.json(result);
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e?.message || "Sync failed" });
+  }
+});
+
+router.post("/integrations/:provider/test-hook", async (req, res) => {
+  try {
+    const provider = String(req.params.provider || "");
+    const cid = companyIdOf(req);
+    let result;
+    if (provider === "google_sheets") {
+      result = await handleGoogleSheetRow(cid, req.body || {
+        name: "Test Lead",
+        phone: req.body?.phone || "919999999999",
+        email: "test@example.com",
+      });
+    } else if (provider === "facebook_leads") {
+      result = await handleFacebookLead(cid, req.body || {
+        name: "FB Test Lead",
+        phone: req.body?.phone || "919999999999",
+        email: "fbtest@example.com",
+      });
+    } else if (provider === "woocommerce") {
+      result = await handleWooWebhook(cid, "order.created", req.body || {
+        id: "test",
+        billing: { first_name: "Woo", last_name: "Test", phone: req.body?.phone || "919999999999", email: "woo@test.com" },
+        status: "processing",
+      });
+    } else if (provider === "shopify") {
+      result = await handleShopifyWebhook(cid, "orders/create", req.body || {
+        id: "test",
+        customer: { first_name: "Shop", last_name: "Test", phone: req.body?.phone || "919999999999", email: "shop@test.com" },
+      });
+    } else {
+      return res.status(400).json({ error: "Test not available for this provider" });
+    }
+    res.json(result);
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e?.message || "Test failed" });
   }
 });
 

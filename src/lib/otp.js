@@ -94,8 +94,8 @@ export function verifyOtp(email, purpose, code) {
 }
 
 export async function requireOtpOrSkip(email, purpose, code) {
-  const { mailConfigured } = await import("./mailer.js");
-  if (!mailConfigured()) return { ok: true, skipped: true };
+  const { emailDeliveryConfigured } = await import("./mailer.js");
+  if (!emailDeliveryConfigured()) return { ok: true, skipped: true };
   if (!code) {
     await issueOtp(email, purpose);
     return { ok: false, otpRequired: true };

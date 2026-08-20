@@ -103,6 +103,29 @@ async function applyCriticalPatches() {
     `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "metaProductId" TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
     `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "availability" TEXT NOT NULL DEFAULT 'online'`,
+
+    // Autocheckout workflow fields
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "shippingMode" TEXT NOT NULL DEFAULT 'free'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "shippingAmount" TEXT NOT NULL DEFAULT '0'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "freeShippingAbove" TEXT NOT NULL DEFAULT '2000'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "discountEnabled" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "discountType" TEXT NOT NULL DEFAULT 'none'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "discountValue" TEXT NOT NULL DEFAULT '0'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "paymentMethod" TEXT NOT NULL DEFAULT 'cod'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "proceedMessage" TEXT NOT NULL DEFAULT 'Thanks for your cart! {{shipping_note}} Your total order value is {{total_order_value}}. Would you like to go ahead with the order?'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "askNameMessage" TEXT NOT NULL DEFAULT 'Great! We will require some details to ship the order. Please provide your full name.'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "askPincodeMessage" TEXT NOT NULL DEFAULT 'Please provide the Pincode/Postcode/Zipcode of the delivery location.'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "askAddressMessage" TEXT NOT NULL DEFAULT 'Please enter your street address, building name/number, flat number, floor etc. For example: 123, MG Road, Kusum Apartments, Flat no. 123, 1st floor.'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "confirmOrderMessage" TEXT NOT NULL DEFAULT 'Thanks for providing the details! We have noted your address as: {{address}}. {{payment_note}} Would you like to confirm the order?'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "cancelMessage" TEXT NOT NULL DEFAULT 'No problem! Your cart is saved. Message us anytime when you are ready to order.'`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "shippingConfirmed" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "discountsConfirmed" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "paymentConfirmed" BOOLEAN NOT NULL DEFAULT false`,
+
+    // Order Panel statuses
+    `ALTER TABLE "CommerceOrder" ADD COLUMN IF NOT EXISTS "orderStatus" TEXT NOT NULL DEFAULT 'cart_received'`,
+    `ALTER TABLE "CommerceOrder" ADD COLUMN IF NOT EXISTS "paymentStatus" TEXT NOT NULL DEFAULT 'unpaid'`,
+    `ALTER TABLE "CommerceOrder" ADD COLUMN IF NOT EXISTS "fulfillmentStatus" TEXT NOT NULL DEFAULT 'not_scheduled'`,
   ];
 
   const tablePatches = [
@@ -185,52 +208,6 @@ async function applyCriticalPatches() {
       CONSTRAINT "SalesLead_pkey" PRIMARY KEY ("id")
     )`,
 
-    // Agent availability
-    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "availability" TEXT NOT NULL DEFAULT 'online'`,
-
-    // Product commerce fields
-    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "retailerId" TEXT NOT NULL DEFAULT ''`,
-    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "currency" TEXT NOT NULL DEFAULT 'INR'`,
-    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "availability" TEXT NOT NULL DEFAULT 'in stock'`,
-    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "source" TEXT NOT NULL DEFAULT 'local'`,
-    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "collectionMetaId" TEXT NOT NULL DEFAULT ''`,
-    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "metaProductId" TEXT NOT NULL DEFAULT ''`,
-    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
-  ];
-
-  const tablePatches = [
-    // Notification (never migrated on some production DBs)
-    `CREATE TABLE IF NOT EXISTS "Notification" (
-      "id" TEXT NOT NULL,
-      "audience" TEXT NOT NULL DEFAULT 'client',
-      "companyId" TEXT,
-      "userId" TEXT,
-      "title" TEXT NOT NULL,
-      "body" TEXT NOT NULL DEFAULT '',
-      "href" TEXT NOT NULL DEFAULT '',
-      "read" BOOLEAN NOT NULL DEFAULT false,
-      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      CONSTRAINT "Notification_pkey" PRIMARY KEY ("id")
-    )`,
-    `CREATE INDEX IF NOT EXISTS "Notification_audience_createdAt_idx" ON "Notification"("audience", "createdAt")`,
-    `CREATE INDEX IF NOT EXISTS "Notification_companyId_createdAt_idx" ON "Notification"("companyId", "createdAt")`,
-    `CREATE INDEX IF NOT EXISTS "Notification_userId_read_idx" ON "Notification"("userId", "read")`,
-
-    // Sales leads
-    `CREATE TABLE IF NOT EXISTS "SalesLead" (
-      "id" TEXT NOT NULL,
-      "name" TEXT NOT NULL,
-      "email" TEXT NOT NULL,
-      "phone" TEXT NOT NULL DEFAULT '',
-      "company" TEXT NOT NULL DEFAULT '',
-      "message" TEXT NOT NULL,
-      "status" TEXT NOT NULL DEFAULT 'new',
-      "note" TEXT NOT NULL DEFAULT '',
-      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      CONSTRAINT "SalesLead_pkey" PRIMARY KEY ("id")
-    )`,
-
     `CREATE TABLE IF NOT EXISTS "CommerceSetting" (
       "id" TEXT NOT NULL,
       "companyId" TEXT NOT NULL,
@@ -274,6 +251,7 @@ async function applyCriticalPatches() {
       CONSTRAINT "CatalogCollection_pkey" PRIMARY KEY ("id")
     )`,
     `CREATE INDEX IF NOT EXISTS "CatalogCollection_companyId_idx" ON "CatalogCollection"("companyId")`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "CatalogCollection_companyId_metaSetId_key" ON "CatalogCollection"("companyId", "metaSetId")`,
 
     `CREATE TABLE IF NOT EXISTS "CommerceOrder" (
       "id" TEXT NOT NULL,
@@ -297,6 +275,28 @@ async function applyCriticalPatches() {
     )`,
     `CREATE INDEX IF NOT EXISTS "CommerceOrder_companyId_createdAt_idx" ON "CommerceOrder"("companyId", "createdAt")`,
     `CREATE INDEX IF NOT EXISTS "CommerceOrder_companyId_status_idx" ON "CommerceOrder"("companyId", "status")`,
+    `CREATE INDEX IF NOT EXISTS "CommerceOrder_companyId_orderStatus_idx" ON "CommerceOrder"("companyId", "orderStatus")`,
+    `CREATE INDEX IF NOT EXISTS "CommerceOrder_companyId_paymentStatus_idx" ON "CommerceOrder"("companyId", "paymentStatus")`,
+    `CREATE INDEX IF NOT EXISTS "CommerceOrder_companyId_fulfillmentStatus_idx" ON "CommerceOrder"("companyId", "fulfillmentStatus")`,
+
+    `CREATE TABLE IF NOT EXISTS "Integration" (
+      "id" TEXT NOT NULL,
+      "companyId" TEXT NOT NULL,
+      "provider" TEXT NOT NULL,
+      "name" TEXT NOT NULL DEFAULT '',
+      "status" TEXT NOT NULL DEFAULT 'disconnected',
+      "config" JSONB NOT NULL DEFAULT '{}',
+      "webhookSecret" TEXT NOT NULL DEFAULT '',
+      "lastSyncAt" TIMESTAMP(3),
+      "lastError" TEXT NOT NULL DEFAULT '',
+      "eventCount" INTEGER NOT NULL DEFAULT 0,
+      "connectedAt" TIMESTAMP(3),
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "Integration_pkey" PRIMARY KEY ("id")
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "Integration_companyId_provider_key" ON "Integration"("companyId", "provider")`,
+    `CREATE INDEX IF NOT EXISTS "Integration_companyId_idx" ON "Integration"("companyId")`,
   ];
 
   const r1 = await runSql(columnPatches);
@@ -323,6 +323,13 @@ async function applyCriticalPatches() {
     console.log("  Contact columns verified (email, userId, attributes)");
   } catch (e) {
     console.error("  Contact columns STILL missing after patch:", e?.message || e);
+    throw e;
+  }
+  try {
+    await prisma.$queryRawUnsafe(`SELECT "catalogId", "sandboxMode" FROM "CommerceSetting" LIMIT 0`);
+    console.log("  CommerceSetting table verified");
+  } catch (e) {
+    console.error("  CommerceSetting table STILL missing after patch:", e?.message || e);
     throw e;
   }
 }

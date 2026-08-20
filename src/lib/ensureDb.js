@@ -180,8 +180,8 @@ async function applyCriticalPatches() {
     `CREATE TABLE IF NOT EXISTS "Notification" (
       "id" TEXT NOT NULL,
       "audience" TEXT NOT NULL DEFAULT 'client',
-      "userId" TEXT,
       "companyId" TEXT,
+      "userId" TEXT,
       "title" TEXT NOT NULL,
       "body" TEXT NOT NULL DEFAULT '',
       "href" TEXT NOT NULL DEFAULT '',

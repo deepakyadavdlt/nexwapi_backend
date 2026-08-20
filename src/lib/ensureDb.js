@@ -93,6 +93,16 @@ async function applyCriticalPatches() {
     `ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "filters" JSONB`,
     `ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "whatsappOnly" BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+
+    // Product commerce fields
+    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "retailerId" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "currency" TEXT NOT NULL DEFAULT 'INR'`,
+    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "availability" TEXT NOT NULL DEFAULT 'in stock'`,
+    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "source" TEXT NOT NULL DEFAULT 'local'`,
+    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "collectionMetaId" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "metaProductId" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "availability" TEXT NOT NULL DEFAULT 'online'`,
   ];
 
   const tablePatches = [

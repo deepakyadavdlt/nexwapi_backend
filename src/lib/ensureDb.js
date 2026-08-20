@@ -6,74 +6,97 @@ import { prisma } from "./prisma.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const backendRoot = path.resolve(__dirname, "../..");
 
+/**
+ * Run each statement separately.
+ * Prisma/pg often only executes the FIRST statement in a multi-statement string,
+ * which is why Campaign.category etc. never got created on production.
+ */
+async function runSql(statements) {
+  let ok = 0;
+  let failed = 0;
+  for (const sql of statements) {
+    const trimmed = String(sql || "").trim();
+    if (!trimmed || trimmed.startsWith("--")) continue;
+    try {
+      await prisma.$executeRawUnsafe(trimmed);
+      ok += 1;
+    } catch (e) {
+      failed += 1;
+      console.warn(`[db] patch skip: ${trimmed.slice(0, 80)}… → ${e?.message || e}`);
+    }
+  }
+  return { ok, failed };
+}
+
 /** Idempotent patches so Prisma queries never hit missing columns/tables. */
 async function applyCriticalPatches() {
-  await prisma.$executeRawUnsafe(`
-    -- Message
-    ALTER TABLE "Message" ADD COLUMN IF NOT EXISTS "senderName" TEXT;
-    ALTER TABLE "Message" ADD COLUMN IF NOT EXISTS "senderUserId" TEXT;
-    ALTER TABLE "Message" ADD COLUMN IF NOT EXISTS "automationSource" TEXT;
+  const columnPatches = [
+    // Message
+    `ALTER TABLE "Message" ADD COLUMN IF NOT EXISTS "senderName" TEXT`,
+    `ALTER TABLE "Message" ADD COLUMN IF NOT EXISTS "senderUserId" TEXT`,
+    `ALTER TABLE "Message" ADD COLUMN IF NOT EXISTS "automationSource" TEXT`,
 
-    -- Setting (inbox automations, routing, AI)
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "assignmentMode" TEXT NOT NULL DEFAULT 'load_balance';
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "assignOnlineOnly" BOOLEAN NOT NULL DEFAULT false;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "roundRobinIndex" INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "welcomeEnabled" BOOLEAN NOT NULL DEFAULT false;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "welcomeMessage" TEXT NOT NULL DEFAULT 'Hi! Thanks for reaching out. How can we help you today?';
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "delayedEnabled" BOOLEAN NOT NULL DEFAULT false;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "delayedMinutes" INTEGER NOT NULL DEFAULT 15;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "delayedMessage" TEXT NOT NULL DEFAULT 'Thanks for your patience! A team member will reply shortly.';
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "customRepliesEnabled" BOOLEAN NOT NULL DEFAULT true;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "workingHoursSlots" JSONB;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "intentMatchingEnabled" BOOLEAN NOT NULL DEFAULT false;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "flowFollowUpEnabled" BOOLEAN NOT NULL DEFAULT false;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "flowFollowUpMinutes" INTEGER NOT NULL DEFAULT 30;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "flowFollowUpMessage" TEXT NOT NULL DEFAULT 'Hi! Just checking in — would you like to continue?';
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "flowIdleTimeoutMinutes" INTEGER NOT NULL DEFAULT 60;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "aiAgentEnabled" BOOLEAN NOT NULL DEFAULT false;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "aiAgentWebsiteUrl" TEXT NOT NULL DEFAULT '';
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "aiAgentKnowledge" JSONB;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "aiAgentGreeting" TEXT NOT NULL DEFAULT 'Hi! I''m the Nexwapi assistant. How can I help?';
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "voiceAiEnabled" BOOLEAN NOT NULL DEFAULT false;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "voiceAiPlan" TEXT NOT NULL DEFAULT 'business';
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "voiceAiCredits" INTEGER NOT NULL DEFAULT 100;
-    ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
+    // Setting
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "assignmentMode" TEXT NOT NULL DEFAULT 'load_balance'`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "assignOnlineOnly" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "roundRobinIndex" INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "welcomeEnabled" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "welcomeMessage" TEXT NOT NULL DEFAULT 'Hi! Thanks for reaching out. How can we help you today?'`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "delayedEnabled" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "delayedMinutes" INTEGER NOT NULL DEFAULT 15`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "delayedMessage" TEXT NOT NULL DEFAULT 'Thanks for your patience! A team member will reply shortly.'`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "customRepliesEnabled" BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "workingHoursSlots" JSONB`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "intentMatchingEnabled" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "flowFollowUpEnabled" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "flowFollowUpMinutes" INTEGER NOT NULL DEFAULT 30`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "flowFollowUpMessage" TEXT NOT NULL DEFAULT 'Hi! Just checking in — would you like to continue?'`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "flowIdleTimeoutMinutes" INTEGER NOT NULL DEFAULT 60`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "aiAgentEnabled" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "aiAgentWebsiteUrl" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "aiAgentKnowledge" JSONB`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "aiAgentGreeting" TEXT NOT NULL DEFAULT 'Hi! I''m the Nexwapi assistant. How can I help?'`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "voiceAiEnabled" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "voiceAiPlan" TEXT NOT NULL DEFAULT 'business'`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "voiceAiCredits" INTEGER NOT NULL DEFAULT 100`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
 
-    -- Automation / Flow / Template
-    ALTER TABLE "Automation" ADD COLUMN IF NOT EXISTS "companyId" TEXT;
-    ALTER TABLE "Automation" ADD COLUMN IF NOT EXISTS "sentCount" INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE "Automation" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
-    ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "sentCount" INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
-    ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "deletedAt" TIMESTAMP(3);
-    -- Contact (full schema sync for older production DBs)
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "email" TEXT;
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "userId" TEXT;
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "optedIn" BOOLEAN NOT NULL DEFAULT true;
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "attributes" JSONB NOT NULL DEFAULT '{}';
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "assignedAgentId" TEXT;
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "activeFlowId" TEXT;
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "activeFlowStep" TEXT;
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "chatStatus" TEXT NOT NULL DEFAULT 'open';
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "labels" TEXT[] DEFAULT ARRAY[]::TEXT[];
-    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "companyId" TEXT;
+    // Automation / Flow / Template
+    `ALTER TABLE "Automation" ADD COLUMN IF NOT EXISTS "companyId" TEXT`,
+    `ALTER TABLE "Automation" ADD COLUMN IF NOT EXISTS "sentCount" INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE "Automation" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "sentCount" INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "deletedAt" TIMESTAMP(3)`,
 
-    -- Campaign (full schema sync for older production DBs)
-    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "failed" INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "campaignType" TEXT NOT NULL DEFAULT 'onetime';
-    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "category" TEXT;
-    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "scheduledAt" TIMESTAMP(3);
-    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "liveAt" TIMESTAMP(3);
-    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "companyId" TEXT;
+    // Contact
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "email" TEXT`,
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "userId" TEXT`,
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "optedIn" BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "attributes" JSONB NOT NULL DEFAULT '{}'`,
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "assignedAgentId" TEXT`,
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "activeFlowId" TEXT`,
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "activeFlowStep" TEXT`,
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "chatStatus" TEXT NOT NULL DEFAULT 'open'`,
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "labels" TEXT[] DEFAULT ARRAY[]::TEXT[]`,
+    `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "companyId" TEXT`,
 
-    -- Segment filters (Contact Hub)
-    ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "filters" JSONB;
-    ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "whatsappOnly" BOOLEAN NOT NULL DEFAULT true;
-    ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
-  `);
+    // Campaign — these were never applied before because of multi-statement bug
+    `ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "failed" INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "campaignType" TEXT NOT NULL DEFAULT 'onetime'`,
+    `ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "category" TEXT`,
+    `ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "scheduledAt" TIMESTAMP(3)`,
+    `ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "liveAt" TIMESTAMP(3)`,
+    `ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "companyId" TEXT`,
 
-  await prisma.$executeRawUnsafe(`
-    CREATE TABLE IF NOT EXISTS "AssignmentRule" (
+    // Segment
+    `ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "filters" JSONB`,
+    `ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "whatsappOnly" BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+  ];
+
+  const tablePatches = [
+    `CREATE TABLE IF NOT EXISTS "AssignmentRule" (
       "id" TEXT NOT NULL,
       "companyId" TEXT NOT NULL,
       "name" TEXT NOT NULL,
@@ -85,10 +108,9 @@ async function applyCriticalPatches() {
       "priority" INTEGER NOT NULL DEFAULT 0,
       "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT "AssignmentRule_pkey" PRIMARY KEY ("id")
-    );
-    CREATE INDEX IF NOT EXISTS "AssignmentRule_companyId_idx" ON "AssignmentRule"("companyId");
-
-    CREATE TABLE IF NOT EXISTS "WhatsAppForm" (
+    )`,
+    `CREATE INDEX IF NOT EXISTS "AssignmentRule_companyId_idx" ON "AssignmentRule"("companyId")`,
+    `CREATE TABLE IF NOT EXISTS "WhatsAppForm" (
       "id" TEXT NOT NULL,
       "companyId" TEXT NOT NULL,
       "name" TEXT NOT NULL,
@@ -100,10 +122,9 @@ async function applyCriticalPatches() {
       "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT "WhatsAppForm_pkey" PRIMARY KEY ("id")
-    );
-    CREATE INDEX IF NOT EXISTS "WhatsAppForm_companyId_idx" ON "WhatsAppForm"("companyId");
-
-    CREATE TABLE IF NOT EXISTS "InteractiveList" (
+    )`,
+    `CREATE INDEX IF NOT EXISTS "WhatsAppForm_companyId_idx" ON "WhatsAppForm"("companyId")`,
+    `CREATE TABLE IF NOT EXISTS "InteractiveList" (
       "id" TEXT NOT NULL,
       "companyId" TEXT NOT NULL,
       "name" TEXT NOT NULL,
@@ -117,11 +138,31 @@ async function applyCriticalPatches() {
       "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT "InteractiveList_pkey" PRIMARY KEY ("id")
-    );
-    CREATE INDEX IF NOT EXISTS "InteractiveList_companyId_idx" ON "InteractiveList"("companyId");
-  `);
+    )`,
+    `CREATE INDEX IF NOT EXISTS "InteractiveList_companyId_idx" ON "InteractiveList"("companyId")`,
+    `CREATE INDEX IF NOT EXISTS "Template_deletedAt_idx" ON "Template"("deletedAt")`,
+    `CREATE INDEX IF NOT EXISTS "Campaign_status_idx" ON "Campaign"("status")`,
+  ];
 
-  await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Template_deletedAt_idx" ON "Template"("deletedAt");`);
+  const r1 = await runSql(columnPatches);
+  const r2 = await runSql(tablePatches);
+  console.log(`  Database schema patches OK (${r1.ok + r2.ok} applied, ${r1.failed + r2.failed} skipped)`);
+
+  // Hard-verify the columns that keep breaking production
+  try {
+    await prisma.$queryRawUnsafe(`SELECT "category", "campaignType", "failed", "liveAt" FROM "Campaign" LIMIT 0`);
+    console.log("  Campaign columns verified (category, campaignType, failed, liveAt)");
+  } catch (e) {
+    console.error("  Campaign columns STILL missing after patch:", e?.message || e);
+    throw e;
+  }
+  try {
+    await prisma.$queryRawUnsafe(`SELECT "email", "userId", "attributes" FROM "Contact" LIMIT 0`);
+    console.log("  Contact columns verified (email, userId, attributes)");
+  } catch (e) {
+    console.error("  Contact columns STILL missing after patch:", e?.message || e);
+    throw e;
+  }
 }
 
 function runMigrateDeploy() {
@@ -145,7 +186,6 @@ function runMigrateDeploy() {
 export async function ensureDatabaseReady() {
   try {
     await applyCriticalPatches();
-    console.log("  Database schema patches OK");
   } catch (e) {
     console.error("[db] schema patch failed:", e?.message || e);
     throw e;

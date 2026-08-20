@@ -18,16 +18,16 @@
 
 */
 -- DropForeignKey
-ALTER TABLE "Payment" DROP CONSTRAINT "Payment_userId_fkey";
+ALTER TABLE "Payment" DROP CONSTRAINT IF EXISTS "Payment_userId_fkey";
 
 -- DropIndex
-DROP INDEX "Agent_email_key";
+DROP INDEX IF EXISTS "Agent_email_key";
 
 -- DropIndex
-DROP INDEX "ApiKey_key_key";
+DROP INDEX IF EXISTS "ApiKey_key_key";
 
 -- DropIndex
-DROP INDEX "Template_name_key";
+DROP INDEX IF EXISTS "Template_name_key";
 
 -- AlterTable
 ALTER TABLE "Agent" ALTER COLUMN "companyId" SET NOT NULL;
@@ -72,10 +72,29 @@ ALTER TABLE "Label" ALTER COLUMN "companyId" SET NOT NULL;
 -- AlterTable
 ALTER TABLE "Message" ALTER COLUMN "companyId" SET NOT NULL;
 
--- AlterTable
-ALTER TABLE "Payment" DROP COLUMN "plan",
-ADD COLUMN     "plan" "PlanKey" NOT NULL DEFAULT 'growth',
-ALTER COLUMN "updatedAt" DROP DEFAULT;
+-- AlterTable (idempotent plan column type sync)
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'Payment'
+      AND column_name = 'plan'
+      AND udt_name <> 'PlanKey'
+  ) THEN
+    ALTER TABLE "Payment" DROP COLUMN "plan";
+    ALTER TABLE "Payment" ADD COLUMN "plan" "PlanKey" NOT NULL DEFAULT 'growth';
+  ELSIF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'Payment'
+      AND column_name = 'plan'
+  ) THEN
+    ALTER TABLE "Payment" ADD COLUMN "plan" "PlanKey" NOT NULL DEFAULT 'growth';
+  END IF;
+END $$;
+ALTER TABLE "Payment" ALTER COLUMN "updatedAt" DROP DEFAULT;
 
 -- AlterTable
 ALTER TABLE "Plan" ALTER COLUMN "updatedAt" DROP DEFAULT;
@@ -92,7 +111,7 @@ ALTER COLUMN "updatedAt" DROP DEFAULT;
 ALTER TABLE "SalesLead" ALTER COLUMN "updatedAt" DROP DEFAULT;
 
 -- AlterTable
-ALTER TABLE "Segment" ADD COLUMN     "description" TEXT,
+ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "description" TEXT,
 ALTER COLUMN "companyId" SET NOT NULL,
 ALTER COLUMN "updatedAt" DROP DEFAULT;
 
@@ -107,8 +126,8 @@ ALTER TABLE "Subscription" ALTER COLUMN "updatedAt" DROP DEFAULT;
 ALTER TABLE "Template" ALTER COLUMN "companyId" SET NOT NULL;
 
 -- AlterTable
-ALTER TABLE "Ticket" ADD COLUMN     "adminReply" TEXT NOT NULL DEFAULT '',
-ADD COLUMN     "origin" TEXT NOT NULL DEFAULT 'client',
+ALTER TABLE "Ticket" ADD COLUMN IF NOT EXISTS "adminReply" TEXT NOT NULL DEFAULT '',
+ADD COLUMN IF NOT EXISTS "origin" TEXT NOT NULL DEFAULT 'client',
 ALTER COLUMN "updatedAt" DROP DEFAULT;
 
 -- AlterTable
@@ -127,22 +146,22 @@ CREATE INDEX IF NOT EXISTS "ApiKey_key_idx" ON "ApiKey"("key");
 CREATE INDEX IF NOT EXISTS "Campaign_status_idx" ON "Campaign"("status");
 
 -- AddForeignKey
-ALTER TABLE "Payment" ADD CONSTRAINT "Payment_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+DO $$ BEGIN ALTER TABLE "Payment" ADD CONSTRAINT "Payment_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- AddForeignKey
-ALTER TABLE "CommerceSetting" ADD CONSTRAINT "CommerceSetting_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+DO $$ BEGIN ALTER TABLE "CommerceSetting" ADD CONSTRAINT "CommerceSetting_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- AddForeignKey
-ALTER TABLE "CatalogCollection" ADD CONSTRAINT "CatalogCollection_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+DO $$ BEGIN ALTER TABLE "CatalogCollection" ADD CONSTRAINT "CatalogCollection_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- AddForeignKey
-ALTER TABLE "CommerceOrder" ADD CONSTRAINT "CommerceOrder_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+DO $$ BEGIN ALTER TABLE "CommerceOrder" ADD CONSTRAINT "CommerceOrder_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- AddForeignKey
-ALTER TABLE "AssignmentRule" ADD CONSTRAINT "AssignmentRule_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+DO $$ BEGIN ALTER TABLE "AssignmentRule" ADD CONSTRAINT "AssignmentRule_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- AddForeignKey
-ALTER TABLE "WhatsAppForm" ADD CONSTRAINT "WhatsAppForm_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+DO $$ BEGIN ALTER TABLE "WhatsAppForm" ADD CONSTRAINT "WhatsAppForm_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- AddForeignKey
-ALTER TABLE "InteractiveList" ADD CONSTRAINT "InteractiveList_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+DO $$ BEGIN ALTER TABLE "InteractiveList" ADD CONSTRAINT "InteractiveList_companyId_fkey" FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE; EXCEPTION WHEN duplicate_object THEN NULL; END $$;

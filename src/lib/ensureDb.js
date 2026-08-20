@@ -46,15 +46,30 @@ async function applyCriticalPatches() {
     ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "sentCount" INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "deletedAt" TIMESTAMP(3);
-    -- Contact extra fields
+    -- Contact (full schema sync for older production DBs)
     ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "email" TEXT;
     ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "userId" TEXT;
     ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "optedIn" BOOLEAN NOT NULL DEFAULT true;
     ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "attributes" JSONB NOT NULL DEFAULT '{}';
+    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "assignedAgentId" TEXT;
+    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "activeFlowId" TEXT;
+    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "activeFlowStep" TEXT;
+    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "chatStatus" TEXT NOT NULL DEFAULT 'open';
+    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "labels" TEXT[] DEFAULT ARRAY[]::TEXT[];
+    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "companyId" TEXT;
 
-    -- Campaign extra fields
+    -- Campaign (full schema sync for older production DBs)
     ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "failed" INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "campaignType" TEXT NOT NULL DEFAULT 'onetime';
+    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "category" TEXT;
+    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "scheduledAt" TIMESTAMP(3);
+    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "liveAt" TIMESTAMP(3);
+    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "companyId" TEXT;
+
+    -- Segment filters (Contact Hub)
+    ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "filters" JSONB;
+    ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "whatsappOnly" BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE "Segment" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
   `);
 
   await prisma.$executeRawUnsafe(`

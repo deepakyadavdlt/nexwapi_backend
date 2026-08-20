@@ -121,10 +121,10 @@ ALTER TABLE "WhatsAppAccount" ALTER COLUMN "updatedAt" DROP DEFAULT;
 ALTER TABLE "WhatsAppForm" ALTER COLUMN "updatedAt" DROP DEFAULT;
 
 -- CreateIndex
-CREATE INDEX "ApiKey_key_idx" ON "ApiKey"("key");
+CREATE INDEX IF NOT EXISTS "ApiKey_key_idx" ON "ApiKey"("key");
 
 -- CreateIndex
-CREATE INDEX "Campaign_status_idx" ON "Campaign"("status");
+CREATE INDEX IF NOT EXISTS "Campaign_status_idx" ON "Campaign"("status");
 
 -- AddForeignKey
 ALTER TABLE "Payment" ADD CONSTRAINT "Payment_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;

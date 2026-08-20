@@ -442,7 +442,6 @@ export async function sendFullCatalog(companyId, toPhone) {
     return sendCollectionsList(companyId, toPhone);
   }
   return sendCatalogMessage(toPhone, {
-    catalogId: setting.catalogId,
     body: setting.collectionsBody || "Browse our full catalog",
     footer: "Nexwapi Commerce",
   }, creds);

@@ -1,5 +1,6 @@
 import nodemailer from "nodemailer";
 // SMTP From: hello@nexwapi.com (Google App Password in .env)
+// Optional: RESEND_API_KEY for HTTP email when SMTP ports are blocked.
 
 export const MAIL_FROM = process.env.MAIL_FROM || "hello@nexwapi.com";
 export const MAIL_SUPPORT = process.env.MAIL_SUPPORT || "hello@nexwapi.com";
@@ -14,6 +15,37 @@ export function mailConfigured() {
     String(process.env.SMTP_USER || "").trim() &&
     String(process.env.SMTP_PASS || "").trim()
   );
+}
+
+export function resendConfigured() {
+  return Boolean(String(process.env.RESEND_API_KEY || "").trim());
+}
+
+/** True when any outbound email channel is configured (SMTP or Resend). */
+export function emailDeliveryConfigured() {
+  return mailConfigured() || resendConfigured();
+}
+
+async function sendViaResend(payload) {
+  const key = String(process.env.RESEND_API_KEY || "").trim();
+  if (!key) return null;
+  const from = process.env.RESEND_FROM || `Nexwapi <${MAIL_FROM}>`;
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from,
+      to: [payload.to],
+      subject: payload.subject,
+      html: payload.html,
+      text: payload.text,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Resend API failed (${res.status}): ${body.slice(0, 240)}`);
+  }
+  return { ok: true, via: "resend" };
 }
 
 function transportProfiles() {
@@ -78,7 +110,7 @@ function wrap(title, bodyHtml) {
 
 export async function sendMail({ to, subject, html, text, attachments }) {
   if (!to) return { skipped: true };
-  if (!mailConfigured()) {
+  if (!emailDeliveryConfigured()) {
     console.log(`[mail:dry-run] to=${to} subject=${subject}\n${text || ""}`);
     return { skipped: true, dryRun: true };
   }
@@ -92,6 +124,19 @@ export async function sendMail({ to, subject, html, text, attachments }) {
     text: text || subject,
     ...(attachments?.length ? { attachments } : {}),
   };
+
+  if (resendConfigured() && !attachments?.length) {
+    try {
+      return await sendViaResend(payload);
+    } catch (e) {
+      console.warn("[mail] Resend failed:", e?.message || e);
+      if (!mailConfigured()) throw e;
+    }
+  }
+
+  if (!mailConfigured()) {
+    throw new Error("Email delivery is not configured. Set RESEND_API_KEY or SMTP credentials.");
+  }
 
   const profiles = transportProfiles();
   let lastErr = null;

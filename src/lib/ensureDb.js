@@ -46,6 +46,8 @@ async function applyCriticalPatches() {
     ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "sentCount" INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "deletedAt" TIMESTAMP(3);
+    ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "email" TEXT;
+    ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "failed" INTEGER NOT NULL DEFAULT 0;
   `);
 
   await prisma.$executeRawUnsafe(`

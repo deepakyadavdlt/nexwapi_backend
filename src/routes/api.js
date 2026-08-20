@@ -132,12 +132,12 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
   const em = String(email).toLowerCase().trim();
   if (!otp) {
     try {
-      await issueOtp(em, "signup", { name, email: em, password, company: companyName });
+      const otpResult = await issueOtp(em, "signup", { name, email: em, password, company: companyName });
+      return res.json({ otpRequired: true, otpHint: otpResult.otpHint });
     } catch (e) {
       console.error("[signup otp]", e?.message || e);
       return res.status(503).json({ error: "Could not send OTP to your email. Check SMTP or try again." });
     }
-    return res.json({ otpRequired: true });
   }
   const v = verifyOtp(em, "signup", otp);
   if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
@@ -217,23 +217,23 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
     const skipOtp = user.role === "SUPER_ADMIN";
     if (!skipOtp) {
       if (!otp) {
+        let otpResult;
         try {
-          await issueOtp(em, "login");
+          otpResult = await issueOtp(em, "login");
         } catch (e) {
           console.error("[login otp]", e?.message || e);
-          // If SMTP is not configured / fails in dev, allow login without OTP so
-          // developers are not locked out. In production set SMTP_USER + SMTP_PASS.
-          const { mailConfigured } = await import("../lib/mailer.js");
-          if (!mailConfigured()) {
-            console.warn("[login] SMTP not configured — skipping OTP for", em);
-          } else {
-            return res.status(503).json({ error: "Could not send OTP to your email. Check SMTP settings or try again." });
-          }
+          return res.status(503).json({ error: "Could not send OTP to your email. Check SMTP settings or try again." });
         }
-        if (otp === undefined) return res.json({ otpRequired: true });
+        const { emailDeliveryConfigured } = await import("../lib/mailer.js");
+        if (!otpResult.emailSent && !otpResult.devConsole && !emailDeliveryConfigured()) {
+          console.warn("[login] No email delivery configured — skipping OTP for", em);
+        } else {
+          return res.json({ otpRequired: true, otpHint: otpResult.otpHint });
+        }
+      } else {
+        const v = verifyOtp(em, "login", otp);
+        if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
       }
-      const v = verifyOtp(em, "login", otp);
-      if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
     }
     prisma.user.update({ where: { id: user.id }, data: { lastActiveAt: new Date(), lastLoginAt: new Date() } }).catch(() => {});
     if (user.companyId) {

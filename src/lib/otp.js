@@ -1,8 +1,8 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { getJwtSecret } from "./env.js";
-import { sendOtpEmail } from "./mailer.js";
+import { getJwtSecret, isProduction } from "./env.js";
+import { emailDeliveryConfigured, sendOtpEmail } from "./mailer.js";
 
 const FILE = path.resolve("data/otps.json");
 
@@ -27,21 +27,54 @@ export function randomOtp() {
   return String(crypto.randomInt(100000, 1000000));
 }
 
+function devOtpConsoleAllowed() {
+  return !isProduction() || String(process.env.OTP_DEV_CONSOLE || "").toLowerCase() === "true";
+}
+
 export async function issueOtp(email, purpose, payload = {}) {
   const em = String(email || "").toLowerCase().trim();
   if (!em) throw new Error("email required");
   const code = randomOtp();
   const rows = readAll().filter((r) => !(r.email === em && r.purpose === purpose) && Date.now() < r.expiresAt);
-  rows.push({
+  const entry = {
     email: em,
     purpose,
     hash: hashCode(em, purpose, code),
     payload,
     expiresAt: Date.now() + 10 * 60 * 1000,
-  });
+  };
+  rows.push(entry);
   writeAll(rows);
-  await sendOtpEmail(em, code, purpose);
-  return { ok: true, expiresIn: 600 };
+
+  let emailSent = false;
+  let devConsole = false;
+
+  try {
+    await sendOtpEmail(em, code, purpose);
+    emailSent = true;
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (!emailDeliveryConfigured() && !isProduction()) {
+      console.warn(`[otp] No email configured — ${purpose} OTP for ${em}: ${code}`);
+      devConsole = true;
+    } else if (devOtpConsoleAllowed()) {
+      console.warn(`[otp:dev] ${purpose} OTP for ${em}: ${code} (email failed: ${msg})`);
+      devConsole = true;
+    } else {
+      writeAll(rows.filter((r) => r !== entry));
+      throw e;
+    }
+  }
+
+  return {
+    ok: true,
+    expiresIn: 600,
+    emailSent,
+    devConsole,
+    otpHint: devConsole
+      ? "Email could not be sent. Check the backend terminal for your 6-digit OTP code."
+      : undefined,
+  };
 }
 
 export function verifyOtp(email, purpose, code) {

@@ -142,6 +142,41 @@ async function applyCriticalPatches() {
     `CREATE INDEX IF NOT EXISTS "InteractiveList_companyId_idx" ON "InteractiveList"("companyId")`,
     `CREATE INDEX IF NOT EXISTS "Template_deletedAt_idx" ON "Template"("deletedAt")`,
     `CREATE INDEX IF NOT EXISTS "Campaign_status_idx" ON "Campaign"("status")`,
+
+    // Notification (never migrated on some production DBs)
+    `CREATE TABLE IF NOT EXISTS "Notification" (
+      "id" TEXT NOT NULL,
+      "audience" TEXT NOT NULL DEFAULT 'client',
+      "userId" TEXT,
+      "companyId" TEXT,
+      "title" TEXT NOT NULL,
+      "body" TEXT NOT NULL DEFAULT '',
+      "href" TEXT NOT NULL DEFAULT '',
+      "read" BOOLEAN NOT NULL DEFAULT false,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "Notification_pkey" PRIMARY KEY ("id")
+    )`,
+    `CREATE INDEX IF NOT EXISTS "Notification_audience_createdAt_idx" ON "Notification"("audience", "createdAt")`,
+    `CREATE INDEX IF NOT EXISTS "Notification_companyId_createdAt_idx" ON "Notification"("companyId", "createdAt")`,
+    `CREATE INDEX IF NOT EXISTS "Notification_userId_read_idx" ON "Notification"("userId", "read")`,
+
+    // Sales leads
+    `CREATE TABLE IF NOT EXISTS "SalesLead" (
+      "id" TEXT NOT NULL,
+      "name" TEXT NOT NULL,
+      "email" TEXT NOT NULL,
+      "phone" TEXT NOT NULL DEFAULT '',
+      "company" TEXT NOT NULL DEFAULT '',
+      "message" TEXT NOT NULL,
+      "status" TEXT NOT NULL DEFAULT 'new',
+      "note" TEXT NOT NULL DEFAULT '',
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "SalesLead_pkey" PRIMARY KEY ("id")
+    )`,
+
+    // Agent availability
+    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "availability" TEXT NOT NULL DEFAULT 'online'`,
   ];
 
   const r1 = await runSql(columnPatches);
@@ -154,6 +189,13 @@ async function applyCriticalPatches() {
     console.log("  Campaign columns verified (category, campaignType, failed, liveAt)");
   } catch (e) {
     console.error("  Campaign columns STILL missing after patch:", e?.message || e);
+    throw e;
+  }
+  try {
+    await prisma.$queryRawUnsafe(`SELECT 1 FROM "Notification" LIMIT 0`);
+    console.log("  Notification table verified");
+  } catch (e) {
+    console.error("  Notification table STILL missing after patch:", e?.message || e);
     throw e;
   }
   try {

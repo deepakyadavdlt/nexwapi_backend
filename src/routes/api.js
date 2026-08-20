@@ -8,7 +8,7 @@ import path from "path";
 import { prisma, toMessage, pickColor } from "../lib/prisma.js";
 import {
   sendText, sendTemplate, sendTemplateWithParams, createTemplate, listTemplates,
-  uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getCompanyCreds, assertLiveCreds,
+  uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getEffectiveCreds, assertLiveCreds,
 } from "../lib/whatsappService.js";
 import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits, templateChargeCredits } from "../lib/wallet.js";
 import {
@@ -47,10 +47,15 @@ import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
 import { loginLimiter, signupLimiter, apiMessageLimiter } from "../lib/rateLimit.js";
 import { findApiKeyByRaw, hashApiKey, keyPrefix, publicApiKeyRow } from "../lib/apiKey.js";
-import { mailConfigured, sendWelcome, sendInvoiceEmail, sendCampaignStatus, sendSuspension, sendTemplateStatus, sendSupportTicketAlert } from "../lib/mailer.js";
+import { mailConfigured, sendWelcome, sendInvoiceEmail, sendCampaignStatus, sendCampaignReportEmail, sendSuspension, sendTemplateStatus, sendSupportTicketAlert } from "../lib/mailer.js";
 import { issueOtp, verifyOtp, requireOtpOrSkip, otpGate } from "../lib/otp.js";
 import { notify } from "../lib/notify.js";
 import { getLocalWaProfile, saveLocalWaProfile } from "../lib/localWaProfile.js";
+import { buildSegmentContactWhere } from "../lib/segmentFilters.js";
+import { CONTACT_TRAITS, TRAIT_CONDITIONS, assignContactToAgent, getAssignmentSettings } from "../lib/assignmentEngine.js";
+import { clearDelayedReplyFlag, getInboxAutomationSettings, updateInboxAutomationSettings } from "../lib/inboxAutomations.js";
+import { formatWorkingHoursSummary, defaultWorkingHoursSlots } from "../lib/businessHours.js";
+import { patchAsyncRouter } from "../lib/asyncRouter.js";
 
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s);
 
@@ -74,6 +79,21 @@ async function tenantContact(req, id) {
 }
 
 const router = express.Router();
+patchAsyncRouter(router);
+
+/** Prevent Express 4 async hangs — return JSON instead of leaving requests open. */
+function asyncRoute(fn) {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
+function requireWorkspace(req, res) {
+  const companyId = companyIdOf(req);
+  if (!companyId) {
+    res.status(403).json({ error: "No workspace linked to this account" });
+    return null;
+  }
+  return companyId;
+}
 
 // Build the inbox list (contact + last message + unread count).
 async function buildConversations(req) {
@@ -192,17 +212,29 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
     if (user.isActive === false) {
       return res.status(403).json({ error: "This account has been deactivated" });
     }
-    if (!otp) {
-      try {
-        await issueOtp(em, "login");
-      } catch (e) {
-        console.error("[login otp]", e?.message || e);
-        return res.status(503).json({ error: "Could not send OTP to your email. Check SMTP or try again." });
+    // Super Admin bypasses OTP (they authenticate via strong password only).
+    // Regular users still go through OTP email verification.
+    const skipOtp = user.role === "SUPER_ADMIN";
+    if (!skipOtp) {
+      if (!otp) {
+        try {
+          await issueOtp(em, "login");
+        } catch (e) {
+          console.error("[login otp]", e?.message || e);
+          // If SMTP is not configured / fails in dev, allow login without OTP so
+          // developers are not locked out. In production set SMTP_USER + SMTP_PASS.
+          const { mailConfigured } = await import("../lib/mailer.js");
+          if (!mailConfigured()) {
+            console.warn("[login] SMTP not configured — skipping OTP for", em);
+          } else {
+            return res.status(503).json({ error: "Could not send OTP to your email. Check SMTP settings or try again." });
+          }
+        }
+        if (otp === undefined) return res.json({ otpRequired: true });
       }
-      return res.json({ otpRequired: true });
+      const v = verifyOtp(em, "login", otp);
+      if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
     }
-    const v = verifyOtp(em, "login", otp);
-    if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
     prisma.user.update({ where: { id: user.id }, data: { lastActiveAt: new Date(), lastLoginAt: new Date() } }).catch(() => {});
     if (user.companyId) {
       prisma.company.update({ where: { id: user.companyId }, data: { lastActiveAt: new Date() } }).catch(() => {});
@@ -709,7 +741,7 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
   } catch (e) {
     return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
   }
-  const creds = await getCompanyCreds(apiKey.companyId);
+  const creds = await getEffectiveCreds(apiKey.companyId);
   try {
     let result;
     if (template) {
@@ -846,16 +878,24 @@ router.get("/contacts", async (req, res) => {
 });
 
 router.post("/contacts", async (req, res) => {
-  const { name, phone, tags = [] } = req.body || {};
+  const { name, phone, tags = [], email, userId, optedIn, attributes } = req.body || {};
   if (!name || !phone) return res.status(400).json({ error: "name and phone required" });
   const cleanPhone = digitsOnly(phone);
   const companyId = companyIdOf(req);
   const tagList = Array.isArray(tags) ? tags : String(tags).split(",").map((t) => t.trim()).filter(Boolean);
   const existing = await findCompanyContactByPhone(prisma, companyId, cleanPhone);
+  const attrData = attributes && typeof attributes === "object" ? attributes : {};
   if (existing) {
     const contact = await prisma.contact.update({
       where: { id: existing.id },
-      data: { name: String(name).trim(), ...(tagList.length ? { tags: tagList } : {}) },
+      data: {
+        name: String(name).trim(),
+        ...(tagList.length ? { tags: tagList } : {}),
+        ...(email !== undefined ? { email: email ? String(email).trim() : null } : {}),
+        ...(userId !== undefined ? { userId: userId ? String(userId).trim() : null } : {}),
+        ...(optedIn !== undefined ? { optedIn: Boolean(optedIn) } : {}),
+        ...(Object.keys(attrData).length ? { attributes: { ...(existing.attributes || {}), ...attrData } } : {}),
+      },
     });
     return res.json({ ...contact, createdAt: contact.createdAt.getTime() });
   }
@@ -867,6 +907,10 @@ router.post("/contacts", async (req, res) => {
         name: String(name).trim(),
         phone: cleanPhone,
         tags: tagList,
+        email: email ? String(email).trim() : null,
+        userId: userId ? String(userId).trim() : null,
+        optedIn: optedIn !== undefined ? Boolean(optedIn) : true,
+        attributes: attrData,
         color: pickColor(count),
       },
     });
@@ -882,13 +926,24 @@ router.patch("/contacts/:id", async (req, res) => {
   if (!existing) return res.status(404).json({ error: "Contact not found" });
   const data = {};
   if (req.body?.name != null) data.name = String(req.body.name).trim();
-  if (req.body?.phone != null) data.phone = String(req.body.phone).replace(/[^\d]/g, "");
+  if (req.body?.phone != null) {
+    const newPhone = String(req.body.phone).replace(/[^\d]/g, "");
+    if (newPhone !== existing.phone) {
+      data.phone = newPhone;
+      logActivity(existing.id, "phone_updated", `Phone updated to +${newPhone}`);
+    }
+  }
   if (req.body?.tags != null) {
     data.tags = Array.isArray(req.body.tags)
       ? req.body.tags
       : String(req.body.tags).split(",").map((t) => t.trim()).filter(Boolean);
   }
   if (req.body?.optedIn != null) data.optedIn = Boolean(req.body.optedIn);
+  if (req.body?.email !== undefined) data.email = req.body.email ? String(req.body.email).trim() : null;
+  if (req.body?.userId !== undefined) data.userId = req.body.userId ? String(req.body.userId).trim() : null;
+  if (req.body?.attributes != null && typeof req.body.attributes === "object") {
+    data.attributes = { ...(existing.attributes || {}), ...req.body.attributes };
+  }
   try {
     const contact = await prisma.contact.update({ where: { id: existing.id }, data });
     res.json({ ...contact, createdAt: contact.createdAt.getTime() });
@@ -923,13 +978,39 @@ router.post("/contacts/import", async (req, res) => {
     const tags = Array.isArray(c.tags)
       ? c.tags
       : String(c.tags || "").split(/[;|]/).map((t) => t.trim()).filter(Boolean);
+    const attrData = c.attributes && typeof c.attributes === "object" ? c.attributes : {};
+    const existing = await findCompanyContactByPhone(prisma, companyIdOf(req), phone);
     try {
-      await prisma.contact.create({
-        data: { companyId: companyIdOf(req), name: String(c.name).trim(), phone, tags, color: pickColor(start + added) },
-      });
+      if (existing) {
+        await prisma.contact.update({
+          where: { id: existing.id },
+          data: {
+            name: String(c.name).trim(),
+            ...(tags.length ? { tags } : {}),
+            ...(c.email !== undefined ? { email: c.email ? String(c.email).trim() : null } : {}),
+            ...(c.userId !== undefined ? { userId: c.userId ? String(c.userId).trim() : null } : {}),
+            ...(c.optedIn !== undefined ? { optedIn: Boolean(c.optedIn) } : {}),
+            ...(Object.keys(attrData).length ? { attributes: { ...(existing.attributes || {}), ...attrData } } : {}),
+          },
+        });
+      } else {
+        await prisma.contact.create({
+          data: {
+            companyId: companyIdOf(req),
+            name: String(c.name).trim(),
+            phone,
+            tags,
+            email: c.email ? String(c.email).trim() : null,
+            userId: c.userId ? String(c.userId).trim() : null,
+            optedIn: c.optedIn !== undefined ? Boolean(c.optedIn) : true,
+            attributes: attrData,
+            color: pickColor(start + added),
+          },
+        });
+      }
       added++;
     } catch {
-      skipped++; // duplicate phone / invalid
+      skipped++;
     }
   }
   res.json({ added, skipped });
@@ -948,7 +1029,7 @@ router.post("/conversations/:id/media", requireNotSuspended, upload.single("file
   const publicUrl = `${req.protocol}://${req.get("host")}/uploads/${storedName}`;
   const waType = waMediaType(mimetype);
   const caption = req.body?.caption || "";
-  const creds = await getCompanyCreds(companyId);
+  const creds = await getEffectiveCreds(companyId);
 
   let waId = null;
   try {
@@ -988,12 +1069,16 @@ router.patch("/conversations/:id/status", async (req, res) => {
     fireEvent("chat.status", { name: c.name, phone: c.phone, status }).catch(() => {});
     logActivity(c.id, "status", `Chat marked ${status}`);
 
+    if (status === "open" && existing.chatStatus === "resolved") {
+      await assignContactToAgent(c, companyIdOf(req), { force: true }).catch(() => {});
+    }
+
     // On resolve, optionally send a CSAT rating request.
     if (status === "resolved") {
       const s = await prisma.setting.findUnique({ where: { companyId: companyIdOf(req) } });
       if (s?.csatEnabled) {
         try {
-          const creds = await getCompanyCreds(companyIdOf(req));
+          const creds = await getEffectiveCreds(companyIdOf(req));
           const r = await sendButtons(c.phone, s.csatMessage, [
             { id: "csat:Great", title: "😀 Great" },
             { id: "csat:Okay", title: "🙂 Okay" },
@@ -1081,6 +1166,182 @@ router.delete("/agents/:id", async (req, res) => {
   } catch {
     res.sendStatus(404);
   }
+});
+
+router.patch("/agents/:id/availability", async (req, res) => {
+  const { availability } = req.body || {};
+  const allowed = ["online", "away", "offline"];
+  if (!allowed.includes(availability)) return res.status(400).json({ error: "availability must be online, away, or offline" });
+  const agent = await prisma.agent.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!agent) return res.sendStatus(404);
+  const updated = await prisma.agent.update({ where: { id: agent.id }, data: { availability } });
+  res.json({ ...updated, createdAt: updated.createdAt.getTime() });
+});
+
+/* ------------------------ Basic inbox automations ---------------------- */
+router.get("/automation/inbox", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const data = await getInboxAutomationSettings(companyId);
+  res.json({
+    ...data,
+    workingHoursSummary: formatWorkingHoursSummary(data),
+    workingHoursSlots: data.workingHoursSlots?.length ? data.workingHoursSlots : defaultWorkingHoursSlots(),
+  });
+}));
+
+router.patch("/automation/inbox", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const updated = await updateInboxAutomationSettings(companyId, req.body, req.company?.name);
+  res.json({
+    ...updated,
+    workingHoursSummary: formatWorkingHoursSummary(updated),
+    workingHoursSlots: updated.workingHoursSlots?.length ? updated.workingHoursSlots : defaultWorkingHoursSlots(),
+  });
+}));
+
+router.get("/automation/custom-replies", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const [items, setting, wa] = await Promise.all([
+    prisma.automation.findMany({ where: { companyId }, orderBy: { updatedAt: "desc" } }),
+    prisma.setting.findUnique({ where: { companyId } }),
+    prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } }),
+  ]);
+  const totalSent = items.reduce((s, a) => s + (a.sentCount || 0), 0);
+  res.json({
+    customRepliesEnabled: setting?.customRepliesEnabled !== false,
+    intentMatchingEnabled: Boolean(setting?.intentMatchingEnabled),
+    whatsappConnected: Boolean(wa?.isConnected),
+    totalSent,
+    items: items.map((a) => ({
+      ...a,
+      actionType: "Send Message",
+      createdAt: a.createdAt.getTime(),
+      updatedAt: a.updatedAt.getTime(),
+    })),
+  });
+}));
+
+router.patch("/automation/custom-replies/settings", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { customRepliesEnabled } = req.body || {};
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: { ...(customRepliesEnabled !== undefined && { customRepliesEnabled: Boolean(customRepliesEnabled) }) },
+    create: { companyId, businessName: req.company?.name || "Nexwapi", customRepliesEnabled: customRepliesEnabled !== false },
+  });
+  res.json({ customRepliesEnabled: s.customRepliesEnabled !== false });
+}));
+
+/* ------------------------ Conversation routing ------------------------- */
+router.get("/assignment/meta", async (_req, res) => {
+  res.json({ traits: CONTACT_TRAITS, conditions: TRAIT_CONDITIONS });
+});
+
+router.get("/assignment/settings", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  res.json(await getAssignmentSettings(companyId));
+}));
+
+router.patch("/assignment/settings", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { assignmentMode, autoAssign, assignOnlineOnly } = req.body || {};
+  const data = {};
+  if (assignmentMode !== undefined) {
+    const allowed = ["none", "round_robin", "load_balance"];
+    if (!allowed.includes(String(assignmentMode))) {
+      return res.status(400).json({ error: "Invalid assignment mode" });
+    }
+    data.assignmentMode = String(assignmentMode);
+    data.autoAssign = assignmentMode !== "none";
+    if (assignmentMode === "round_robin") data.roundRobinIndex = 0;
+  }
+  if (autoAssign !== undefined) data.autoAssign = Boolean(autoAssign);
+  if (assignOnlineOnly !== undefined) data.assignOnlineOnly = Boolean(assignOnlineOnly);
+
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: data,
+    create: { companyId, businessName: req.company?.name || "Nexwapi", ...data },
+  });
+  res.json({
+    ...(await getAssignmentSettings(companyId)),
+    setting: {
+      assignmentMode: s.assignmentMode,
+      autoAssign: s.autoAssign,
+      assignOnlineOnly: s.assignOnlineOnly,
+    },
+  });
+}));
+
+router.get("/assignment/rules", asyncRoute(async (req, res) => {
+  const rules = await prisma.assignmentRule.findMany({
+    where: tenantWhere(req),
+    orderBy: [{ priority: "asc" }, { createdAt: "asc" }],
+  });
+  res.json(rules.map((r) => ({ ...r, createdAt: r.createdAt.getTime() })));
+}));
+
+router.post("/assignment/rules", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { name, trait, condition, values, agentIds, enabled = true, priority = 0 } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: "Rule name is required" });
+  if (!trait) return res.status(400).json({ error: "Contact field is required" });
+  if (!Array.isArray(values) || !values.length) return res.status(400).json({ error: "At least one value is required" });
+  if (!Array.isArray(agentIds) || !agentIds.length) return res.status(400).json({ error: "Select at least one agent" });
+  const agents = await prisma.agent.findMany({ where: { id: { in: agentIds }, companyId } });
+  if (agents.length !== agentIds.length) return res.status(400).json({ error: "One or more agents not found" });
+  const rule = await prisma.assignmentRule.create({
+    data: {
+      companyId,
+      name: name.trim(),
+      trait,
+      condition: condition || "contains",
+      values: values.map(String),
+      agentIds,
+      enabled: Boolean(enabled),
+      priority: Number(priority) || 0,
+    },
+  });
+  res.status(201).json({ ...rule, createdAt: rule.createdAt.getTime() });
+}));
+
+router.patch("/assignment/rules/:id", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const existing = await prisma.assignmentRule.findFirst({ where: { id: req.params.id, companyId } });
+  if (!existing) return res.sendStatus(404);
+  const { name, trait, condition, values, agentIds, enabled, priority } = req.body || {};
+  const data = {};
+  if (name !== undefined) data.name = String(name).trim();
+  if (trait !== undefined) data.trait = trait;
+  if (condition !== undefined) data.condition = condition;
+  if (values !== undefined) {
+    if (!Array.isArray(values) || !values.length) return res.status(400).json({ error: "At least one value is required" });
+    data.values = values.map(String);
+  }
+  if (agentIds !== undefined) {
+    if (!Array.isArray(agentIds) || !agentIds.length) return res.status(400).json({ error: "Select at least one agent" });
+    const agents = await prisma.agent.findMany({ where: { id: { in: agentIds }, companyId } });
+    if (agents.length !== agentIds.length) return res.status(400).json({ error: "One or more agents not found" });
+    data.agentIds = agentIds;
+  }
+  if (enabled !== undefined) data.enabled = Boolean(enabled);
+  if (priority !== undefined) data.priority = Number(priority) || 0;
+  const rule = await prisma.assignmentRule.update({ where: { id: existing.id }, data });
+  res.json({ ...rule, createdAt: rule.createdAt.getTime() });
+});
+
+router.delete("/assignment/rules/:id", async (req, res) => {
+  const existing = await prisma.assignmentRule.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.sendStatus(404);
+  await prisma.assignmentRule.delete({ where: { id: existing.id } });
+  res.sendStatus(204);
 });
 
 // Assign / unassign a conversation (contact) to an agent.
@@ -1183,36 +1444,83 @@ router.delete("/products/:id", async (req, res) => {
 });
 
 /* ------------------------------ Segments ------------------------------- */
+
 router.get("/segments", async (req, res) => {
   const segments = await prisma.segment.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
+  const cid = companyIdOf(req);
   const withCounts = await Promise.all(
-    segments.map(async (s) => ({
-      ...s,
-      createdAt: s.createdAt.getTime(),
-      count: await prisma.contact.count({
-        where: { ...(await resolveAudience(`segment: ${s.name}`, companyIdOf(req))), ...tenantWhere(req) },
-      }),
-    }))
+    segments.map(async (s) => {
+      const contactWhere = buildSegmentContactWhere(s, cid);
+      const count = await prisma.contact.count({ where: contactWhere });
+      return { ...s, createdAt: s.createdAt.getTime(), updatedAt: s.updatedAt?.getTime?.() || s.createdAt.getTime(), count };
+    })
   );
   res.json(withCounts);
 });
 
+router.get("/segments/:id", async (req, res) => {
+  const seg = await prisma.segment.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!seg) return res.sendStatus(404);
+  const contactWhere = buildSegmentContactWhere(seg, companyIdOf(req));
+  const count = await prisma.contact.count({ where: contactWhere });
+  const contacts = await prisma.contact.findMany({ where: contactWhere, orderBy: { createdAt: "desc" }, take: 100 });
+  res.json({
+    ...seg,
+    createdAt: seg.createdAt.getTime(),
+    updatedAt: seg.updatedAt?.getTime?.() || seg.createdAt.getTime(),
+    count,
+    contacts: contacts.map((c) => ({ ...c, createdAt: c.createdAt.getTime() })),
+  });
+});
+
 router.post("/segments", async (req, res) => {
-  const { name, tags = [], match = "any" } = req.body || {};
-  if (!name || !Array.isArray(tags) || !tags.length) return res.status(400).json({ error: "name and tags required" });
-  const seg = await prisma.segment.create({ data: { companyId: companyIdOf(req), name, tags, match } });
-  res.status(201).json({ ...seg, createdAt: seg.createdAt.getTime() });
+  const { name, description, tags = [], match = "any", filters, whatsappOnly = true } = req.body || {};
+  if (!name) return res.status(400).json({ error: "name required" });
+  const seg = await prisma.segment.create({
+    data: { companyId: companyIdOf(req), name, description: description || null, tags, match, filters: filters || null, whatsappOnly },
+  });
+  const count = await prisma.contact.count({ where: buildSegmentContactWhere(seg, companyIdOf(req)) });
+  res.status(201).json({ ...seg, createdAt: seg.createdAt.getTime(), updatedAt: seg.updatedAt.getTime(), count });
+});
+
+router.patch("/segments/:id", async (req, res) => {
+  const existing = await prisma.segment.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.sendStatus(404);
+  const { name, description, tags, match, filters, whatsappOnly } = req.body || {};
+  const data = {};
+  if (name !== undefined) data.name = name;
+  if (description !== undefined) data.description = description;
+  if (tags !== undefined) data.tags = tags;
+  if (match !== undefined) data.match = match;
+  if (filters !== undefined) data.filters = filters;
+  if (whatsappOnly !== undefined) data.whatsappOnly = whatsappOnly;
+  const seg = await prisma.segment.update({ where: { id: existing.id }, data });
+  const count = await prisma.contact.count({ where: buildSegmentContactWhere(seg, companyIdOf(req)) });
+  res.json({ ...seg, createdAt: seg.createdAt.getTime(), updatedAt: seg.updatedAt.getTime(), count });
 });
 
 router.delete("/segments/:id", async (req, res) => {
   try {
-    if (!(await otpGate(req, res, "segment_delete"))) return;
     const deleted = await prisma.segment.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
   }
+});
+
+router.get("/segments/:id/contacts", async (req, res) => {
+  const seg = await prisma.segment.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!seg) return res.sendStatus(404);
+  const contactWhere = buildSegmentContactWhere(seg, companyIdOf(req));
+  const page = parseInt(req.query.page) || 1;
+  const take = parseInt(req.query.limit) || 50;
+  const skip = (page - 1) * take;
+  const [contacts, total] = await Promise.all([
+    prisma.contact.findMany({ where: contactWhere, orderBy: { createdAt: "desc" }, take, skip }),
+    prisma.contact.count({ where: contactWhere }),
+  ]);
+  res.json({ contacts: contacts.map((c) => ({ ...c, createdAt: c.createdAt.getTime() })), total, page, pages: Math.ceil(total / take) });
 });
 
 /* ------------------------------- Labels -------------------------------- */
@@ -1313,7 +1621,7 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
   if (!text) return res.status(400).json({ error: "text required" });
   const companyId = companyIdOf(req);
   const sendTextBody = outboundTextWithAgent(req, text);
-  const creds = await getCompanyCreds(companyId);
+  const creds = await getEffectiveCreds(companyId);
   let waId = null;
   try {
     assertLiveCreds(creds);
@@ -1337,6 +1645,7 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
       senderUserId: req.user?.id || null,
     },
   });
+  await clearDelayedReplyFlag(contact.id).catch(() => {});
   res.status(201).json(toMessage(msg));
 });
 
@@ -1354,7 +1663,7 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
     return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
   }
 
-  const creds = await getCompanyCreds(companyId);
+  const creds = await getEffectiveCreds(companyId);
   let waId = null;
   try {
     assertLiveCreds(creds);
@@ -1395,8 +1704,154 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
 });
 
 /* ------------------------------ Templates ------------------------------ */
+// Built-in library templates (no Meta needed — demo/default)
+const TEMPLATE_LIBRARY = [
+  {
+    id: "lib_promo_offer",
+    name: "exclusive_offer",
+    category: "PROMOTIONAL",
+    language: "en",
+    status: "approved",
+    body: "🌟 Hi there! We at {{1}} are excited to offer you an exclusive discount on our latest products!\nUse the code **{{2}}** at checkout to enjoy 20% off your purchase.\nHurry, the offer is valid until the end of the month! 🛍️✨",
+    format: "text",
+    isLibrary: true,
+    createdAt: 0,
+  },
+  {
+    id: "lib_promo_launch",
+    name: "new_product_launch",
+    category: "PROMOTIONAL",
+    language: "en",
+    status: "approved",
+    body: "🚀 Exciting News! We're thrilled to announce the launch of our latest product: **{{1}}**!\nExperience features like never before! Visit our website to explore more.",
+    format: "text",
+    isLibrary: true,
+    createdAt: 0,
+  },
+  {
+    id: "lib_promo_sale",
+    name: "mega_sale_announcement",
+    category: "PROMOTIONAL",
+    language: "en",
+    status: "approved",
+    body: "🎉 It's that time of the year again! Our Mega Sale is LIVE!\nGet up to **{{1}}% OFF** on all products. Shop now before stocks run out!\nUse code: **{{2}}** 🛒",
+    format: "text",
+    isLibrary: true,
+    createdAt: 0,
+  },
+  {
+    id: "lib_promo_referral",
+    name: "referral_program",
+    category: "PROMOTIONAL",
+    language: "en",
+    status: "approved",
+    body: "👋 Hi {{1}}! Refer a friend to {{2}} and both of you get ₹{{3}} off your next order!\nShare your referral link: {{4}}",
+    format: "text",
+    isLibrary: true,
+    createdAt: 0,
+  },
+  {
+    id: "lib_service_notification",
+    name: "service_notification",
+    category: "SERVICE ALERTS",
+    language: "en",
+    status: "approved",
+    body: "🔔 Service Update: Dear {{1}}, we wanted to let you know about an important update regarding your account.\n{{2}}\nIf you have questions, reply to this message.",
+    format: "text",
+    isLibrary: true,
+    createdAt: 0,
+  },
+  {
+    id: "lib_txn_success",
+    name: "transaction_successful",
+    category: "TRANSACTIONAL",
+    language: "en",
+    status: "approved",
+    body: "✅ Hi {{1}}, your payment of **₹{{2}}** was successful!\nThank you for choosing {{3}}. Your order will be processed shortly.\nIf you have any questions, feel free to reach out to us!",
+    format: "text",
+    isLibrary: true,
+    createdAt: 0,
+  },
+  {
+    id: "lib_txn_order",
+    name: "order_status_update",
+    category: "TRANSACTIONAL",
+    language: "en",
+    status: "approved",
+    body: "📦 Hi {{1}}, your order #{{2}} has been shipped!\nYou can expect delivery by **{{3}}**.\nIf you have any questions, just ask!",
+    format: "text",
+    isLibrary: true,
+    createdAt: 0,
+  },
+  {
+    id: "lib_lead_thankyou",
+    name: "thank_you_for_reaching_out",
+    category: "LEAD QUALIFICATION",
+    language: "en",
+    status: "approved",
+    body: "🙏 Hi {{1}}, thank you for submitting your interest in {{2}}.\nWe appreciate your interest and one of our team members will get back to you shortly to discuss how we can assist you!",
+    format: "text",
+    isLibrary: true,
+    createdAt: 0,
+  },
+  {
+    id: "lib_lead_product_info",
+    name: "product_information_request",
+    category: "LEAD QUALIFICATION",
+    language: "en",
+    status: "approved",
+    body: "Hi {{1}}, thank you for your interest in {{2}}. Here are some details:\n\n{{3}}\n\nWould you like to schedule a call to learn more?",
+    format: "text",
+    isLibrary: true,
+    createdAt: 0,
+  },
+];
+
+router.get("/templates/library", async (req, res) => {
+  // Production: fetch approved templates from Meta when live
+  if (WA_LIVE) {
+    try {
+      const creds = await getEffectiveCreds(companyIdOf(req));
+      if (creds?.wabaId && creds?.accessToken) {
+        const metaTemplates = await listTemplates(creds);
+        const approved = (metaTemplates || []).filter((t) => String(t.status).toUpperCase() === "APPROVED");
+        const mapped = approved.map((mt) => {
+          const bodyComp = (mt.components || []).find((c) => c.type === "BODY");
+          const body = bodyComp?.text || "(no body)";
+          return {
+            id: `meta_${mt.name}_${mt.language}`,
+            name: mt.name,
+            category: cap(mt.category || "Utility"),
+            language: mt.language || "en",
+            status: "approved",
+            body,
+            format: "text",
+            isLibrary: true,
+            fromMeta: true,
+            createdAt: 0,
+          };
+        });
+        if (mapped.length > 0) return res.json(mapped);
+      }
+    } catch (e) {
+      console.warn("[templates/library] Meta fetch failed:", e.message);
+    }
+  }
+  // Fallback: starter templates (must be submitted to Meta via "Use template")
+  res.json(TEMPLATE_LIBRARY.map((t) => ({ ...t, fromMeta: false, note: "Submit to Meta to use in campaigns" })));
+});
+
 router.get("/templates", async (req, res) => {
-  const templates = await prisma.template.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
+  const tab = req.query.tab; // "active" (default) | "deleted"
+  const whereClause = {
+    ...tenantWhere(req),
+    deletedAt: tab === "deleted" ? { not: null } : null,
+  };
+  // status filter
+  if (req.query.status) whereClause.status = req.query.status;
+  // category filter
+  if (req.query.category) whereClause.category = req.query.category;
+  const templates = await prisma.template.findMany({ where: whereClause, orderBy: { createdAt: "desc" } });
   res.json(templates.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
 });
 
@@ -1407,20 +1862,17 @@ router.post("/templates", async (req, res) => {
   const cleanName = String(name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
 
   let status = "pending";
-  let metaError = null;
-  if (WA_LIVE) {
-    try {
-      const creds = await getCompanyCreds(companyIdOf(req));
-      assertLiveCreds(creds);
-      if (!creds?.wabaId) throw new Error("WhatsApp is connected but WABA id is missing. Reconnect with Facebook.");
-      const r = format === "carousel" && Array.isArray(cards) && cards.length
-        ? await createCarouselTemplate({ name: cleanName, category, language, body, cards }, creds)
-        : await createTemplate({ name: cleanName, category, language, body, headerType, headerText, headerImageUrl, buttons }, creds);
-      status = (r.status || "pending").toLowerCase();
-      if (r.language) language = r.language;
-    } catch (e) {
-      metaError = e.message;
-    }
+  try {
+    const creds = await getEffectiveCreds(companyIdOf(req));
+    assertLiveCreds(creds);
+    if (!creds?.wabaId) throw Object.assign(new Error("Connect WhatsApp first (Dashboard → WhatsApp), then submit templates."), { status: 400 });
+    const r = format === "carousel" && Array.isArray(cards) && cards.length
+      ? await createCarouselTemplate({ name: cleanName, category, language, body, cards }, creds)
+      : await createTemplate({ name: cleanName, category, language, body, headerType, headerText, headerImageUrl, buttons }, creds);
+    status = (r.status || "pending").toLowerCase();
+    if (r.language) language = r.language;
+  } catch (e) {
+    return res.status(e.status || 400).json({ error: e.message, code: e.code || undefined });
   }
 
   try {
@@ -1436,7 +1888,7 @@ router.post("/templates", async (req, res) => {
         cards: format === "carousel" ? cards : undefined,
       },
     });
-    res.status(201).json({ ...tpl, createdAt: tpl.createdAt.getTime(), metaError });
+    res.status(201).json({ ...tpl, createdAt: tpl.createdAt.getTime() });
     notify({
       audience: "admin",
       title: "Template submitted",
@@ -1474,15 +1926,15 @@ router.delete("/templates/:id", async (req, res) => {
   if (!(await otpGate(req, res, "template_delete"))) return;
   const existing = await prisma.template.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
   if (!existing) return res.sendStatus(404);
-  await prisma.template.delete({ where: { id: existing.id } });
+  // Soft-delete: move to "deleted" tab
+  await prisma.template.update({ where: { id: existing.id }, data: { deletedAt: new Date(), status: "deleted" } });
   res.sendStatus(204);
 });
 
 // Pull the latest template statuses from Meta and reconcile the local list.
 router.post("/templates/sync", async (req, res) => {
-  if (!WA_LIVE) return res.status(400).json({ error: "Not in live mode" });
   try {
-    const creds = await getCompanyCreds(companyIdOf(req));
+    const creds = await getEffectiveCreds(companyIdOf(req));
     assertLiveCreds(creds);
     if (!creds?.wabaId) return res.status(400).json({ error: "Connect WhatsApp first, then sync templates." });
     const metaTemplates = await listTemplates(creds);
@@ -1516,13 +1968,22 @@ router.post("/templates/sync", async (req, res) => {
 });
 
 /* ------------------------------ Campaigns ------------------------------ */
+function serializeCampaign(c) {
+  return {
+    ...c,
+    createdAt: c.createdAt instanceof Date ? c.createdAt.getTime() : c.createdAt,
+    scheduledAt: c.scheduledAt instanceof Date ? c.scheduledAt.getTime() : (c.scheduledAt || null),
+    liveAt: c.liveAt instanceof Date ? c.liveAt.getTime() : (c.liveAt || null),
+  };
+}
+
 router.get("/campaigns", async (req, res) => {
   const campaigns = await prisma.campaign.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
-  res.json(campaigns.map((c) => ({ ...c, createdAt: c.createdAt.getTime(), scheduledAt: c.scheduledAt?.getTime() || null })));
+  res.json(campaigns.map(serializeCampaign));
 });
 
 router.post("/campaigns", requireNotSuspended, async (req, res) => {
-  const { name, template, audience = "All contacts", scheduledAt } = req.body || {};
+  const { name, template, audience = "All contacts", scheduledAt, campaignType = "onetime", category, status: reqStatus } = req.body || {};
   if (!name || !template) return res.status(400).json({ error: "name and template required" });
   const audienceWhere = await resolveAudience(audience, companyIdOf(req));
   const recipients = await prisma.contact.count({ where: { ...audienceWhere, ...tenantWhere(req) } });
@@ -1533,11 +1994,39 @@ router.post("/campaigns", requireNotSuspended, async (req, res) => {
       template,
       audience,
       recipients,
-      status: "scheduled",
+      campaignType,
+      category: category || null,
+      status: reqStatus || "scheduled",
       scheduledAt: scheduledAt ? new Date(scheduledAt) : null,
     },
   });
-  res.status(201).json({ ...campaign, createdAt: campaign.createdAt.getTime(), scheduledAt: campaign.scheduledAt?.getTime() || null });
+  res.status(201).json(serializeCampaign(campaign));
+});
+
+// Update campaign (name, status pause/cancel, scheduledAt)
+router.patch("/campaigns/:id", async (req, res) => {
+  const campaign = await prisma.campaign.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!campaign) return res.sendStatus(404);
+  const { name, status, scheduledAt } = req.body || {};
+  const allowed = ["scheduled", "paused", "cancelled"];
+  if (status && !allowed.includes(status)) return res.status(400).json({ error: "Cannot set status to " + status });
+  const updated = await prisma.campaign.update({
+    where: { id: campaign.id },
+    data: {
+      ...(name ? { name } : {}),
+      ...(status ? { status } : {}),
+      ...(scheduledAt !== undefined ? { scheduledAt: scheduledAt ? new Date(scheduledAt) : null } : {}),
+    },
+  });
+  res.json(serializeCampaign(updated));
+});
+
+router.delete("/campaigns/:id", async (req, res) => {
+  const campaign = await prisma.campaign.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!campaign) return res.sendStatus(404);
+  if (campaign.status === "running") return res.status(409).json({ error: "Cannot delete a running campaign" });
+  await prisma.campaign.delete({ where: { id: campaign.id } });
+  res.json({ ok: true });
 });
 
 // Broadcast engine — send now (the scheduler auto-runs scheduled ones).
@@ -1546,6 +2035,8 @@ router.post("/campaigns/:id/send", requireNotSuspended, async (req, res) => {
   if (!campaign) return res.sendStatus(404);
   if (campaign.status === "running") return res.status(409).json({ error: "Campaign already running" });
   try {
+    // Mark liveAt
+    await prisma.campaign.update({ where: { id: campaign.id }, data: { liveAt: new Date() } });
     const result = await runCampaign(campaign.id);
     res.json({ ok: true, status: "completed", ...result });
   } catch (e) {
@@ -1616,38 +2107,60 @@ router.post("/drips/:id/enroll", requireNotSuspended, async (req, res) => {
 });
 
 /* ----------------------------- Automations ----------------------------- */
-router.get("/automations", async (req, res) => {
+router.get("/automations", asyncRoute(async (req, res) => {
   const items = await prisma.automation.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
-  res.json(items.map((a) => ({ ...a, createdAt: a.createdAt.getTime() })));
-});
+  res.json(items.map((a) => ({ ...a, createdAt: a.createdAt.getTime(), updatedAt: a.updatedAt.getTime() })));
+}));
 
-router.post("/automations", async (req, res) => {
-  const { name, keyword = "", matchType = "contains", reply } = req.body || {};
-  if (!name || !reply) return res.status(400).json({ error: "name and reply required" });
-  const a = await prisma.automation.create({ data: { companyId: companyIdOf(req), name, keyword, matchType, reply } });
-  res.status(201).json({ ...a, createdAt: a.createdAt.getTime() });
-});
+router.post("/automations", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { name, keyword = "", matchType = "contains", reply, enabled = true } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: "Rule name is required" });
+  if (!reply?.trim()) return res.status(400).json({ error: "Reply message is required" });
+  const a = await prisma.automation.create({
+    data: {
+      companyId,
+      name: name.trim(),
+      keyword: String(keyword || ""),
+      matchType: matchType || "contains",
+      reply: reply.trim(),
+      enabled: Boolean(enabled),
+    },
+  });
+  res.status(201).json({ ...a, createdAt: a.createdAt.getTime(), updatedAt: a.updatedAt.getTime() });
+}));
 
-router.patch("/automations/:id", async (req, res) => {
+router.patch("/automations/toggle-all", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { enabled } = req.body || {};
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: { customRepliesEnabled: Boolean(enabled) },
+    create: { companyId, businessName: req.company?.name || "Nexwapi", customRepliesEnabled: Boolean(enabled) },
+  });
+  res.json({ customRepliesEnabled: s.customRepliesEnabled });
+}));
+
+router.patch("/automations/:id", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
   const { enabled, name, keyword, matchType, reply } = req.body || {};
-  try {
-    const existing = await prisma.automation.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
-    if (!existing) return res.sendStatus(404);
-    const a = await prisma.automation.update({
-      where: { id: existing.id },
-      data: {
-        ...(enabled !== undefined && { enabled }),
-        ...(name !== undefined && { name }),
-        ...(keyword !== undefined && { keyword }),
-        ...(matchType !== undefined && { matchType }),
-        ...(reply !== undefined && { reply }),
-      },
-    });
-    res.json({ ...a, createdAt: a.createdAt.getTime() });
-  } catch {
-    res.sendStatus(404);
-  }
-});
+  const existing = await prisma.automation.findFirst({ where: { id: req.params.id, companyId } });
+  if (!existing) return res.sendStatus(404);
+  const a = await prisma.automation.update({
+    where: { id: existing.id },
+    data: {
+      ...(enabled !== undefined && { enabled }),
+      ...(name !== undefined && { name: String(name).trim() }),
+      ...(keyword !== undefined && { keyword: String(keyword) }),
+      ...(matchType !== undefined && { matchType }),
+      ...(reply !== undefined && { reply: String(reply).trim() }),
+    },
+  });
+  res.json({ ...a, createdAt: a.createdAt.getTime(), updatedAt: a.updatedAt.getTime() });
+}));
 
 router.delete("/automations/:id", async (req, res) => {
   try {
@@ -1661,14 +2174,54 @@ router.delete("/automations/:id", async (req, res) => {
 });
 
 /* ------------------------- Chatbot Flows ------------------------------- */
-router.get("/flows", async (req, res) => {
-  const flows = await prisma.flow.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
-  res.json(flows.map((f) => ({ ...f, createdAt: f.createdAt.getTime() })));
-});
+router.get("/flows/overview", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const [items, setting, wa] = await Promise.all([
+    prisma.flow.findMany({ where: { companyId }, orderBy: { updatedAt: "desc" } }),
+    prisma.setting.findUnique({ where: { companyId } }),
+    prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } }),
+  ]);
+  const totalSent = items.reduce((s, f) => s + (f.sentCount || 0), 0);
+  res.json({
+    items: items.map((f) => ({
+      ...f,
+      actionType: "Workflow",
+      createdAt: f.createdAt.getTime(),
+      updatedAt: f.updatedAt.getTime(),
+    })),
+    totalSent,
+    whatsappConnected: Boolean(wa?.isConnected),
+    intentMatchingEnabled: Boolean(setting?.intentMatchingEnabled),
+    flowFollowUpEnabled: Boolean(setting?.flowFollowUpEnabled),
+    flowFollowUpMinutes: setting?.flowFollowUpMinutes ?? 30,
+    flowFollowUpMessage: setting?.flowFollowUpMessage ?? "",
+    flowIdleTimeoutMinutes: setting?.flowIdleTimeoutMinutes ?? 60,
+  });
+}));
 
-router.post("/flows", async (req, res) => {
+router.get("/flows/settings", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const s = await prisma.setting.findUnique({ where: { companyId } });
+  res.json({
+    flowFollowUpEnabled: Boolean(s?.flowFollowUpEnabled),
+    flowFollowUpMinutes: s?.flowFollowUpMinutes ?? 30,
+    flowFollowUpMessage: s?.flowFollowUpMessage ?? "Hi! Just checking in — would you like to continue?",
+    flowIdleTimeoutMinutes: s?.flowIdleTimeoutMinutes ?? 60,
+  });
+}));
+
+router.get("/flows", asyncRoute(async (req, res) => {
+  const flows = await prisma.flow.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
+  res.json(flows.map((f) => ({ ...f, createdAt: f.createdAt.getTime(), updatedAt: f.updatedAt.getTime() })));
+}));
+
+router.post("/flows", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
   const { name, triggerType = "keyword", trigger = "", steps } = req.body || {};
-  if (!name) return res.status(400).json({ error: "name required" });
+  if (!name?.trim()) return res.status(400).json({ error: "Flow name is required" });
   const defaultSteps = [
     { id: "start", message: "Hi! 👋 How can we help you today?", buttons: [{ title: "Pricing", next: "pricing" }, { title: "Talk to agent", next: "agent" }] },
     { id: "pricing", message: "See all our plans here: https://nexwapi.com/pricing", buttons: [] },
@@ -1676,49 +2229,269 @@ router.post("/flows", async (req, res) => {
   ];
   const flow = await prisma.flow.create({
     data: {
-      companyId: companyIdOf(req),
-      name,
+      companyId,
+      name: name.trim(),
       triggerType,
       trigger,
       steps: Array.isArray(steps) && steps.length ? steps : defaultSteps,
     },
   });
-  res.status(201).json({ ...flow, createdAt: flow.createdAt.getTime() });
-});
+  res.status(201).json({ ...flow, createdAt: flow.createdAt.getTime(), updatedAt: flow.updatedAt.getTime() });
+}));
 
-router.patch("/flows/:id", async (req, res) => {
+router.patch("/flows/settings", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { flowFollowUpEnabled, flowFollowUpMinutes, flowFollowUpMessage, flowIdleTimeoutMinutes } = req.body || {};
+  const data = {
+    ...(flowFollowUpEnabled !== undefined && { flowFollowUpEnabled: Boolean(flowFollowUpEnabled) }),
+    ...(flowFollowUpMinutes !== undefined && { flowFollowUpMinutes: Math.max(5, Number(flowFollowUpMinutes) || 30) }),
+    ...(flowFollowUpMessage !== undefined && { flowFollowUpMessage: String(flowFollowUpMessage) }),
+    ...(flowIdleTimeoutMinutes !== undefined && {
+      flowIdleTimeoutMinutes: Number(flowIdleTimeoutMinutes) <= 0
+        ? 0
+        : Math.max(5, Number(flowIdleTimeoutMinutes) || 60),
+    }),
+  };
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: data,
+    create: { companyId, businessName: req.company?.name || "Nexwapi", ...data },
+  });
+  res.json({
+    flowFollowUpEnabled: Boolean(s.flowFollowUpEnabled),
+    flowFollowUpMinutes: s.flowFollowUpMinutes,
+    flowFollowUpMessage: s.flowFollowUpMessage,
+    flowIdleTimeoutMinutes: s.flowIdleTimeoutMinutes,
+  });
+}));
+
+/* ---------------------- Advanced automation features ------------------- */
+router.patch("/automation/intent-matching", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { enabled } = req.body || {};
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: { intentMatchingEnabled: Boolean(enabled) },
+    create: { companyId, businessName: req.company?.name || "Nexwapi", intentMatchingEnabled: Boolean(enabled) },
+  });
+  res.json({ intentMatchingEnabled: s.intentMatchingEnabled });
+}));
+
+router.patch("/flows/:id", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
   const { name, triggerType, trigger, enabled, steps } = req.body || {};
-  try {
-    const existing = await prisma.flow.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
-    if (!existing) return res.sendStatus(404);
-    const flow = await prisma.flow.update({
-      where: { id: existing.id },
-      data: {
-        ...(name !== undefined && { name }),
-        ...(triggerType !== undefined && { triggerType }),
-        ...(trigger !== undefined && { trigger }),
-        ...(enabled !== undefined && { enabled }),
-        ...(steps !== undefined && { steps }),
-      },
-    });
-    res.json({ ...flow, createdAt: flow.createdAt.getTime() });
-  } catch {
-    res.sendStatus(404);
-  }
+  const existing = await prisma.flow.findFirst({ where: { id: req.params.id, companyId } });
+  if (!existing) return res.sendStatus(404);
+  const flow = await prisma.flow.update({
+    where: { id: existing.id },
+    data: {
+      ...(name !== undefined && { name }),
+      ...(triggerType !== undefined && { triggerType }),
+      ...(trigger !== undefined && { trigger }),
+      ...(enabled !== undefined && { enabled }),
+      ...(steps !== undefined && { steps }),
+    },
+  });
+  res.json({ ...flow, createdAt: flow.createdAt.getTime(), updatedAt: flow.updatedAt.getTime() });
+}));
+
+router.get("/automation/ai-agent", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const s = await prisma.setting.findUnique({ where: { companyId } });
+  res.json({
+    enabled: s?.aiAgentEnabled ?? false,
+    websiteUrl: s?.aiAgentWebsiteUrl ?? "",
+    greeting: s?.aiAgentGreeting ?? "",
+    knowledge: Array.isArray(s?.aiAgentKnowledge) ? s.aiAgentKnowledge : [],
+  });
+}));
+
+router.patch("/automation/ai-agent", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { enabled, websiteUrl, greeting, knowledge } = req.body || {};
+  const data = {
+    ...(enabled !== undefined && { aiAgentEnabled: Boolean(enabled) }),
+    ...(websiteUrl !== undefined && { aiAgentWebsiteUrl: String(websiteUrl) }),
+    ...(greeting !== undefined && { aiAgentGreeting: String(greeting) }),
+    ...(knowledge !== undefined && { aiAgentKnowledge: knowledge }),
+  };
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: data,
+    create: { companyId, businessName: req.company?.name || "Nexwapi", ...data },
+  });
+  res.json({
+    enabled: s.aiAgentEnabled,
+    websiteUrl: s.aiAgentWebsiteUrl,
+    greeting: s.aiAgentGreeting,
+    knowledge: Array.isArray(s.aiAgentKnowledge) ? s.aiAgentKnowledge : [],
+  });
+}));
+
+router.post("/automation/ai-agent/sync-website", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { url } = req.body || {};
+  const { syncWebsiteKnowledge } = await import("../lib/aiAgent.js");
+  const result = await syncWebsiteKnowledge(companyId, url);
+  res.json({ ok: true, ...result });
+}));
+
+router.post("/automation/ai-agent/documents", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { title, content } = req.body || {};
+  if (!title?.trim() || !content?.trim()) return res.status(400).json({ error: "title and content required" });
+  const s = await prisma.setting.findUnique({ where: { companyId } });
+  const existing = Array.isArray(s?.aiAgentKnowledge) ? s.aiAgentKnowledge : [];
+  const knowledge = [...existing, { title: title.trim(), source: "document", content: content.trim() }];
+  const updated = await prisma.setting.upsert({
+    where: { companyId },
+    update: { aiAgentKnowledge: knowledge },
+    create: { companyId, businessName: req.company?.name || "Nexwapi", aiAgentKnowledge: knowledge },
+  });
+  res.status(201).json({ knowledge: updated.aiAgentKnowledge });
+}));
+
+router.get("/automation/voice-ai", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const s = await prisma.setting.findUnique({ where: { companyId } });
+  res.json({
+    enabled: s?.voiceAiEnabled ?? false,
+    plan: s?.voiceAiPlan ?? "business",
+    credits: s?.voiceAiCredits ?? 100,
+  });
+}));
+
+router.patch("/automation/voice-ai", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { enabled, plan, credits } = req.body || {};
+  const data = {
+    ...(enabled !== undefined && { voiceAiEnabled: Boolean(enabled) }),
+    ...(plan !== undefined && { voiceAiPlan: String(plan) }),
+    ...(credits !== undefined && { voiceAiCredits: Math.max(0, Number(credits) || 0) }),
+  };
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: data,
+    create: { companyId, businessName: req.company?.name || "Nexwapi", ...data },
+  });
+  res.json({ enabled: s.voiceAiEnabled, plan: s.voiceAiPlan, credits: s.voiceAiCredits });
+}));
+
+router.get("/whatsapp-forms", asyncRoute(async (req, res) => {
+  const items = await prisma.whatsAppForm.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
+  res.json(items.map((f) => ({ ...f, createdAt: f.createdAt.getTime(), updatedAt: f.updatedAt.getTime() })));
+}));
+
+router.post("/whatsapp-forms", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { name, triggerKeyword, fields, thankYouMessage, enabled = true } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: "Form name is required" });
+  const f = await prisma.whatsAppForm.create({
+    data: {
+      companyId,
+      name: name.trim(),
+      triggerKeyword: triggerKeyword || "",
+      fields: Array.isArray(fields) ? fields : [],
+      thankYouMessage: thankYouMessage || "Thanks! We received your details.",
+      enabled: Boolean(enabled),
+    },
+  });
+  res.status(201).json({ ...f, createdAt: f.createdAt.getTime(), updatedAt: f.updatedAt.getTime() });
+}));
+
+router.patch("/whatsapp-forms/:id", async (req, res) => {
+  const existing = await prisma.whatsAppForm.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.sendStatus(404);
+  const { name, triggerKeyword, fields, thankYouMessage, enabled } = req.body || {};
+  const f = await prisma.whatsAppForm.update({
+    where: { id: existing.id },
+    data: {
+      ...(name !== undefined && { name }),
+      ...(triggerKeyword !== undefined && { triggerKeyword }),
+      ...(fields !== undefined && { fields }),
+      ...(thankYouMessage !== undefined && { thankYouMessage }),
+      ...(enabled !== undefined && { enabled }),
+    },
+  });
+  res.json({ ...f, createdAt: f.createdAt.getTime(), updatedAt: f.updatedAt.getTime() });
 });
 
-router.delete("/flows/:id", async (req, res) => {
-  try {
-    if (!(await otpGate(req, res, "flow_delete"))) return;
-    const existing = await prisma.flow.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
-    if (!existing) return res.sendStatus(404);
-    await prisma.contact.updateMany({ where: { activeFlowId: existing.id, ...tenantWhere(req) }, data: { activeFlowId: null, activeFlowStep: null } });
-    await prisma.flow.delete({ where: { id: existing.id } });
-    res.sendStatus(204);
-  } catch {
-    res.sendStatus(404);
-  }
+router.delete("/whatsapp-forms/:id", async (req, res) => {
+  const deleted = await prisma.whatsAppForm.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!deleted.count) return res.sendStatus(404);
+  res.sendStatus(204);
 });
+
+router.get("/interactive-lists", async (req, res) => {
+  const items = await prisma.interactiveList.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
+  res.json(items.map((l) => ({ ...l, createdAt: l.createdAt.getTime(), updatedAt: l.updatedAt.getTime() })));
+});
+
+router.post("/interactive-lists", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { name, header, body, footer, buttonText, sections, enabled = true } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: "List name is required" });
+  const l = await prisma.interactiveList.create({
+    data: {
+      companyId,
+      name: name.trim(),
+      header: header || "",
+      body: body || "",
+      footer: footer || "",
+      buttonText: buttonText || "View options",
+      sections: Array.isArray(sections) ? sections : [],
+      enabled: Boolean(enabled),
+    },
+  });
+  res.status(201).json({ ...l, createdAt: l.createdAt.getTime(), updatedAt: l.updatedAt.getTime() });
+}));
+
+router.patch("/interactive-lists/:id", async (req, res) => {
+  const existing = await prisma.interactiveList.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.sendStatus(404);
+  const { name, header, body, footer, buttonText, sections, enabled } = req.body || {};
+  const l = await prisma.interactiveList.update({
+    where: { id: existing.id },
+    data: {
+      ...(name !== undefined && { name }),
+      ...(header !== undefined && { header }),
+      ...(body !== undefined && { body }),
+      ...(footer !== undefined && { footer }),
+      ...(buttonText !== undefined && { buttonText }),
+      ...(sections !== undefined && { sections }),
+      ...(enabled !== undefined && { enabled }),
+    },
+  });
+  res.json({ ...l, createdAt: l.createdAt.getTime(), updatedAt: l.updatedAt.getTime() });
+});
+
+router.delete("/interactive-lists/:id", async (req, res) => {
+  const deleted = await prisma.interactiveList.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!deleted.count) return res.sendStatus(404);
+  res.sendStatus(204);
+});
+
+router.delete("/flows/:id", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  if (!(await otpGate(req, res, "flow_delete"))) return;
+  const existing = await prisma.flow.findFirst({ where: { id: req.params.id, companyId } });
+  if (!existing) return res.sendStatus(404);
+  await prisma.contact.updateMany({ where: { activeFlowId: existing.id, companyId }, data: { activeFlowId: null, activeFlowStep: null } });
+  await prisma.flow.delete({ where: { id: existing.id } });
+  res.sendStatus(204);
+}));
 
 /* ------------------------------ Settings ------------------------------- */
 router.get("/settings", async (req, res) => {
@@ -1733,6 +2506,10 @@ router.get("/settings", async (req, res) => {
   });
   res.json({
     ...s,
+    workingHoursSummary: formatWorkingHoursSummary(s),
+    workingHoursSlots: Array.isArray(s.workingHoursSlots) && s.workingHoursSlots.length
+      ? s.workingHoursSlots
+      : defaultWorkingHoursSlots(),
     whatsappConnected: Boolean(wa?.isConnected),
     whatsapp: wa
       ? {
@@ -2228,7 +3005,12 @@ router.post("/wallet/recharge", async (req, res) => {
 
 router.patch("/settings", async (req, res) => {
   const companyId = companyIdOf(req);
-  const { awayEnabled, awayMessage, hoursStart, hoursEnd, days, businessName, autoAssign, webhookUrl, csatEnabled, csatMessage } = req.body || {};
+  const {
+    awayEnabled, awayMessage, hoursStart, hoursEnd, days, businessName, autoAssign,
+    assignmentMode, assignOnlineOnly, webhookUrl, csatEnabled, csatMessage,
+    welcomeEnabled, welcomeMessage, delayedEnabled, delayedMinutes, delayedMessage,
+    customRepliesEnabled, workingHoursSlots,
+  } = req.body || {};
   const data = {
     ...(awayEnabled !== undefined && { awayEnabled }),
     ...(awayMessage !== undefined && { awayMessage }),
@@ -2237,16 +3019,35 @@ router.patch("/settings", async (req, res) => {
     ...(days !== undefined && { days }),
     ...(businessName !== undefined && { businessName }),
     ...(autoAssign !== undefined && { autoAssign }),
+    ...(assignmentMode !== undefined && { assignmentMode: String(assignmentMode) }),
+    ...(assignOnlineOnly !== undefined && { assignOnlineOnly: Boolean(assignOnlineOnly) }),
     ...(webhookUrl !== undefined && { webhookUrl }),
     ...(csatEnabled !== undefined && { csatEnabled }),
     ...(csatMessage !== undefined && { csatMessage }),
+    ...(welcomeEnabled !== undefined && { welcomeEnabled }),
+    ...(welcomeMessage !== undefined && { welcomeMessage }),
+    ...(delayedEnabled !== undefined && { delayedEnabled }),
+    ...(delayedMinutes !== undefined && { delayedMinutes: Math.max(1, Number(delayedMinutes) || 15) }),
+    ...(delayedMessage !== undefined && { delayedMessage }),
+    ...(customRepliesEnabled !== undefined && { customRepliesEnabled: Boolean(customRepliesEnabled) }),
+    ...(workingHoursSlots !== undefined && { workingHoursSlots }),
   };
+  if (Array.isArray(workingHoursSlots) && workingHoursSlots.length) {
+    const daySet = [...new Set(workingHoursSlots.map((s) => s.day).filter(Boolean))];
+    if (daySet.length) data.days = daySet;
+  }
   const s = await prisma.setting.upsert({
     where: { companyId },
     update: data,
     create: { companyId, businessName: req.company?.name || "Nexwapi", ...data },
   });
-  res.json(s);
+  res.json({
+    ...s,
+    workingHoursSummary: formatWorkingHoursSummary(s),
+    workingHoursSlots: Array.isArray(s.workingHoursSlots) && s.workingHoursSlots.length
+      ? s.workingHoursSlots
+      : defaultWorkingHoursSlots(),
+  });
 });
 
 /* ------------------------- Developer API keys -------------------------- */
@@ -2355,7 +3156,470 @@ router.get("/reports", async (req, res) => {
   });
 });
 
+function parseReportDateRange(preset, fromStr, toStr) {
+  const now = new Date();
+  const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+  const endOfDay = (d) => { const x = new Date(d); x.setHours(23, 59, 59, 999); return x; };
+  if (preset === "today") return { from: startOfDay(now), to: endOfDay(now) };
+  if (preset === "yesterday") {
+    const y = new Date(now); y.setDate(y.getDate() - 1);
+    return { from: startOfDay(y), to: endOfDay(y) };
+  }
+  if (preset === "last7") {
+    const f = new Date(now); f.setDate(f.getDate() - 6);
+    return { from: startOfDay(f), to: endOfDay(now) };
+  }
+  if (preset === "last30") {
+    const f = new Date(now); f.setDate(f.getDate() - 29);
+    return { from: startOfDay(f), to: endOfDay(now) };
+  }
+  const from = fromStr ? startOfDay(new Date(fromStr)) : null;
+  const to = toStr ? endOfDay(new Date(toStr)) : null;
+  return { from, to };
+}
+
+function csvEscape(v) {
+  return `"${String(v ?? "").replace(/"/g, '""')}"`;
+}
+
+function buildCampaignSummaryCsv(campaigns) {
+  const header = ["Campaign Name", "Template", "Audience", "Type", "Status", "Recipients", "Sent", "Delivered", "Read", "Replied", "Failed", "Delivery Rate %", "Read Rate %", "Created At", "Live At"];
+  const rows = campaigns.map((c) => {
+    const sent = c.sent || 0;
+    const delRate = sent ? Math.round(((c.delivered || 0) / sent) * 100) : 0;
+    const readRate = sent ? Math.round(((c.read || 0) / sent) * 100) : 0;
+    return [
+      c.name, c.template, c.audience, c.campaignType, c.status,
+      c.recipients, c.sent, c.delivered, c.read, c.replied, c.failed,
+      delRate, readRate,
+      c.createdAt ? new Date(c.createdAt).toISOString() : "",
+      c.liveAt ? new Date(c.liveAt).toISOString() : "",
+    ].map(csvEscape).join(",");
+  });
+  return [header.map(csvEscape).join(","), ...rows].join("\n");
+}
+
+async function buildCampaignDetailedCsv(campaigns, companyId, from, to) {
+  const summary = buildCampaignSummaryCsv(campaigns);
+  const atRange = {};
+  if (from) atRange.gte = from;
+  if (to) atRange.lte = to;
+  const messages = await prisma.message.findMany({
+    where: {
+      companyId,
+      type: "template",
+      direction: "out",
+      ...(Object.keys(atRange).length ? { at: atRange } : {}),
+    },
+    include: { contact: { select: { name: true, phone: true } } },
+    orderBy: { at: "desc" },
+    take: 5000,
+  });
+  const msgHeader = ["Contact Name", "Phone", "Message Status", "Sent At", "Message Preview"];
+  const msgRows = messages.map((m) =>
+    [m.contact?.name || "", m.contact?.phone || "", m.status, m.at.toISOString(), (m.text || "").slice(0, 120)]
+      .map(csvEscape).join(",")
+  );
+  return `${summary}\n\n--- Message Details ---\n${msgHeader.map(csvEscape).join(",")}\n${msgRows.join("\n")}`;
+}
+
+router.get("/reports/campaigns", async (req, res) => {
+  const campaigns = await prisma.campaign.findMany({
+    where: tenantWhere(req),
+    orderBy: { createdAt: "desc" },
+    select: { id: true, name: true, campaignType: true, category: true, status: true, createdAt: true },
+  });
+  res.json(campaigns.map((c) => ({ ...c, createdAt: c.createdAt.getTime() })));
+});
+
+router.post("/reports/campaign/email", async (req, res) => {
+  const { reportType = "summary", preset, from: fromStr, to: toStr, campaignType, campaignId } = req.body || {};
+  const validTypes = ["summary", "detailed", "ctwa"];
+  if (!validTypes.includes(reportType)) {
+    return res.status(400).json({ error: "reportType must be summary, detailed, or ctwa" });
+  }
+  const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { email: true, name: true } });
+  if (!user?.email) return res.status(400).json({ error: "No email on account" });
+
+  const { from, to } = parseReportDateRange(preset, fromStr, toStr);
+  const where = { ...tenantWhere(req) };
+  if (from || to) {
+    where.createdAt = { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) };
+  }
+  if (campaignType && campaignType !== "all") where.campaignType = campaignType;
+  if (campaignId && campaignId !== "all") where.id = campaignId;
+  if (reportType === "ctwa") where.category = { contains: "CTWA", mode: "insensitive" };
+
+  const campaigns = await prisma.campaign.findMany({ where, orderBy: { createdAt: "desc" } });
+  const companyId = companyIdOf(req);
+
+  let csv;
+  if (reportType === "detailed") {
+    csv = await buildCampaignDetailedCsv(campaigns, companyId, from, to);
+  } else {
+    csv = buildCampaignSummaryCsv(campaigns);
+    if (reportType === "ctwa" && campaigns.length === 0) {
+      csv = "Note: No CTWA campaigns found in this date range. Connect Meta Click-to-WhatsApp Ads to track ad-driven campaigns.\n" + csv;
+    }
+  }
+
+  const fromLabel = from ? from.toISOString().slice(0, 10) : "";
+  const toLabel = to ? to.toISOString().slice(0, 10) : "";
+
+  try {
+    const result = await sendCampaignReportEmail({
+      to: user.email,
+      reportType,
+      from: fromLabel,
+      toDate: toLabel,
+      csvContent: csv,
+      campaignCount: campaigns.length,
+    });
+    if (result.skipped) {
+      return res.status(503).json({
+        error: "Email not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS in backend .env",
+        dryRun: true,
+        campaignCount: campaigns.length,
+      });
+    }
+    res.json({ ok: true, email: user.email, campaignCount: campaigns.length });
+  } catch (e) {
+    res.status(502).json({ error: e.message || "Failed to send report email" });
+  }
+});
+
 /* ------------------------------ Analytics ------------------------------ */
+
+async function eventContactIds(companyId, event, from, to, tag) {
+  if (!event || event === "all") return null;
+  const contactFilter = { companyId };
+  if (tag && tag !== "all") contactFilter.tags = { has: tag };
+  const createdAt = {};
+  if (from) createdAt.gte = from;
+  if (to) createdAt.lte = to;
+  const at = { ...createdAt };
+
+  if (event === "phone_updated" || event === "flow_completed") {
+    const rows = await prisma.event.findMany({
+      where: {
+        type: event,
+        ...(Object.keys(createdAt).length ? { createdAt } : {}),
+        contact: contactFilter,
+      },
+      select: { contactId: true },
+    });
+    const ids = [...new Set(rows.map((r) => r.contactId))];
+    return ids.length ? ids : ["__none__"];
+  }
+  if (event === "notification_sent") {
+    const rows = await prisma.message.findMany({
+      where: {
+        companyId,
+        direction: "out",
+        type: "template",
+        ...(Object.keys(at).length ? { at } : {}),
+        ...(tag && tag !== "all" ? { contact: { tags: { has: tag } } } : {}),
+      },
+      select: { contactId: true },
+    });
+    const ids = [...new Set(rows.map((r) => r.contactId))];
+    return ids.length ? ids : ["__none__"];
+  }
+  if (event === "ctwa") {
+    const rows = await prisma.contact.findMany({
+      where: {
+        ...contactFilter,
+        OR: [
+          { tags: { hasSome: ["CTWA", "ctwa", "Click to WhatsApp"] } },
+          { attributes: { path: ["source"], equals: "ctwa" } },
+        ],
+      },
+      select: { id: true },
+    });
+    const ids = rows.map((r) => r.id);
+    return ids.length ? ids : ["__none__"];
+  }
+  if (event === "replied_notification") {
+    const outMsgs = await prisma.message.findMany({
+      where: {
+        companyId,
+        direction: "out",
+        type: "template",
+        ...(Object.keys(at).length ? { at } : {}),
+        ...(tag && tag !== "all" ? { contact: { tags: { has: tag } } } : {}),
+      },
+      select: { contactId: true, at: true },
+    });
+    const replied = new Set();
+    for (const out of outMsgs) {
+      const reply = await prisma.message.findFirst({
+        where: {
+          contactId: out.contactId,
+          direction: "in",
+          at: { gt: out.at },
+          ...(to ? { at: { lte: to } } : {}),
+        },
+      });
+      if (reply) replied.add(out.contactId);
+    }
+    const ids = [...replied];
+    return ids.length ? ids : ["__none__"];
+  }
+  return null;
+}
+
+async function computeChatAnalytics(companyId, { from, to, event, tag }) {
+  const contactWhere = { companyId };
+  if (tag && tag !== "all") contactWhere.tags = { has: tag };
+
+  let contactIds = tag && tag !== "all"
+    ? (await prisma.contact.findMany({ where: contactWhere, select: { id: true } })).map((c) => c.id)
+    : null;
+
+  const eventIds = await eventContactIds(companyId, event, from, to, tag);
+  if (eventIds) {
+    contactIds = contactIds
+      ? contactIds.filter((id) => eventIds.includes(id))
+      : eventIds;
+  }
+
+  const msgWhere = { companyId };
+  if (from || to) msgWhere.at = { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) };
+  if (contactIds) msgWhere.contactId = { in: contactIds.length ? contactIds : ["__none__"] };
+  if (event === "inbound") msgWhere.direction = "in";
+  else if (event === "outbound") msgWhere.direction = "out";
+  else if (event === "auto_reply") {
+    msgWhere.direction = "out";
+    msgWhere.senderUserId = null;
+  }
+
+  const [messages, contacts, automations] = await Promise.all([
+    prisma.message.findMany({
+      where: msgWhere,
+      orderBy: { at: "asc" },
+      include: { contact: { select: { id: true, name: true, chatStatus: true, tags: true, assignedAgentId: true, createdAt: true, assignedAgent: { select: { name: true } } } } },
+    }),
+    prisma.contact.findMany({ where: contactWhere, select: { id: true, chatStatus: true, createdAt: true, tags: true } }),
+    prisma.automation.count({ where: { companyId, enabled: true } }),
+  ]);
+
+  const openChats = contacts.filter((c) => c.chatStatus === "open").length;
+  const pendingChats = contacts.filter((c) => c.chatStatus === "pending").length;
+  const resolvedTotal = contacts.filter((c) => c.chatStatus === "resolved").length;
+
+  const inRange = (d) => {
+    const t = new Date(d).getTime();
+    if (from && t < from.getTime()) return false;
+    if (to && t > to.getTime()) return false;
+    return true;
+  };
+
+  const newConversations = contacts.filter((c) => inRange(c.createdAt)).length;
+  const inboundMessages = messages.filter((m) => m.direction === "in").length;
+  const outboundMessages = messages.filter((m) => m.direction === "out").length;
+
+  // Group messages by contact
+  const byContact = {};
+  for (const m of messages) {
+    if (!byContact[m.contactId]) byContact[m.contactId] = [];
+    byContact[m.contactId].push(m);
+  }
+
+  let delayedMessages = 0;
+  let autoReplies = 0;
+  let totalResponseMin = 0;
+  let responseCount = 0;
+  let closedWithoutResponse = 0;
+  let resolvedInPeriod = 0;
+  const DELAY_THRESHOLD_MS = 15 * 60 * 1000;
+
+  for (const cid of Object.keys(byContact)) {
+    const msgs = byContact[cid];
+    const contact = msgs[0]?.contact;
+    if (!contact) continue;
+
+    let hasAgentReply = false;
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i];
+      if (m.direction === "out" && !m.senderUserId) autoReplies++;
+      if (m.direction === "in") {
+        const nextOut = msgs.slice(i + 1).find((x) => x.direction === "out");
+        if (nextOut) {
+          hasAgentReply = true;
+          const diffMs = nextOut.at - m.at;
+          if (diffMs > DELAY_THRESHOLD_MS) delayedMessages++;
+          totalResponseMin += diffMs / 60000;
+          responseCount++;
+        } else if (event !== "outbound") {
+          const elapsed = to ? to.getTime() - m.at.getTime() : Date.now() - m.at.getTime();
+          if (elapsed > DELAY_THRESHOLD_MS) delayedMessages++;
+        }
+      }
+    }
+
+    if (contact.chatStatus === "resolved") {
+      const lastInRange = msgs.filter((m) => inRange(m.at));
+      if (lastInRange.length > 0) resolvedInPeriod++;
+      if (!hasAgentReply && msgs.some((m) => m.direction === "in")) closedWithoutResponse++;
+    }
+  }
+
+  if (event === "resolved") {
+    // When filtering by resolved event, zero out unrelated counts
+  }
+
+  const avgResponseMinutes = responseCount ? Math.round(totalResponseMin / responseCount) : null;
+
+  // Resolution time: first message to last message for resolved contacts
+  let totalResolutionMin = 0;
+  let resolutionCount = 0;
+  for (const cid of Object.keys(byContact)) {
+    const msgs = byContact[cid];
+    const contact = msgs[0]?.contact;
+    if (contact?.chatStatus !== "resolved" || msgs.length < 2) continue;
+    const first = msgs[0].at;
+    const last = msgs[msgs.length - 1].at;
+    totalResolutionMin += (last - first) / 60000;
+    resolutionCount++;
+  }
+  const avgResolutionMinutes = resolutionCount ? Math.round(totalResolutionMin / resolutionCount) : null;
+
+  // Daily chart buckets
+  const dayCount = from && to
+    ? Math.max(1, Math.ceil((to - from) / (24 * 60 * 60 * 1000)))
+    : 7;
+  const chartDays = Math.min(dayCount, 30);
+  const responseTimeChart = [];
+  const resolutionTimeChart = [];
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+  for (let i = chartDays - 1; i >= 0; i--) {
+    const d = to ? new Date(to) : new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - i);
+    const next = new Date(d);
+    next.setDate(next.getDate() + 1);
+    if (from && d < from) continue;
+
+    let dayRespTotal = 0, dayRespCount = 0, dayResTotal = 0, dayResCount = 0;
+
+    for (const cid of Object.keys(byContact)) {
+      const dayMsgs = byContact[cid].filter((m) => m.at >= d && m.at < next);
+      if (!dayMsgs.length) continue;
+      for (let j = 0; j < dayMsgs.length; j++) {
+        if (dayMsgs[j].direction === "in") {
+          const nextOut = byContact[cid].slice(byContact[cid].indexOf(dayMsgs[j]) + 1).find((x) => x.direction === "out");
+          if (nextOut) {
+            dayRespTotal += (nextOut.at - dayMsgs[j].at) / 60000;
+            dayRespCount++;
+          }
+        }
+      }
+      const contact = byContact[cid][0]?.contact;
+      if (contact?.chatStatus === "resolved" && dayMsgs.length >= 2) {
+        dayResTotal += (dayMsgs[dayMsgs.length - 1].at - dayMsgs[0].at) / 60000;
+        dayResCount++;
+      }
+    }
+
+    const label = chartDays <= 7 ? days[d.getDay()] : d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
+    responseTimeChart.push({ label, minutes: dayRespCount ? Math.round(dayRespTotal / dayRespCount) : 0 });
+    resolutionTimeChart.push({ label, minutes: dayResCount ? Math.round(dayResTotal / dayResCount) : 0 });
+  }
+
+  // Agent stats
+  const agentMap = {};
+  for (const m of messages.filter((x) => x.direction === "out" && x.senderName)) {
+    const name = m.senderName || "Agent";
+    if (!agentMap[name]) agentMap[name] = { name, responses: 0, totalMin: 0 };
+    agentMap[name].responses++;
+  }
+  const agents = await prisma.agent.findMany({ where: { companyId }, select: { id: true, name: true, color: true } });
+  const agentStats = await Promise.all(
+    agents.map(async (a) => ({
+      name: a.name,
+      color: a.color,
+      responses: agentMap[a.name]?.responses || 0,
+      assigned: await prisma.contact.count({ where: { companyId, assignedAgentId: a.id, chatStatus: { in: ["open", "pending"] } } }),
+      resolved: await prisma.contact.count({ where: { companyId, assignedAgentId: a.id, chatStatus: "resolved" } }),
+    }))
+  );
+
+  // Available tags (all company contacts)
+  const allContacts = await prisma.contact.findMany({ where: { companyId }, select: { tags: true } });
+  const tagSet = new Set();
+  allContacts.forEach((c) => (c.tags || []).forEach((t) => tagSet.add(t)));
+
+  const firstResponseRate = inboundMessages
+    ? Math.round((responseCount / Math.max(1, messages.filter((m) => m.direction === "in").length)) * 100)
+    : 0;
+
+  // Automation message counts by source
+  const autoWhere = {
+    companyId,
+    direction: "out",
+    automationSource: { not: null },
+    ...(from || to ? { at: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } : {}),
+    ...(contactIds ? { contactId: { in: contactIds.length ? contactIds : ["__none__"] } } : {}),
+  };
+  const autoGroups = await prisma.message.groupBy({
+    by: ["automationSource"],
+    where: autoWhere,
+    _count: { _all: true },
+  });
+  const autoCount = (src) => autoGroups.find((g) => g.automationSource === src)?._count._all || 0;
+  const automationMessages = {
+    outOfOffice: autoCount("away"),
+    welcome: autoCount("welcome"),
+    delayed: autoCount("delayed"),
+    workflow: autoCount("workflow"),
+    customReply: autoCount("custom_reply"),
+  };
+
+  return {
+    kpis: {
+      newConversations,
+      openChats,
+      pendingChats,
+      resolved: event === "resolved" ? resolvedInPeriod : resolvedTotal,
+      resolvedInPeriod,
+      closedWithoutResponse,
+      delayedMessages,
+      autoReplies,
+      avgResponseMinutes,
+      avgResolutionMinutes,
+      inboundMessages,
+      outboundMessages,
+      firstResponseRate,
+      activeAutomations: automations,
+    },
+    automationMessages,
+    responseTimeChart,
+    resolutionTimeChart,
+    agentStats,
+    availableTags: Array.from(tagSet).sort(),
+  };
+}
+
+router.get("/analytics/chat", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const { preset, from: fromStr, to: toStr, event = "all", tag = "all" } = req.query;
+  const { from, to } = parseReportDateRange(preset || "last7", fromStr, toStr);
+  try {
+    const data = await computeChatAnalytics(companyId, { from, to, event, tag });
+    res.json({
+      ...data,
+      range: {
+        preset: preset || "last7",
+        from: from ? from.toISOString().slice(0, 10) : null,
+        to: to ? to.toISOString().slice(0, 10) : null,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message || "Failed to load chat analytics" });
+  }
+});
+
 router.get("/analytics", async (req, res) => {
   const tw = tenantWhere(req);
   const companyId = companyIdOf(req);
@@ -2546,6 +3810,12 @@ router.post("/tickets", async (req, res) => {
     href: "/dashboard/support",
   }).catch(() => {});
   res.status(201).json(serializeTicket(ticket));
+});
+
+router.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  console.error("[api]", err?.message || err);
+  res.status(500).json({ error: err?.message || "Server error" });
 });
 
 export default router;

@@ -1,6 +1,7 @@
 // routes/superAdmin.js — platform Super Admin APIs
 import express from "express";
 import { prisma } from "../lib/prisma.js";
+import { buildSegmentContactWhere } from "../lib/segmentFilters.js";
 import { requireAuth, requireSuperAdmin, signImpersonationToken, hashPassword } from "../lib/auth.js";
 import { publicCompanyUser, uniqueSlug } from "../lib/tenant.js";
 import { createAgentSeat, ensureOwnerAgent } from "../lib/teamSeats.js";
@@ -16,7 +17,10 @@ import {
   fetchBusinessProfile, updateBusinessProfile, uploadProfilePicture, VERTICALS, platformWaCreds,
 } from "../lib/waBusinessProfile.js";
 
+import { patchAsyncRouter } from "../lib/asyncRouter.js";
+
 const router = express.Router();
+patchAsyncRouter(router);
 router.use(requireAuth, requireSuperAdmin);
 router.use(async (req, res, next) => {
   try {
@@ -1114,6 +1118,19 @@ router.patch("/templates/:id", async (req, res) => {
     where: { id: req.params.id },
     data: { status },
   });
+  // Notify company owner about approval/rejection
+  if (status === "approved" || status === "rejected") {
+    const msg = status === "approved"
+      ? `✅ Your template "${template.name}" has been approved! You can now use it in campaigns.`
+      : `❌ Your template "${template.name}" was rejected.${req.body?.reason ? " Reason: " + req.body.reason : ""} Please review and resubmit.`;
+    notify({
+      audience: "client",
+      companyId: template.companyId,
+      title: `Template ${status}`,
+      body: msg,
+      href: "/dashboard/templates",
+    }).catch(() => {});
+  }
   await prisma.auditLog.create({
     data: {
       companyId: template.companyId,
@@ -1121,10 +1138,49 @@ router.patch("/templates/:id", async (req, res) => {
       action: "template_" + status,
       entity: "Template",
       entityId: template.id,
-      meta: { name: template.name, status },
+      meta: { name: template.name, status, reason: req.body?.reason || null },
     },
   }).catch(() => {});
-  res.json(template);
+  res.json({ ...template, createdAt: template.createdAt.getTime() });
+});
+
+/* ---- Admin: Segments overview ---- */
+router.get("/segments", async (_req, res) => {
+  const segments = await prisma.segment.findMany({
+    orderBy: { createdAt: "desc" },
+    take: 500,
+    include: { company: { select: { name: true, email: true } } },
+  });
+  const withCounts = await Promise.all(
+    segments.map(async (s) => {
+      const contactWhere = buildSegmentContactWhere(s, s.companyId);
+      const count = await prisma.contact.count({ where: contactWhere });
+      return {
+        id: s.id,
+        name: s.name,
+        description: s.description,
+        companyId: s.companyId,
+        companyName: s.company?.name || "—",
+        companyEmail: s.company?.email || "—",
+        tags: s.tags,
+        filters: s.filters,
+        whatsappOnly: s.whatsappOnly,
+        count,
+        createdAt: s.createdAt.getTime(),
+        updatedAt: s.updatedAt?.getTime?.() || s.createdAt.getTime(),
+      };
+    })
+  );
+  res.json(withCounts);
+});
+
+router.delete("/segments/:id", async (req, res) => {
+  try {
+    await prisma.segment.delete({ where: { id: req.params.id } });
+    res.sendStatus(204);
+  } catch {
+    res.sendStatus(404);
+  }
 });
 
 router.get("/sales-leads", async (_req, res) => {
@@ -1376,6 +1432,89 @@ router.delete("/users/:id", async (req, res) => {
     data: { userId: req.user.id, action: "user_delete", entity: "User", entityId: target.id, meta: { email: target.email } },
   }).catch(() => {});
   res.json({ ok: true });
+});
+
+/* ─────────────────────────── Admin: Campaigns ─────────────────────────── */
+
+function serializeAdminCampaign(c) {
+  return {
+    ...c,
+    createdAt: c.createdAt instanceof Date ? c.createdAt.getTime() : c.createdAt,
+    scheduledAt: c.scheduledAt instanceof Date ? c.scheduledAt.getTime() : (c.scheduledAt || null),
+    liveAt: c.liveAt instanceof Date ? c.liveAt.getTime() : (c.liveAt || null),
+    companyName: c.company?.name || "—",
+    companyEmail: c.company?.email || "—",
+  };
+}
+
+// GET /admin/campaigns — list all campaigns across all tenants
+router.get("/campaigns", async (req, res) => {
+  const { status, companyId, q, limit = "50", offset = "0" } = req.query;
+  const where = {};
+  if (status) where.status = status;
+  if (companyId) where.companyId = companyId;
+  if (q) where.name = { contains: q, mode: "insensitive" };
+
+  const [total, campaigns] = await Promise.all([
+    prisma.campaign.count({ where }),
+    prisma.campaign.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: parseInt(limit),
+      skip: parseInt(offset),
+      include: { company: { select: { id: true, name: true, email: true } } },
+    }),
+  ]);
+  res.json({ total, campaigns: campaigns.map(serializeAdminCampaign) });
+});
+
+// GET /admin/campaigns/:id
+router.get("/campaigns/:id", async (req, res) => {
+  const c = await prisma.campaign.findUnique({
+    where: { id: req.params.id },
+    include: { company: { select: { id: true, name: true, email: true } } },
+  });
+  if (!c) return res.sendStatus(404);
+  res.json(serializeAdminCampaign(c));
+});
+
+// PATCH /admin/campaigns/:id — admin can pause, cancel, or resume any campaign
+router.patch("/campaigns/:id", async (req, res) => {
+  const { status, note } = req.body || {};
+  const allowed = ["scheduled", "paused", "cancelled", "running", "completed"];
+  if (!allowed.includes(status)) return res.status(400).json({ error: "Invalid status" });
+  const c = await prisma.campaign.findUnique({ where: { id: req.params.id } });
+  if (!c) return res.sendStatus(404);
+  const updated = await prisma.campaign.update({
+    where: { id: req.params.id },
+    data: { status },
+    include: { company: { select: { id: true, name: true, email: true } } },
+  });
+  // Notify company owner
+  if (note) {
+    const owner = await prisma.user.findFirst({
+      where: { companyId: c.companyId, role: { in: ["OWNER", "ADMIN"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (owner) {
+      await notify({ userId: owner.id, companyId: c.companyId, type: "campaign_status", message: `Your campaign "${c.name}" was marked ${status} by admin.${note ? " Note: " + note : ""}` }).catch(() => {});
+    }
+  }
+  res.json(serializeAdminCampaign(updated));
+});
+
+// DELETE /admin/campaigns/:id
+router.delete("/campaigns/:id", async (req, res) => {
+  const c = await prisma.campaign.findUnique({ where: { id: req.params.id } });
+  if (!c) return res.sendStatus(404);
+  await prisma.campaign.delete({ where: { id: req.params.id } });
+  res.json({ ok: true });
+});
+
+router.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  console.error("[super-admin]", err?.message || err);
+  res.status(500).json({ error: err?.message || "Server error" });
 });
 
 export default router;

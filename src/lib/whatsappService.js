@@ -238,6 +238,22 @@ export async function getCompanyCreds(companyId) {
   };
 }
 
+/** Tenant creds first; fall back to platform Meta env when live (for admin / unconnected clients). */
+export async function getEffectiveCreds(companyId) {
+  const tenant = await getCompanyCreds(companyId);
+  if (tenant?.incomplete) return tenant;
+  if (tenant?.phoneNumberId && tenant?.accessToken && tenant?.wabaId) return tenant;
+  if (WA_LIVE && WA.phoneNumberId && WA.accessToken && WA.wabaId) {
+    return {
+      phoneNumberId: WA.phoneNumberId,
+      accessToken: WA.accessToken,
+      wabaId: WA.wabaId,
+      platformFallback: true,
+    };
+  }
+  return tenant;
+}
+
 /** Throw a clear 400-style error when tenant WhatsApp is only partially connected. */
 export function assertLiveCreds(creds) {
   if (creds?.incomplete) {

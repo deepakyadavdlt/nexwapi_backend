@@ -76,7 +76,7 @@ function wrap(title, bodyHtml) {
   </div></body></html>`;
 }
 
-export async function sendMail({ to, subject, html, text }) {
+export async function sendMail({ to, subject, html, text, attachments }) {
   if (!to) return { skipped: true };
   if (!mailConfigured()) {
     console.log(`[mail:dry-run] to=${to} subject=${subject}\n${text || ""}`);
@@ -90,6 +90,7 @@ export async function sendMail({ to, subject, html, text }) {
     subject,
     html,
     text: text || subject,
+    ...(attachments?.length ? { attachments } : {}),
   };
 
   const profiles = transportProfiles();
@@ -221,6 +222,34 @@ export async function sendCampaignStatus(to, name, status) {
     subject: `Campaign "${name}" ${status}`,
     html: wrap("Campaign update", `<p>Campaign <b>${name}</b> is now <b>${status}</b>.</p>
       <p><a href="${APP_URL}/dashboard/campaigns">Open campaigns</a></p>`),
+  });
+}
+
+/** Email a generated campaign report CSV to the user. */
+export async function sendCampaignReportEmail({ to, reportType, from, toDate, csvContent, campaignCount }) {
+  const labels = {
+    summary: "Campaign Summary Report",
+    detailed: "Campaign Detailed Report",
+    ctwa: "CTWA Ad Campaign Detailed Report",
+  };
+  const title = labels[reportType] || "Campaign Report";
+  const range = from && toDate ? `${from} to ${toDate}` : "All time";
+  return sendMail({
+    to,
+    subject: `Nexwapi ${title} — ${range}`,
+    html: wrap(title, `
+      <p>Your <b>${title}</b> is ready.</p>
+      <p>Date range: <b>${range}</b></p>
+      <p>Campaigns included: <b>${campaignCount}</b></p>
+      <p>The report is attached as a CSV file. Open it in Excel or Google Sheets.</p>
+      <p><a href="${APP_URL}/dashboard/reports" style="color:#00735c;font-weight:700">View reports dashboard</a></p>
+    `),
+    text: `${title} for ${range}. ${campaignCount} campaigns. See attached CSV.`,
+    attachments: [{
+      filename: `nexwapi-${reportType}-report-${from || "all"}${toDate ? `-to-${toDate}` : ""}.csv`,
+      content: csvContent,
+      contentType: "text/csv",
+    }],
   });
 }
 

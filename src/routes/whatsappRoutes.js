@@ -9,9 +9,13 @@ import path from "path";
 import { WA } from "../config/whatsapp.js";
 import { prisma, pickColor } from "../lib/prisma.js";
 import { sendText, sendButtons, fetchInboundMedia, getCompanyCreds, assertLiveCreds } from "../lib/whatsappService.js";
-import { fireEvent } from "../lib/events.js";
+import { fireEvent, logActivity } from "../lib/events.js";
 import { digitsOnly, findCompanyContactByPhone, looksLikePhone } from "../lib/phone.js";
 import { notify } from "../lib/notify.js";
+import { assignContactToAgent } from "../lib/assignmentEngine.js";
+import { maybeWelcome, maybeAway } from "../lib/inboxAutomations.js";
+import { buildTriggerCatalog, matchIntent } from "../lib/intentMatcher.js";
+import { maybeAiAgentReply } from "../lib/aiAgent.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
 const EXT = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf", "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3" };
@@ -51,12 +55,16 @@ async function resolveCompanyId(value) {
     });
     if (acct?.companyId) return acct.companyId;
   }
-  // Demo / single-tenant fallback: first active company
-  const co = await prisma.company.findFirst({
-    where: { status: { in: ["TRIAL", "ACTIVE"] } },
-    orderBy: { createdAt: "asc" },
-  });
-  return co?.id || null;
+  // Platform number fallback only when it matches env phoneNumberId
+  if (phoneNumberId && WA.phoneNumberId && String(phoneNumberId) === String(WA.phoneNumberId)) {
+    const co = await prisma.company.findFirst({
+      where: { status: { in: ["TRIAL", "ACTIVE"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    return co?.id || null;
+  }
+  console.warn("[webhook] unmatched phone_number_id:", phoneNumberId);
+  return null;
 }
 
 function keywordHit(lc, keyword) {
@@ -70,77 +78,31 @@ function keywordHit(lc, keyword) {
 }
 
 async function findAutoReply(text, companyId) {
+  const s = await prisma.setting.findUnique({ where: { companyId } }).catch(() => null);
+  if (s && s.customRepliesEnabled === false) return null;
   const autos = await prisma.automation.findMany({
     where: { enabled: true, ...(companyId ? { companyId } : {}) },
     orderBy: { createdAt: "asc" },
+  });
+  // Specific keyword rules before catch-all "any message" rules
+  autos.sort((a, b) => {
+    if (a.matchType === "any" && b.matchType !== "any") return 1;
+    if (b.matchType === "any" && a.matchType !== "any") return -1;
+    return 0;
   });
   const lc = (text || "").trim().toLowerCase();
   return autos.find((a) => {
     if (a.matchType === "any") return true;
     if (!a.keyword) return false;
-    const k = a.keyword.trim().toLowerCase();
-    return a.matchType === "exact" ? lc === k : keywordHit(lc, k);
+    const keys = a.keyword.split(",").map((k) => k.trim().toLowerCase()).filter(Boolean);
+    if (!keys.length) return false;
+    if (a.matchType === "exact") return keys.some((k) => lc === k);
+    return keys.some((k) => keywordHit(lc, k));
   });
 }
 
 async function autoAssignIfNeeded(contact, companyId, { force = false } = {}) {
-  if (!force && contact.assignedAgentId && contact.chatStatus !== "resolved") {
-    return contact.assignedAgentId;
-  }
-  const s = await prisma.setting.findUnique({ where: { companyId } }).catch(() => null);
-  if (s && s.autoAssign === false) return null;
-  const agents = await prisma.agent.findMany({ where: { companyId } });
-  if (!agents.length) return null;
-  const loads = await Promise.all(
-    agents.map(async (a) => ({
-      id: a.id,
-      name: a.name,
-      n: await prisma.contact.count({
-        where: { assignedAgentId: a.id, companyId, chatStatus: { in: ["open", "pending"] } },
-      }),
-    }))
-  );
-  loads.sort((a, b) => a.n - b.n);
-  const pick = loads[0];
-  await prisma.contact.update({
-    where: { id: contact.id },
-    data: { assignedAgentId: pick.id, chatStatus: "open" },
-  });
-  console.log("[wa] auto-assigned", contact.phone, "->", pick.name, "open load", pick.n);
-  return pick.id;
-}
-
-async function maybeAway(contact, companyId) {
-  const s = await prisma.setting.findUnique({ where: { companyId } }).catch(() => null);
-  if (!s?.awayEnabled) return;
-  const now = new Date();
-  const day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][now.getDay()];
-  const hour = now.getHours();
-  const open = s.days.includes(day) && hour >= s.hoursStart && hour < s.hoursEnd;
-  if (open) return;
-  const recentOut = await prisma.message.findFirst({
-    where: { contactId: contact.id, direction: "out", at: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
-  });
-  if (recentOut) return;
-  try {
-    const r = await outboundChargeAndSend(companyId, contact.phone, (creds) =>
-      sendText(contact.phone, s.awayMessage, creds)
-    , { channel: "away" });
-    await prisma.message.create({
-      data: {
-        companyId,
-        waId: r.messages?.[0]?.id || null,
-        contactId: contact.id,
-        direction: "out",
-        type: "text",
-        text: s.awayMessage,
-        status: "sent",
-      },
-    });
-    console.log("[wa] away message sent to", contact.phone);
-  } catch (e) {
-    console.error("[wa] away failed:", e.message);
-  }
+  return assignContactToAgent(contact, companyId, { force });
 }
 
 /* --------------------------- Chatbot flow engine --------------------------- */
@@ -190,13 +152,16 @@ async function sendStep(contact, flow, step, companyId) {
       type: buttons.length ? "interactive" : "text",
       text: step.message,
       status: "sent",
+      automationSource: "workflow",
     },
   });
   const waiting = buttons.length > 0 || Boolean(step.capture?.field) || (step.conditions?.length > 0);
+  const done = !waiting && !step.apiCall?.next;
   await prisma.contact.update({
     where: { id: contact.id },
     data: waiting ? { activeFlowId: flow.id, activeFlowStep: step.id } : { activeFlowId: null, activeFlowStep: null },
   });
+  if (done) logActivity(contact.id, "flow_completed", flow.name || "Workflow");
 }
 
 async function runChatbot(contact, m, text, companyId) {
@@ -227,6 +192,7 @@ async function runChatbot(contact, m, text, companyId) {
       const next = nextId ? flow.steps.find((s) => s.id === nextId) : null;
       if (next) { await sendStep(contact, flow, next, cid); return true; }
       await prisma.contact.update({ where: { id: contact.id }, data: { activeFlowId: null, activeFlowStep: null } });
+      logActivity(contact.id, "flow_completed", flow.name || "Workflow");
     }
   }
 
@@ -234,7 +200,11 @@ async function runChatbot(contact, m, text, companyId) {
   for (const flow of flows) {
     if (!Array.isArray(flow.steps) || !flow.steps.length) continue;
     const match = flow.triggerType === "any" || keywordHit(lc, flow.trigger);
-    if (match) { await sendStep(contact, flow, flow.steps[0], cid); return true; }
+    if (match) {
+      await sendStep(contact, flow, flow.steps[0], cid);
+      await prisma.flow.update({ where: { id: flow.id }, data: { sentCount: { increment: 1 } } }).catch(() => {});
+      return true;
+    }
   }
   return false;
 }
@@ -339,6 +309,7 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
 
         for (const m of value.messages || []) {
           const phone = digitsOnly(m.from);
+          let isNewContact = false;
           let contact = await findCompanyContactByPhone(prisma, companyId, phone);
           if (contact) {
             const betterName = profileName && !looksLikePhone(profileName) ? profileName : null;
@@ -346,6 +317,7 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
               contact = await prisma.contact.update({ where: { id: contact.id }, data: { name: betterName } });
             }
           } else {
+            isNewContact = true;
             const count = await prisma.contact.count({ where: { companyId } });
             const name = profileName && !looksLikePhone(profileName) ? profileName : `+${phone}`;
             contact = await prisma.contact.create({
@@ -397,7 +369,17 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             href: "/dashboard/inbox",
           }).catch(() => {});
           const force = contact.chatStatus === "resolved" || !contact.assignedAgentId;
-          await autoAssignIfNeeded(contact, companyId, { force }).catch(() => {});
+          const assignedId = await autoAssignIfNeeded(contact, companyId, { force }).catch(() => null);
+          if (assignedId) {
+            contact = await prisma.contact.findUnique({ where: { id: contact.id } }) || contact;
+          }
+
+          // Reset delayed-reply flag so scheduler can fire again for this unanswered message
+          if (contact.attributes?.delayed_reply_sent_at) {
+            const attrs = { ...(contact.attributes || {}) };
+            delete attrs.delayed_reply_sent_at;
+            contact = await prisma.contact.update({ where: { id: contact.id }, data: { attributes: attrs } });
+          }
 
           const btnId0 = m.interactive?.button_reply?.id;
           if (btnId0?.startsWith("csat:")) {
@@ -426,6 +408,22 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
 
           let handled = false;
           try {
+            handled = await maybeWelcome(contact, companyId, { isNewContact });
+            if (handled) console.log("[wa] welcome sent", m.from);
+          } catch (e) {
+            console.error("[wa] welcome error:", e.message);
+          }
+          if (handled) continue;
+
+          try {
+            handled = await maybeAway(contact, companyId);
+            if (handled) console.log("[wa] OOO sent", m.from);
+          } catch (e) {
+            console.error("[wa] OOO error:", e.message);
+          }
+          if (handled) continue;
+
+          try {
             handled = await runChatbot(contact, m, bodyText, companyId);
             if (handled) console.log("[wa] chatbot handled", m.from);
           } catch (e) {
@@ -448,14 +446,48 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
                   type: "text",
                   text: auto.reply,
                   status: "sent",
+                  automationSource: "custom_reply",
                 },
               });
+              await prisma.automation.update({
+                where: { id: auto.id },
+                data: { sentCount: { increment: 1 } },
+              }).catch(() => {});
               console.log(`[wa] auto-replied (${auto.name}) to`, m.from);
             } catch (e) {
               console.error("[wa] auto-reply failed:", e.message);
             }
           } else {
-            await maybeAway(contact, companyId);
+            const setting = await prisma.setting.findUnique({ where: { companyId } }).catch(() => null);
+            let intentHandled = false;
+            if (setting?.intentMatchingEnabled) {
+              const [autos, flows] = await Promise.all([
+                prisma.automation.findMany({ where: { enabled: true, companyId } }),
+                prisma.flow.findMany({ where: { enabled: true, companyId } }),
+              ]);
+              const match = matchIntent(bodyText, buildTriggerCatalog(autos, flows));
+              if (match?.type === "automation") {
+                try {
+                  const r = await outboundChargeAndSend(companyId, m.from, (creds) =>
+                    sendText(m.from, match.payload.reply, creds)
+                  , { channel: "intent", automationId: match.id });
+                  await prisma.message.create({
+                    data: { companyId, waId: r.messages?.[0]?.id || null, contactId: contact.id, direction: "out", type: "text", text: match.payload.reply, status: "sent", automationSource: "custom_reply" },
+                  });
+                  await prisma.automation.update({ where: { id: match.id }, data: { sentCount: { increment: 1 } } }).catch(() => {});
+                  intentHandled = true;
+                  console.log(`[wa] intent matched automation (${match.name})`);
+                } catch (e) { console.error("[wa] intent automation failed:", e.message); }
+              } else if (match?.type === "flow" && match.payload.steps?.[0]) {
+                await sendStep(contact, match.payload, match.payload.steps[0], companyId);
+                await prisma.flow.update({ where: { id: match.id }, data: { sentCount: { increment: 1 } } }).catch(() => {});
+                intentHandled = true;
+                console.log(`[wa] intent matched flow (${match.name})`);
+              }
+            }
+            if (!intentHandled) {
+              await maybeAiAgentReply(contact, bodyText, companyId);
+            }
           }
         }
         }

@@ -67,10 +67,13 @@ model Company {
   campaigns        Campaign[]
   automations      Automation[]
   flows            Flow[]
+  whatsAppForms    WhatsAppForm[]
+  interactiveLists InteractiveList[]
   drips            Drip[]
   segments         Segment[]
   products         Product[]
   labels           Label[]
+  assignmentRules  AssignmentRule[]
   apiKeys          ApiKey[]
   setting          Setting?
   couponsRedemptions CouponRedemption[]
@@ -340,9 +343,10 @@ model Agent {
   company   Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
   name      String
   email     String
-  role      String    @default("Agent")
-  color     String    @default("#25D366")
-  createdAt DateTime  @default(now())
+  role         String    @default("Agent")
+  color        String    @default("#25D366")
+  availability String    @default("online") // online | away | offline
+  createdAt    DateTime  @default(now())
   contacts  Contact[]
 
   @@unique([companyId, email])
@@ -366,6 +370,8 @@ model Contact {
   company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
   name            String
   phone           String
+  email           String?
+  userId          String?
   tags            String[]  @default([])
   optedIn         Boolean   @default(true)
   color           String    @default("#25D366")
@@ -433,13 +439,17 @@ model DripEnrollment {
 }
 
 model Segment {
-  id        String   @id @default(cuid())
-  companyId String
-  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  name      String
-  tags      String[] @default([])
-  match     String   @default("any")
-  createdAt DateTime @default(now())
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  tags        String[] @default([])
+  match       String   @default("any")
+  filters     Json?    // { type: "tags"|"fields"|"events", conditions: [...] }
+  whatsappOnly Boolean @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   @@index([companyId])
 }
@@ -467,11 +477,49 @@ model Setting {
   hoursEnd     Int      @default(18)
   days         String[] @default(["Mon", "Tue", "Wed", "Thu", "Fri"])
   businessName String   @default("Nexwapi")
-  autoAssign   Boolean  @default(true)
-  webhookUrl   String   @default("")
+  autoAssign         Boolean  @default(true)
+  assignmentMode     String   @default("load_balance") // none | round_robin | load_balance
+  assignOnlineOnly   Boolean  @default(false)
+  roundRobinIndex    Int      @default(0)
+  welcomeEnabled     Boolean  @default(false)
+  welcomeMessage     String   @default("Hi! Thanks for reaching out. How can we help you today?")
+  delayedEnabled     Boolean  @default(false)
+  delayedMinutes     Int      @default(15)
+  delayedMessage     String   @default("Thanks for your patience! A team member will reply shortly.")
+  customRepliesEnabled Boolean @default(true)
+  workingHoursSlots  Json?
+  intentMatchingEnabled Boolean @default(false)
+  flowFollowUpEnabled   Boolean @default(false)
+  flowFollowUpMinutes   Int     @default(30)
+  flowFollowUpMessage   String  @default("Hi! Just checking in — would you like to continue?")
+  flowIdleTimeoutMinutes Int    @default(60)
+  aiAgentEnabled        Boolean @default(false)
+  aiAgentWebsiteUrl     String  @default("")
+  aiAgentKnowledge      Json?
+  aiAgentGreeting       String  @default("Hi! I'm the Nexwapi assistant. How can I help?")
+  voiceAiEnabled        Boolean @default(false)
+  voiceAiPlan           String  @default("business")
+  voiceAiCredits        Int     @default(100)
+  webhookUrl         String   @default("")
   csatEnabled  Boolean  @default(false)
   csatMessage  String   @default("Thanks for chatting with us! How would you rate your experience?")
   updatedAt    DateTime @updatedAt
+}
+
+model AssignmentRule {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name      String
+  trait     String
+  condition String   @default("contains")
+  values    String[] @default([])
+  agentIds  String[] @default([])
+  enabled   Boolean  @default(true)
+  priority  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([companyId])
 }
 
 model ApiKey {
@@ -497,7 +545,43 @@ model Flow {
   trigger     String   @default("")
   enabled     Boolean  @default(true)
   steps       Json     @default("[]")
+  sentCount   Int      @default(0)
   createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@index([companyId])
+}
+
+model WhatsAppForm {
+  id           String   @id @default(cuid())
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name         String
+  triggerKeyword String @default("")
+  fields       Json     @default("[]")
+  thankYouMessage String @default("Thanks! We received your details.")
+  enabled      Boolean  @default(true)
+  submissionCount Int   @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([companyId])
+}
+
+model InteractiveList {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name      String
+  header    String   @default("")
+  body      String   @default("")
+  footer    String   @default("")
+  buttonText String  @default("View options")
+  sections  Json     @default("[]")
+  enabled   Boolean  @default(true)
+  sentCount Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([companyId])
 }
@@ -517,6 +601,7 @@ model Message {
   status    String   @default("sent")
   senderName String?
   senderUserId String?
+  automationSource String?
   at        DateTime @default(now())
 
   @@index([contactId])
@@ -524,20 +609,22 @@ model Message {
 }
 
 model Template {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   companyId String
-  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  company   Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
   name      String
-  category  String   @default("Utility")
-  language  String   @default("en")
-  status    String   @default("pending")
+  category  String    @default("Utility")
+  language  String    @default("en")
+  status    String    @default("pending")
   body      String
-  format    String   @default("text")
+  format    String    @default("text")
   cards     Json?
-  createdAt DateTime @default(now())
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
 
   @@unique([companyId, name])
   @@index([companyId])
+  @@index([deletedAt])
 }
 
 model QuickReply {
@@ -559,26 +646,33 @@ model Automation {
   matchType String   @default("contains")
   reply     String
   enabled   Boolean  @default(true)
+  sentCount Int      @default(0)
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([companyId])
 }
 
 model Campaign {
-  id          String    @id @default(cuid())
-  companyId   String
-  company     Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  name        String
-  template    String
-  audience    String    @default("All contacts")
-  recipients  Int       @default(0)
-  sent        Int       @default(0)
-  delivered   Int       @default(0)
-  read        Int       @default(0)
-  replied     Int       @default(0)
-  status      String    @default("scheduled")
-  scheduledAt DateTime?
-  createdAt   DateTime  @default(now())
+  id            String    @id @default(cuid())
+  companyId     String
+  company       Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name          String
+  template      String
+  audience      String    @default("All contacts")
+  recipients    Int       @default(0)
+  sent          Int       @default(0)
+  delivered     Int       @default(0)
+  read          Int       @default(0)
+  replied       Int       @default(0)
+  failed        Int       @default(0)
+  status        String    @default("scheduled")
+  campaignType  String    @default("onetime")
+  category      String?
+  scheduledAt   DateTime?
+  liveAt        DateTime?
+  createdAt     DateTime  @default(now())
 
   @@index([companyId])
+  @@index([status])
 }

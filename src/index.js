@@ -99,10 +99,18 @@ ensureDatabaseReady()
   });
 
 // Scheduler: every 30s, run due scheduled campaigns and drip-campaign steps.
-Promise.all([import("./lib/campaignRunner.js"), import("./lib/dripRunner.js"), import("./lib/lifecycleEmails.js")]).then(([cr, dr, life]) => {
+Promise.all([
+  import("./lib/campaignRunner.js"),
+  import("./lib/dripRunner.js"),
+  import("./lib/lifecycleEmails.js"),
+  import("./lib/delayedReplyRunner.js"),
+  import("./lib/flowRunner.js"),
+]).then(([cr, dr, life, delayed, flow]) => {
   setInterval(() => {
     cr.runDueCampaigns().catch(() => {});
     dr.runDueDrips().catch(() => {});
+    delayed.runDelayedReplies().catch(() => {});
+    flow.runFlowMaintenance().catch(() => {});
   }, 30 * 1000);
   setInterval(() => life.runLifecycleEmails().catch(() => {}), 60 * 60 * 1000);
   setTimeout(() => life.runLifecycleEmails().catch(() => {}), 15 * 1000);

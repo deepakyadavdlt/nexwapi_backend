@@ -1,6 +1,7 @@
 // lib/campaignRunner.js — runs a broadcast campaign (used by the API route and the scheduler).
 import { prisma } from "./prisma.js";
 import { sendTemplate, sendTemplateWithParams } from "./whatsappService.js";
+import { buildSegmentContactWhere } from "./segmentFilters.js";
 
 // Build the contact filter for a campaign audience: "All contacts", "Tag: x", or "Segment: name".
 export async function resolveAudience(audience, companyId) {
@@ -10,7 +11,12 @@ export async function resolveAudience(audience, companyId) {
   if (/^segment:/i.test(audience)) {
     const name = audience.replace(/^segment:\s*/i, "").trim();
     const seg = await prisma.segment.findFirst({ where: { name, ...(companyId ? { companyId } : {}) } });
-    if (seg?.tags?.length) where.tags = seg.match === "all" ? { hasEvery: seg.tags } : { hasSome: seg.tags };
+    if (seg) return buildSegmentContactWhere(seg, companyId);
+    return where;
+  }
+  if (/^contacts:/i.test(audience)) {
+    const ids = audience.replace(/^contacts:\s*/i, "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (ids.length) return { ...where, id: { in: ids } };
     return where;
   }
   where.tags = { has: audience.replace(/^tag:\s*/i, "").trim() };
@@ -53,9 +59,9 @@ export async function runCampaign(id) {
     throw new Error("Plan expired — add wallet credits or upgrade");
   }
 
-  const { getCompanyCreds, assertLiveCreds } = await import("./whatsappService.js");
+  const { getEffectiveCreds, assertLiveCreds } = await import("./whatsappService.js");
   const { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } = await import("./wallet.js");
-  const creds = await getCompanyCreds(companyId);
+  const creds = await getEffectiveCreds(companyId);
   assertLiveCreds(creds);
   const pricing = await getPlatformPricing();
   const creditsNeeded = pricing.creditPerOutbound || 1;

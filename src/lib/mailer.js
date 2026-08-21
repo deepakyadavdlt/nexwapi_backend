@@ -5,6 +5,7 @@ import { isProduction } from "./env.js";
 export const MAIL_FROM = process.env.MAIL_FROM || "no-reply@nexwapi.com";
 export const MAIL_SUPPORT = process.env.MAIL_SUPPORT || "hello@nexwapi.com";
 export const APP_URL = (process.env.APP_URL || process.env.CORS_ORIGIN || "https://nexwapi.com").split(",")[0].trim();
+const APP_DASHBOARD_URL = (process.env.APP_DASHBOARD_URL || "https://app.nexwapi.com").replace(/\/$/, "");
 const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || "Nexwapi";
 
 let transporter = null;
@@ -100,6 +101,17 @@ async function sendViaZeptoMail(payload) {
   };
   if (replyTo) {
     body.reply_to = [{ address: replyTo, name: "Nexwapi Support" }];
+  }
+  if (payload.attachments?.length) {
+    body.attachments = payload.attachments.map((a) => {
+      const raw = a.content;
+      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw || ""), "utf8");
+      return {
+        name: a.filename || "attachment",
+        content: buf.toString("base64"),
+        mime_type: a.contentType || "application/octet-stream",
+      };
+    });
   }
 
   const res = await fetch(endpoint, {
@@ -218,7 +230,7 @@ export async function sendMail({ to, subject, html, text, attachments }) {
 
   const mode = String(process.env.EMAIL_PROVIDER || "auto").toLowerCase();
   const chain = [];
-  if ((mode === "zeptomail" || mode === "auto") && zeptomailConfigured() && !attachments?.length) {
+  if ((mode === "zeptomail" || mode === "auto") && zeptomailConfigured()) {
     chain.push("zeptomail");
   }
   if ((mode === "resend" || mode === "auto") && resendConfigured() && !attachments?.length) {
@@ -227,14 +239,9 @@ export async function sendMail({ to, subject, html, text, attachments }) {
   if (
     mailConfigured()
     && String(process.env.SMTP_DISABLED || "").toLowerCase() !== "true"
-    && (mode === "smtp" || (mode === "auto" && !chain.length) || mode === "smtp")
+    && (mode === "smtp" || mode === "auto")
   ) {
     if (!chain.includes("smtp")) chain.push("smtp");
-  }
-  if (mode === "smtp" && mailConfigured() && !chain.includes("smtp")) chain.push("smtp");
-  // auto: also allow SMTP as last resort after HTTPS fails
-  if (mode === "auto" && mailConfigured() && String(process.env.SMTP_DISABLED || "").toLowerCase() !== "true" && !chain.includes("smtp")) {
-    chain.push("smtp");
   }
 
   let lastErr = null;
@@ -279,9 +286,6 @@ export async function sendMail({ to, subject, html, text, attachments }) {
     }
   }
 
-  if (attachments?.length && !mailConfigured()) {
-    throw new Error("Attachments require SMTP credentials.");
-  }
   throw lastErr || new Error(
     isProduction()
       ? "Email delivery failed. Set ZEPTOMAIL_TOKEN in production .env."
@@ -296,6 +300,7 @@ export async function sendOtpEmail(to, code, purpose) {
     reset: "Password reset",
     user_add: "Add team member",
     user_delete: "Remove team member",
+    contact_delete: "Delete contact",
     wa_disconnect: "Disconnect WhatsApp",
     api_create: "Create API key",
     api_delete: "Delete API key",
@@ -321,7 +326,7 @@ export async function sendWelcome(to, name) {
     subject: "Welcome to Nexwapi — your 7-day trial is live",
     html: wrap("Welcome", `<p>Hi ${name || "there"},</p>
       <p>Your Nexwapi workspace is ready. You have a <b>7-day free trial</b> to connect WhatsApp, send campaigns, and run your inbox.</p>
-      <p><a href="${APP_URL}/dashboard" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Open dashboard</a></p>
+      <p><a href="${APP_DASHBOARD_URL}/dashboard" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Open dashboard</a></p>
       <p>Need help? ${MAIL_SUPPORT}</p>`),
   });
 }
@@ -332,7 +337,7 @@ export async function sendTrialExpiry(to, name, daysLeft) {
     subject: daysLeft <= 0 ? "Your Nexwapi trial has ended" : `Your Nexwapi trial ends in ${daysLeft} day(s)`,
     html: wrap("Trial reminder", `<p>Hi ${name || "there"},</p>
       <p>${daysLeft <= 0 ? "Your 7-day trial has ended." : `Your trial ends in <b>${daysLeft} day(s)</b>.`} Upgrade to keep campaigns, chatbots and your WhatsApp number live.</p>
-      <p><a href="${APP_URL}/dashboard/upgrade" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Upgrade now</a></p>`),
+      <p><a href="${APP_DASHBOARD_URL}/dashboard/upgrade" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Upgrade now</a></p>`),
   });
 }
 
@@ -342,7 +347,7 @@ export async function sendPlanExpiry(to, name, plan) {
     subject: `Your Nexwapi ${plan || "plan"} is expiring`,
     html: wrap("Plan expiry", `<p>Hi ${name || "there"},</p>
       <p>Your <b>${plan || "paid"}</b> plan needs renewal so messaging and automations stay on.</p>
-      <p><a href="${APP_URL}/dashboard/upgrade" style="color:#00735c;font-weight:700">Renew your plan</a></p>`),
+      <p><a href="${APP_DASHBOARD_URL}/dashboard/upgrade" style="color:#00735c;font-weight:700">Renew your plan</a></p>`),
   });
 }
 
@@ -352,7 +357,7 @@ export async function sendInvoiceEmail(to, { invoiceNo, amount, plan }) {
     subject: `Invoice ${invoiceNo || ""} from Nexwapi`,
     html: wrap("Invoice", `<p>Thanks for your payment.</p>
       <p>Invoice: <b>${invoiceNo || "—"}</b><br/>Plan: ${plan || "—"}<br/>Amount: ₹${((amount || 0) / 100).toFixed(2)}</p>
-      <p><a href="${APP_URL}/dashboard/upgrade">Download from Billing</a></p>
+      <p><a href="${APP_DASHBOARD_URL}/dashboard/upgrade">Download from Billing</a></p>
       <p>Questions? ${MAIL_SUPPORT}</p>`),
   });
 }
@@ -373,7 +378,7 @@ export async function sendTemplateStatus(to, name, status) {
     to,
     subject: `WhatsApp template "${name}" ${ok ? "approved" : "update"}: ${status}`,
     html: wrap("Template status", `<p>Template <b>${name}</b> is now <b>${status}</b>.</p>
-      <p><a href="${APP_URL}/dashboard/templates">Open templates</a></p>`),
+      <p><a href="${APP_DASHBOARD_URL}/dashboard/templates">Open templates</a></p>`),
   });
 }
 
@@ -382,7 +387,7 @@ export async function sendCampaignStatus(to, name, status) {
     to,
     subject: `Campaign "${name}" ${status}`,
     html: wrap("Campaign update", `<p>Campaign <b>${name}</b> is now <b>${status}</b>.</p>
-      <p><a href="${APP_URL}/dashboard/campaigns">Open campaigns</a></p>`),
+      <p><a href="${APP_DASHBOARD_URL}/dashboard/campaigns">Open campaigns</a></p>`),
   });
 }
 
@@ -403,7 +408,7 @@ export async function sendCampaignReportEmail({ to, reportType, from, toDate, cs
       <p>Date range: <b>${range}</b></p>
       <p>Campaigns included: <b>${campaignCount}</b></p>
       <p>The report is attached as a CSV file. Open it in Excel or Google Sheets.</p>
-      <p><a href="${APP_URL}/dashboard/reports" style="color:#00735c;font-weight:700">View reports dashboard</a></p>
+      <p><a href="${APP_DASHBOARD_URL}/dashboard/reports" style="color:#00735c;font-weight:700">View reports dashboard</a></p>
     `),
     text: `${title} for ${range}. ${campaignCount} campaigns. See attached CSV.`,
     attachments: [{

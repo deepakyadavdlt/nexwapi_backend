@@ -364,7 +364,7 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             },
           });
           console.log("[wa] incoming from", m.from, ":", bodyText);
-          fireEvent("message.received", { from: m.from, name: contact.name, text: bodyText, type: m.type }).catch(() => {});
+          fireEvent(companyId, "message.received", { from: m.from, name: contact.name, text: bodyText, type: m.type }).catch(() => {});
           notify({
             audience: "client",
             companyId,
@@ -553,6 +553,15 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             continue;
           }
           console.log("[wa] status", s.id, "->", next);
+          const statusCompanyId = companyId || (await prisma.message.findFirst({ where: { waId: s.id } }))?.companyId;
+          if (statusCompanyId) {
+            fireEvent(statusCompanyId, "message.status", {
+              waId: s.id,
+              status: next,
+              recipient: s.recipient_id || null,
+              timestamp: s.timestamp || null,
+            }).catch(() => {});
+          }
           if (next === "delivered" || next === "read") {
             const msg = await prisma.message.findFirst({ where: { waId: s.id } });
             if (msg?.type === "template" && msg.companyId) {

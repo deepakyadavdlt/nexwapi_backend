@@ -329,6 +329,27 @@ export async function sendWelcome(to, name) {
   });
 }
 
+export async function sendAgentInvite({ to, name, inviterName, password, role }) {
+  const loginUrl = `${APP_DASHBOARD_URL}/login`;
+  return sendMail({
+    to,
+    subject: `${inviterName || "Your team"} invited you to Nexwapi`,
+    text: `Hi ${name || "there"}, you have been invited to join a Nexwapi workspace as ${role || "Teammate"}. Login: ${loginUrl} Email: ${to} Temporary password: ${password}`,
+    html: wrap(
+      "You're invited",
+      `<p>Hi ${name || "there"},</p>
+      <p><b>${inviterName || "A teammate"}</b> invited you to Nexwapi as <b>${role || "Teammate"}</b>.</p>
+      <p>Login with:</p>
+      <ul>
+        <li>Email: <b>${to}</b></li>
+        <li>Temporary password: <b style="letter-spacing:1px">${password}</b></li>
+      </ul>
+      <p><a href="${loginUrl}" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Accept invitation</a></p>
+      <p style="color:#64748b;font-size:13px">Change your password after first login.</p>`
+    ),
+  });
+}
+
 export async function sendTrialExpiry(to, name, daysLeft) {
   return sendMail({
     to,

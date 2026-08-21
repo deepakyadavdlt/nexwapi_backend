@@ -39,7 +39,13 @@ import {
   requireNotSuspended, requireFeature, isSuperAdmin,
 } from "../lib/tenant.js";
 import { PLAN_CATALOG, normalizePlan, hasFeature, isPaidPlan } from "../lib/plans.js";
-import { createAgentSeat, ensureOwnerAgent } from "../lib/teamSeats.js";
+import { createAgentSeat, ensureOwnerAgent, listAgentsEnriched, updateAgentSeat, resetAgentInvitePassword, companySeatUsage, AGENT_ROLES } from "../lib/teamSeats.js";
+import {
+  getAllRolePermissions,
+  saveRolePermissions,
+  resolveWorkspaceRole,
+  userHasWorkspacePermission,
+} from "../lib/workspaceRbac.js";
 import { digitsOnly, findCompanyContactByPhone } from "../lib/phone.js";
 import { RAZORPAY_ENABLED, RAZORPAY_KEY_ID, PLANS, razorpay, verifySignature, verifyWebhook } from "../lib/razorpay.js";
 import { runCampaign, resolveAudience } from "../lib/campaignRunner.js";
@@ -47,6 +53,7 @@ import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
 import { loginLimiter, signupLimiter, apiMessageLimiter } from "../lib/rateLimit.js";
 import { findApiKeyByRaw, hashApiKey, keyPrefix, publicApiKeyRow } from "../lib/apiKey.js";
+import { requireApiKey, digitsPhone, publicContact } from "../lib/publicApi.js";
 import { mailConfigured, emailDeliveryConfigured, sendWelcome, sendInvoiceEmail, sendCampaignStatus, sendCampaignReportEmail, sendSuspension, sendTemplateStatus, sendSupportTicketAlert } from "../lib/mailer.js";
 import {
   commerceOverview, connectCatalog, syncCatalog, getOrCreateCommerceSetting,
@@ -309,8 +316,13 @@ router.get("/me", requireAuth, attachCompany, async (req, res) => {
   });
   if (!user) return res.status(404).json({ error: "User not found" });
   if (user.isActive === false) return res.status(403).json({ error: "Account disabled" });
+  const rbac = user.companyId
+    ? await resolveWorkspaceRole({ user, companyId: user.companyId })
+    : { role: "Owner", permissions: {} };
   res.json({
     ...publicCompanyUser(user, req.company || user.company),
+    workspaceRole: rbac.role,
+    workspacePermissions: rbac.permissions,
     ...(req.user.impersonating
       ? { impersonating: true, impersonatedBy: req.user.impersonatedBy }
       : {}),
@@ -729,30 +741,34 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
 
 // Public send API (for Zapier / Shopify / custom integrations). Auth via x-api-key.
 router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
-  const key = req.headers["x-api-key"];
-  if (!key) return res.status(401).json({ error: "Missing x-api-key header" });
-  const apiKey = await findApiKeyByRaw(String(key));
-  if (!apiKey) return res.status(401).json({ error: "Invalid API key" });
-  const plan = normalizePlan(apiKey.company?.plan || "trial");
-  if (!hasFeature(plan, "api")) {
-    return res.status(403).json({ error: "Your plan does not include api", code: "FEATURE_LOCKED", feature: "api", plan });
-  }
-  if (apiKey.company?.status === "SUSPENDED") {
-    return res.status(403).json({ error: "Account suspended", code: "SUSPENDED" });
-  }
-  prisma.apiKey.update({ where: { id: apiKey.id }, data: { lastUsedAt: new Date() } }).catch(() => {});
+  const auth = await requireApiKey(req, res);
+  if (!auth) return;
 
   const { to, text, template, params, language = "en" } = req.body || {};
-  if (!to) return res.status(400).json({ error: "to (phone number) required" });
+  if (!to) return res.status(400).json({ error: "to (phone number) required", code: "VALIDATION_ERROR" });
+
+  const cleanPhone = digitsPhone(to);
+  const existingContact = await prisma.contact.findFirst({
+    where: { companyId: auth.companyId, phone: cleanPhone },
+  });
+  const setting = await prisma.setting.findUnique({ where: { companyId: auth.companyId } });
+  const rejectOptedOut = setting?.rejectOptedOutApi !== false;
+  if (rejectOptedOut && existingContact && existingContact.optedIn === false) {
+    return res.status(403).json({
+      error: "Contact has opted out of messaging",
+      code: "OPTED_OUT",
+    });
+  }
+
   let charge = { charged: false, creditsNeeded: 0 };
   try {
     if (template) {
-      charge = await templateChargeCredits(apiKey.companyId, template, { to, channel: "api_key" });
+      charge = await templateChargeCredits(auth.companyId, template, { to, channel: "api_key" });
     }
   } catch (e) {
     return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
   }
-  const creds = await getEffectiveCreds(apiKey.companyId);
+  const creds = await getEffectiveCreds(auth.companyId);
   try {
     let result;
     if (template) {
@@ -762,14 +778,13 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
     } else if (text) {
       result = await sendText(to, text, creds);
     } else {
-      return res.status(400).json({ error: "text or template required" });
+      return res.status(400).json({ error: "text or template required", code: "VALIDATION_ERROR" });
     }
-    const cleanPhone = String(to).replace(/[^\d]/g, "");
-    const contact = await prisma.contact.findFirst({ where: { companyId: apiKey.companyId, phone: cleanPhone } });
+    const contact = existingContact || await prisma.contact.findFirst({ where: { companyId: auth.companyId, phone: cleanPhone } });
     if (contact) {
       await prisma.message.create({
         data: {
-          companyId: apiKey.companyId,
+          companyId: auth.companyId,
           contactId: contact.id,
           waId: result.messages?.[0]?.id || null,
           direction: "out",
@@ -779,18 +794,134 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
         },
       });
     }
+    fireEvent(auth.companyId, "message.sent", {
+      to: cleanPhone,
+      text: text || null,
+      template: template || null,
+      messageId: result.messages?.[0]?.id || null,
+    }).catch(() => {});
     res.json({ ok: true, messageId: result.messages?.[0]?.id || null });
   } catch (e) {
     if (charge.charged) {
-      await refundCredits(apiKey.companyId, charge.creditsNeeded, "api_message_refund", {
+      await refundCredits(auth.companyId, charge.creditsNeeded, "api_message_refund", {
         to,
         reason: e.message,
         template: template || null,
         channel: "api_key",
       }).catch(() => {});
     }
-    res.status(502).json({ error: e.message });
+    res.status(502).json({ error: e.message, code: "SEND_FAILED" });
   }
+});
+
+/** Account + API capability probe */
+router.get("/v1/account", async (req, res) => {
+  const auth = await requireApiKey(req, res);
+  if (!auth) return;
+  const setting = await prisma.setting.findUnique({ where: { companyId: auth.companyId } });
+  res.json({
+    ok: true,
+    companyId: auth.companyId,
+    name: auth.company?.name || null,
+    plan: auth.plan,
+    status: auth.company?.status || null,
+    rejectOptedOutApi: setting?.rejectOptedOutApi !== false,
+    webhookConfigured: Boolean(String(setting?.webhookUrl || "").trim()),
+  });
+});
+
+/** List / search contacts */
+router.get("/v1/contacts", async (req, res) => {
+  const auth = await requireApiKey(req, res);
+  if (!auth) return;
+  const phone = req.query.phone ? digitsPhone(req.query.phone) : "";
+  const q = String(req.query.q || "").trim();
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25));
+  const where = {
+    companyId: auth.companyId,
+    ...(phone ? { phone } : {}),
+    ...(q && !phone
+      ? {
+          OR: [
+            { name: { contains: q, mode: "insensitive" } },
+            { email: { contains: q, mode: "insensitive" } },
+            { phone: { contains: q.replace(/[^\d]/g, "") } },
+          ],
+        }
+      : {}),
+  };
+  const rows = await prisma.contact.findMany({
+    where,
+    orderBy: { createdAt: "desc" },
+    take: limit,
+  });
+  res.json({ ok: true, contacts: rows.map(publicContact), count: rows.length });
+});
+
+/** Create or upsert contact by phone */
+router.post("/v1/contacts", async (req, res) => {
+  const auth = await requireApiKey(req, res);
+  if (!auth) return;
+  const { name, phone, email, tags, optedIn, attributes } = req.body || {};
+  const cleanPhone = digitsPhone(phone);
+  if (!cleanPhone) return res.status(400).json({ error: "phone required", code: "VALIDATION_ERROR" });
+  const displayName = String(name || "").trim() || `+${cleanPhone}`;
+  const data = {
+    name: displayName,
+    email: email ? String(email).toLowerCase().trim() : null,
+    ...(tags !== undefined ? { tags: Array.isArray(tags) ? tags.map(String) : [] } : {}),
+    ...(optedIn !== undefined ? { optedIn: Boolean(optedIn) } : {}),
+    ...(attributes !== undefined && typeof attributes === "object" ? { attributes } : {}),
+  };
+  const contact = await prisma.contact.upsert({
+    where: { companyId_phone: { companyId: auth.companyId, phone: cleanPhone } },
+    create: { companyId: auth.companyId, phone: cleanPhone, ...data, optedIn: optedIn !== undefined ? Boolean(optedIn) : true },
+    update: data,
+  });
+  res.status(201).json({ ok: true, contact: publicContact(contact) });
+});
+
+/** Update opt-in by phone */
+router.patch("/v1/contacts/:phone/opt-in", async (req, res) => {
+  const auth = await requireApiKey(req, res);
+  if (!auth) return;
+  const cleanPhone = digitsPhone(req.params.phone);
+  const optedIn = req.body?.optedIn;
+  if (typeof optedIn !== "boolean") {
+    return res.status(400).json({ error: "optedIn boolean required", code: "VALIDATION_ERROR" });
+  }
+  const existing = await prisma.contact.findFirst({ where: { companyId: auth.companyId, phone: cleanPhone } });
+  if (!existing) return res.status(404).json({ error: "Contact not found", code: "NOT_FOUND" });
+  const contact = await prisma.contact.update({
+    where: { id: existing.id },
+    data: { optedIn },
+  });
+  res.json({ ok: true, contact: publicContact(contact) });
+});
+
+/** List sendable (approved) templates */
+router.get("/v1/templates", async (req, res) => {
+  const auth = await requireApiKey(req, res);
+  if (!auth) return;
+  const templates = await prisma.template.findMany({
+    where: {
+      companyId: auth.companyId,
+      deletedAt: null,
+      status: { in: ["approved", "APPROVED", "active"] },
+    },
+    orderBy: { name: "asc" },
+    take: 200,
+  });
+  res.json({
+    ok: true,
+    templates: templates.map((t) => ({
+      id: t.id,
+      name: t.name,
+      language: t.language || "en",
+      category: t.category || null,
+      status: String(t.status || "").toLowerCase(),
+    })),
+  });
 });
 
 router.post("/sales-leads", async (req, res) => {
@@ -931,11 +1062,27 @@ router.delete("/me", async (req, res) => {
 
 /* ------------------------------ Contacts ------------------------------- */
 router.get("/contacts", async (req, res) => {
+  if (!(await userHasWorkspacePermission(req, "contacts.access"))) {
+    return res.status(403).json({ error: "You do not have permission for this action", code: "PERMISSION_DENIED", permission: "contacts.access" });
+  }
+  const { permissions } = await resolveWorkspaceRole(req);
   const contacts = await prisma.contact.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
-  res.json(contacts.map((c) => ({ ...c, createdAt: c.createdAt.getTime() })));
+  res.json(contacts.map((c) => {
+    const row = { ...c, createdAt: c.createdAt.getTime() };
+    if (permissions["contacts.hide_fields"]) {
+      return { ...row, phone: "••••••••••", email: null, attributes: {}, tags: row.tags || [] };
+    }
+    if (permissions["contacts.hide_phone"] || permissions["contacts.hide_phone_legacy"]) {
+      return { ...row, phone: "••••••••••" };
+    }
+    return row;
+  }));
 });
 
 router.post("/contacts", async (req, res) => {
+  if (!(await userHasWorkspacePermission(req, "contacts.add"))) {
+    return res.status(403).json({ error: "You do not have permission for this action", code: "PERMISSION_DENIED", permission: "contacts.add" });
+  }
   const { name, phone, tags = [], email, userId, optedIn, attributes } = req.body || {};
   if (!name || !phone) return res.status(400).json({ error: "name and phone required" });
   const cleanPhone = digitsOnly(phone);
@@ -1013,6 +1160,9 @@ router.patch("/contacts/:id", async (req, res) => {
 
 router.delete("/contacts/:id", async (req, res) => {
   try {
+    if (!(await userHasWorkspacePermission(req, "contacts.delete"))) {
+      return res.status(403).json({ error: "You do not have permission for this action", code: "PERMISSION_DENIED", permission: "contacts.delete" });
+    }
     const gate = await requireOtpOrSkip(req.user.email, "contact_delete", req.body?.otp || req.query?.otp);
     if (gate.otpRequired) return res.json({ otpRequired: true });
     if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
@@ -1026,6 +1176,9 @@ router.delete("/contacts/:id", async (req, res) => {
 
 // Bulk import contacts (from a parsed CSV). Skips invalid rows and duplicates.
 router.post("/contacts/import", async (req, res) => {
+  if (!(await userHasWorkspacePermission(req, "contacts.add"))) {
+    return res.status(403).json({ error: "You do not have permission for this action", code: "PERMISSION_DENIED", permission: "contacts.add" });
+  }
   const { contacts } = req.body || {};
   if (!Array.isArray(contacts)) return res.status(400).json({ error: "contacts array required" });
   const start = await prisma.contact.count({ where: tenantWhere(req) });
@@ -1124,7 +1277,7 @@ router.patch("/conversations/:id/status", async (req, res) => {
     const existing = await tenantContact(req, req.params.id);
     if (!existing) return res.sendStatus(404);
     const c = await prisma.contact.update({ where: { id: existing.id }, data: { chatStatus: status, ...(status === "resolved" ? {} : {}) } });
-    fireEvent("chat.status", { name: c.name, phone: c.phone, status }).catch(() => {});
+    fireEvent(companyIdOf(req), "chat.status", { name: c.name, phone: c.phone, status }).catch(() => {});
     logActivity(c.id, "status", `Chat marked ${status}`);
 
     if (status === "open" && existing.chatStatus === "resolved") {
@@ -1188,23 +1341,113 @@ router.delete("/quick-replies/:id", async (req, res) => {
 
 /* ------------------------------- Agents -------------------------------- */
 router.get("/agents", async (req, res) => {
-  const agents = await prisma.agent.findMany({ where: tenantWhere(req), orderBy: { createdAt: "asc" } });
-  res.json(agents.map((a) => ({ ...a, createdAt: a.createdAt.getTime() })));
+  const companyId = companyIdOf(req);
+  const agents = await listAgentsEnriched(companyId);
+  res.json(agents);
+});
+
+router.get("/agent-settings", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const [agents, seats, teams] = await Promise.all([
+    listAgentsEnriched(companyId),
+    companySeatUsage(companyId),
+    prisma.team.findMany({ where: { companyId }, orderBy: { name: "asc" } }),
+  ]);
+  res.json({
+    agents,
+    seats: {
+      used: seats.used,
+      limit: seats.unlimited ? null : seats.limit,
+      unlimited: seats.unlimited,
+      salesUsed: seats.salesUsed,
+      salesLimit: seats.unlimited ? null : seats.salesLimit,
+    },
+    teams: teams.map((t) => ({ id: t.id, name: t.name, createdAt: t.createdAt.getTime() })),
+    roles: AGENT_ROLES,
+  });
 });
 
 router.post("/agents", async (req, res) => {
-  const { name, email, role = "Agent", otp, password } = req.body || {};
-  if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  const {
+    name,
+    firstName,
+    lastName,
+    email,
+    phone,
+    role = "Teammate",
+    teamId,
+    otp,
+    password,
+  } = req.body || {};
+  if ((!name && !firstName) || !email) {
+    return res.status(400).json({ error: "name/firstName and email required" });
+  }
   const gate = await requireOtpOrSkip(req.user.email, "user_add", otp);
   if (gate.otpRequired) return res.json({ otpRequired: true });
   if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
   try {
-    const { agent, login } = await createAgentSeat(companyIdOf(req), { name, email, role, password });
-    res.status(201).json({ ...agent, loginEmail: login.email, tempPassword: login.password });
+    const { agent, login } = await createAgentSeat(companyIdOf(req), {
+      name,
+      firstName,
+      lastName,
+      email,
+      phone,
+      role,
+      teamId: teamId || null,
+      password,
+      createdBy: req.user?.name || req.user?.email || "",
+    });
+    if (login?.password) {
+      const { sendAgentInvite } = await import("../lib/mailer.js");
+      sendAgentInvite({
+        to: login.email,
+        name: agent.name,
+        inviterName: req.user?.name || "Your teammate",
+        password: login.password,
+        role: agent.role,
+      }).catch((e) => console.warn("[agents] invite email:", e?.message || e));
+    }
+    res.status(201).json({
+      ...agent,
+      loginEmail: login.email,
+      tempPassword: login.password,
+      inviteEmailSent: Boolean(login?.password),
+    });
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "Agent with this email already exists" });
     if (e.status) return res.status(e.status).json({ error: e.message, code: e.code, limit: e.limit, used: e.used });
     throw e;
+  }
+});
+
+router.patch("/agents/:id", async (req, res) => {
+  try {
+    const updated = await updateAgentSeat(companyIdOf(req), req.params.id, req.body || {});
+    res.json(updated);
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    throw e;
+  }
+});
+
+router.post("/agents/:id/resend-invitation", async (req, res) => {
+  try {
+    const gate = await requireOtpOrSkip(req.user.email, "user_add", req.body?.otp);
+    if (gate.otpRequired) return res.json({ otpRequired: true });
+    if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
+    const invite = await resetAgentInvitePassword(companyIdOf(req), req.params.id);
+    const { sendAgentInvite } = await import("../lib/mailer.js");
+    await sendAgentInvite({
+      to: invite.email,
+      name: invite.name,
+      inviterName: req.user?.name || "Your teammate",
+      password: invite.password,
+      role: "Teammate",
+    }).catch(() => {});
+    res.json({ ok: true, email: invite.email, tempPassword: invite.password });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    res.status(502).json({ error: e?.message || "Could not resend invitation" });
   }
 });
 
@@ -1215,11 +1458,10 @@ router.delete("/agents/:id", async (req, res) => {
     if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
     const agent = await prisma.agent.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (!agent) return res.sendStatus(404);
+    if (agent.role === "Owner") return res.status(400).json({ error: "Owner cannot be deleted" });
     await prisma.contact.updateMany({ where: { assignedAgentId: agent.id, ...tenantWhere(req) }, data: { assignedAgentId: null } });
     await prisma.agent.delete({ where: { id: agent.id } });
-    if (agent.role !== "Owner") {
-      await prisma.user.deleteMany({ where: { email: agent.email, companyId: companyIdOf(req), role: { in: ["AGENT", "ADMIN"] } } }).catch(() => {});
-    }
+    await prisma.user.deleteMany({ where: { email: agent.email, companyId: companyIdOf(req), role: { in: ["AGENT", "ADMIN", "MEMBER"] } } }).catch(() => {});
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
@@ -1230,10 +1472,110 @@ router.patch("/agents/:id/availability", async (req, res) => {
   const { availability } = req.body || {};
   const allowed = ["online", "away", "offline"];
   if (!allowed.includes(availability)) return res.status(400).json({ error: "availability must be online, away, or offline" });
-  const agent = await prisma.agent.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
-  if (!agent) return res.sendStatus(404);
-  const updated = await prisma.agent.update({ where: { id: agent.id }, data: { availability } });
-  res.json({ ...updated, createdAt: updated.createdAt.getTime() });
+  try {
+    const updated = await updateAgentSeat(companyIdOf(req), req.params.id, { availability });
+    res.json(updated);
+  } catch (e) {
+    if (e.status === 404) return res.sendStatus(404);
+    throw e;
+  }
+});
+
+/* ------------------------------- Teams --------------------------------- */
+router.get("/teams", async (req, res) => {
+  const teams = await prisma.team.findMany({
+    where: tenantWhere(req),
+    orderBy: { name: "asc" },
+    include: { _count: { select: { agents: true } } },
+  });
+  res.json(teams.map((t) => ({
+    id: t.id,
+    name: t.name,
+    agentCount: t._count.agents,
+    createdAt: t.createdAt.getTime(),
+  })));
+});
+
+router.post("/teams", async (req, res) => {
+  const name = String(req.body?.name || "").trim();
+  if (!name) return res.status(400).json({ error: "name required" });
+  try {
+    const t = await prisma.team.create({
+      data: { companyId: companyIdOf(req), name },
+    });
+    res.status(201).json({ id: t.id, name: t.name, agentCount: 0, createdAt: t.createdAt.getTime() });
+  } catch (e) {
+    if (e.code === "P2002") return res.status(409).json({ error: "Team already exists" });
+    throw e;
+  }
+});
+
+router.patch("/teams/:id", async (req, res) => {
+  const name = String(req.body?.name || "").trim();
+  if (!name) return res.status(400).json({ error: "name required" });
+  const existing = await prisma.team.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.sendStatus(404);
+  try {
+    const t = await prisma.team.update({ where: { id: existing.id }, data: { name } });
+    res.json({ id: t.id, name: t.name, createdAt: t.createdAt.getTime() });
+  } catch (e) {
+    if (e.code === "P2002") return res.status(409).json({ error: "Team already exists" });
+    throw e;
+  }
+});
+
+router.delete("/teams/:id", async (req, res) => {
+  const existing = await prisma.team.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.sendStatus(404);
+  await prisma.agent.updateMany({ where: { teamId: existing.id }, data: { teamId: null } });
+  await prisma.team.delete({ where: { id: existing.id } });
+  res.sendStatus(204);
+});
+
+/* ------------------------- Role permissions (RBAC) --------------------- */
+router.get("/role-permissions", async (req, res) => {
+  const rbac = await resolveWorkspaceRole(req);
+  const allowed =
+    ["Owner", "Admin", "Super Admin"].includes(rbac.role) ||
+    rbac.permissions?.["settings.agents"] === true;
+  if (!allowed) {
+    return res.status(403).json({ error: "You do not have permission to manage role permissions", code: "PERMISSION_DENIED" });
+  }
+  const data = await getAllRolePermissions(companyIdOf(req));
+  res.json(data);
+});
+
+router.get("/role-permissions/:role", async (req, res) => {
+  const data = await getAllRolePermissions(companyIdOf(req));
+  const role = req.params.role;
+  if (!data.roles[role]) return res.status(404).json({ error: "Unknown role" });
+  res.json({ role, permissions: data.roles[role], catalog: data.catalog });
+});
+
+router.put("/role-permissions/:role", async (req, res) => {
+  const rbac = await resolveWorkspaceRole(req);
+  if (rbac.role !== "Owner" && rbac.role !== "Admin" && rbac.role !== "Super Admin") {
+    if (!(await userHasWorkspacePermission(req, "settings.agents"))) {
+      return res.status(403).json({ error: "Only Owner/Admin can edit role permissions", code: "PERMISSION_DENIED" });
+    }
+  }
+  try {
+    const permissions = await saveRolePermissions(companyIdOf(req), req.params.role, req.body?.permissions || req.body || {});
+    res.json({ ok: true, role: req.params.role, permissions });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    throw e;
+  }
+});
+
+router.post("/role-permissions/:role/reset", async (req, res) => {
+  const rbac = await resolveWorkspaceRole(req);
+  if (rbac.role !== "Owner" && rbac.role !== "Admin" && rbac.role !== "Super Admin") {
+    return res.status(403).json({ error: "Only Owner/Admin can reset role permissions", code: "PERMISSION_DENIED" });
+  }
+  const { defaultPermissionsForRole } = await import("../lib/rolePermissions.js");
+  const permissions = await saveRolePermissions(companyIdOf(req), req.params.role, defaultPermissionsForRole(req.params.role));
+  res.json({ ok: true, role: req.params.role, permissions });
 });
 
 /* ------------------------ Basic inbox automations ---------------------- */
@@ -2261,6 +2603,9 @@ router.get("/templates", async (req, res) => {
 });
 
 router.post("/templates", async (req, res) => {
+  if (!(await userHasWorkspacePermission(req, "templates.create"))) {
+    return res.status(403).json({ error: "You do not have permission for this action", code: "PERMISSION_DENIED", permission: "templates.create" });
+  }
   const { name, category = "Utility", body, headerType, headerText, headerImageUrl, buttons, format = "text", cards } = req.body || {};
   let language = req.body?.language || "en";
   if (!name || !body) return res.status(400).json({ error: "name and body required" });
@@ -2328,6 +2673,9 @@ router.patch("/templates/:id", async (req, res) => {
 });
 
 router.delete("/templates/:id", async (req, res) => {
+  if (!(await userHasWorkspacePermission(req, "templates.delete"))) {
+    return res.status(403).json({ error: "You do not have permission for this action", code: "PERMISSION_DENIED", permission: "templates.delete" });
+  }
   if (!(await otpGate(req, res, "template_delete"))) return;
   const existing = await prisma.template.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
   if (!existing) return res.sendStatus(404);
@@ -2388,6 +2736,9 @@ router.get("/campaigns", async (req, res) => {
 });
 
 router.post("/campaigns", requireNotSuspended, async (req, res) => {
+  if (!(await userHasWorkspacePermission(req, "campaigns.create"))) {
+    return res.status(403).json({ error: "You do not have permission for this action", code: "PERMISSION_DENIED", permission: "campaigns.create" });
+  }
   const { name, template, audience = "All contacts", scheduledAt, campaignType = "onetime", category, status: reqStatus } = req.body || {};
   if (!name || !template) return res.status(400).json({ error: "name and template required" });
   const audienceWhere = await resolveAudience(audience, companyIdOf(req));
@@ -3414,7 +3765,7 @@ router.patch("/settings", async (req, res) => {
     awayEnabled, awayMessage, hoursStart, hoursEnd, days, businessName, autoAssign,
     assignmentMode, assignOnlineOnly, webhookUrl, csatEnabled, csatMessage,
     welcomeEnabled, welcomeMessage, delayedEnabled, delayedMinutes, delayedMessage,
-    customRepliesEnabled, workingHoursSlots,
+    customRepliesEnabled, workingHoursSlots, rejectOptedOutApi,
   } = req.body || {};
   const data = {
     ...(awayEnabled !== undefined && { awayEnabled }),
@@ -3426,7 +3777,8 @@ router.patch("/settings", async (req, res) => {
     ...(autoAssign !== undefined && { autoAssign }),
     ...(assignmentMode !== undefined && { assignmentMode: String(assignmentMode) }),
     ...(assignOnlineOnly !== undefined && { assignOnlineOnly: Boolean(assignOnlineOnly) }),
-    ...(webhookUrl !== undefined && { webhookUrl }),
+    ...(webhookUrl !== undefined && { webhookUrl: String(webhookUrl || "").trim() }),
+    ...(rejectOptedOutApi !== undefined && { rejectOptedOutApi: Boolean(rejectOptedOutApi) }),
     ...(csatEnabled !== undefined && { csatEnabled }),
     ...(csatMessage !== undefined && { csatMessage }),
     ...(welcomeEnabled !== undefined && { welcomeEnabled }),
@@ -3462,6 +3814,9 @@ router.get("/api-keys", async (req, res) => {
 });
 
 router.post("/api-keys", requireFeature("api"), async (req, res) => {
+  if (!(await userHasWorkspacePermission(req, "settings.api_key"))) {
+    return res.status(403).json({ error: "You do not have permission for this action", code: "PERMISSION_DENIED", permission: "settings.api_key" });
+  }
   const gate = await requireOtpOrSkip(req.user.email, "api_create", req.body?.otp);
   if (gate.otpRequired) return res.json({ otpRequired: true });
   if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
@@ -3489,6 +3844,57 @@ router.delete("/api-keys/:id", async (req, res) => {
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);
+  }
+});
+
+/* ------------------------- Developer settings -------------------------- */
+router.get("/developer-settings", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const [s, keys, wa] = await Promise.all([
+    prisma.setting.upsert({
+      where: { companyId },
+      update: {},
+      create: { companyId, businessName: req.company?.name || "Nexwapi" },
+    }),
+    prisma.apiKey.findMany({ where: { companyId }, orderBy: { createdAt: "desc" } }),
+    prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } }),
+  ]);
+  const primary = keys[0] || null;
+  res.json({
+    rejectOptedOutApi: s.rejectOptedOutApi !== false,
+    webhookUrl: s.webhookUrl || "",
+    whatsappConnected: Boolean(wa?.isConnected),
+    keys: keys.map(publicApiKeyRow),
+    primaryKey: primary
+      ? {
+          id: primary.id,
+          name: primary.name,
+          masked: publicApiKeyRow(primary).key,
+          createdAt: primary.createdAt.getTime(),
+          lastUsedAt: primary.lastUsedAt?.getTime() || null,
+        }
+      : null,
+    docs: {
+      api: "https://nexwapi.com/docs/api",
+      postman: "https://nexwapi.com/docs/postman",
+      nodeSdk: "https://nexwapi.com/docs/node-sdk",
+    },
+    sendEndpoint: "/api/v1/messages",
+  });
+});
+
+router.post("/developer-settings/test-webhook", async (req, res) => {
+  try {
+    const companyId = companyIdOf(req);
+    const s = await prisma.setting.findUnique({ where: { companyId } });
+    if (!String(s?.webhookUrl || "").trim()) {
+      return res.status(400).json({ error: "Configure a webhook URL first" });
+    }
+    const { fireTestWebhook } = await import("../lib/events.js");
+    await fireTestWebhook(companyId);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: e?.message || "Test webhook failed" });
   }
 });
 

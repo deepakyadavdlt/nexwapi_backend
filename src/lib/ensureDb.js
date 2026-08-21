@@ -103,6 +103,13 @@ async function applyCriticalPatches() {
     `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "metaProductId" TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE "Product" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
     `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "availability" TEXT NOT NULL DEFAULT 'online'`,
+    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "firstName" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "lastName" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "phone" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "kind" TEXT NOT NULL DEFAULT 'inbox'`,
+    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "inviteStatus" TEXT NOT NULL DEFAULT 'pending'`,
+    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "createdBy" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "teamId" TEXT`,
 
     // Autocheckout workflow fields
     `ALTER TABLE "CommerceSetting" ADD COLUMN IF NOT EXISTS "shippingMode" TEXT NOT NULL DEFAULT 'free'`,
@@ -126,6 +133,9 @@ async function applyCriticalPatches() {
     `ALTER TABLE "CommerceOrder" ADD COLUMN IF NOT EXISTS "orderStatus" TEXT NOT NULL DEFAULT 'cart_received'`,
     `ALTER TABLE "CommerceOrder" ADD COLUMN IF NOT EXISTS "paymentStatus" TEXT NOT NULL DEFAULT 'unpaid'`,
     `ALTER TABLE "CommerceOrder" ADD COLUMN IF NOT EXISTS "fulfillmentStatus" TEXT NOT NULL DEFAULT 'not_scheduled'`,
+
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "webhookUrl" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "rejectOptedOutApi" BOOLEAN NOT NULL DEFAULT true`,
   ];
 
   const tablePatches = [
@@ -207,6 +217,28 @@ async function applyCriticalPatches() {
       "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT "SalesLead_pkey" PRIMARY KEY ("id")
     )`,
+
+    `CREATE TABLE IF NOT EXISTS "Team" (
+      "id" TEXT NOT NULL,
+      "companyId" TEXT NOT NULL,
+      "name" TEXT NOT NULL,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "Team_pkey" PRIMARY KEY ("id")
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "Team_companyId_name_key" ON "Team"("companyId", "name")`,
+    `CREATE INDEX IF NOT EXISTS "Team_companyId_idx" ON "Team"("companyId")`,
+
+    `CREATE TABLE IF NOT EXISTS "RolePermission" (
+      "id" TEXT NOT NULL,
+      "companyId" TEXT NOT NULL,
+      "role" TEXT NOT NULL,
+      "permissions" JSONB NOT NULL DEFAULT '{}',
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "RolePermission_pkey" PRIMARY KEY ("id")
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "RolePermission_companyId_role_key" ON "RolePermission"("companyId", "role")`,
+    `CREATE INDEX IF NOT EXISTS "RolePermission_companyId_idx" ON "RolePermission"("companyId")`,
 
     `CREATE TABLE IF NOT EXISTS "CommerceSetting" (
       "id" TEXT NOT NULL,

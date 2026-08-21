@@ -1,0 +1,31 @@
+-- Agent settings (Interakt-style manage agents)
+CREATE TABLE IF NOT EXISTS "Team" (
+  "id" TEXT NOT NULL,
+  "companyId" TEXT NOT NULL,
+  "name" TEXT NOT NULL,
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "Team_pkey" PRIMARY KEY ("id")
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS "Team_companyId_name_key" ON "Team"("companyId", "name");
+CREATE INDEX IF NOT EXISTS "Team_companyId_idx" ON "Team"("companyId");
+
+DO $$ BEGIN
+  ALTER TABLE "Team" ADD CONSTRAINT "Team_companyId_fkey"
+    FOREIGN KEY ("companyId") REFERENCES "Company"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "firstName" TEXT NOT NULL DEFAULT '';
+ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "lastName" TEXT NOT NULL DEFAULT '';
+ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "phone" TEXT NOT NULL DEFAULT '';
+ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "kind" TEXT NOT NULL DEFAULT 'inbox';
+ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "inviteStatus" TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "createdBy" TEXT NOT NULL DEFAULT '';
+ALTER TABLE "Agent" ADD COLUMN IF NOT EXISTS "teamId" TEXT;
+
+CREATE INDEX IF NOT EXISTS "Agent_teamId_idx" ON "Agent"("teamId");
+
+DO $$ BEGIN
+  ALTER TABLE "Agent" ADD CONSTRAINT "Agent_teamId_fkey"
+    FOREIGN KEY ("teamId") REFERENCES "Team"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;

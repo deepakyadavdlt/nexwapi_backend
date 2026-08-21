@@ -61,6 +61,8 @@ model Company {
   subscription     Subscription?
   whatsappAccounts WhatsAppAccount[]
   agents           Agent[]
+  teams            Team[]
+  rolePermissions  RolePermission[]
   contacts         Contact[]
   messages         Message[]
   templates        Template[]
@@ -341,20 +343,56 @@ model SalesLead {
   updatedAt DateTime @updatedAt
 }
 
-model Agent {
-  id        String    @id @default(cuid())
+model Team {
+  id        String   @id @default(cuid())
   companyId String
-  company   Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
   name      String
-  email     String
-  role         String    @default("Agent")
+  createdAt DateTime @default(now())
+  agents    Agent[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+/** Per-workspace RBAC matrix for a display role (Owner, Admin, Teammate…). */
+model RolePermission {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  role        String
+  permissions Json     @default("{}")
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@unique([companyId, role])
+  @@index([companyId])
+}
+
+model Agent {
+  id           String    @id @default(cuid())
+  companyId    String
+  company      Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name         String
+  firstName    String    @default("")
+  lastName     String    @default("")
+  email        String
+  phone        String    @default("")
+  role         String    @default("Teammate")
+  /// inbox | sales — used for All Agents vs Sales CRM Agents tabs
+  kind         String    @default("inbox")
   color        String    @default("#25D366")
   availability String    @default("online") // online | away | offline
+  inviteStatus String    @default("pending") // pending | joined
+  createdBy    String    @default("")
+  teamId       String?
+  team         Team?     @relation(fields: [teamId], references: [id], onDelete: SetNull)
   createdAt    DateTime  @default(now())
-  contacts  Contact[]
+  contacts     Contact[]
 
   @@unique([companyId, email])
   @@index([companyId])
+  @@index([teamId])
 }
 
 model Note {
@@ -630,6 +668,8 @@ model Setting {
   voiceAiPlan           String  @default("business")
   voiceAiCredits        Int     @default(100)
   webhookUrl         String   @default("")
+  /** When true, public Message Send API returns error for opted-out contacts. */
+  rejectOptedOutApi  Boolean  @default(true)
   csatEnabled  Boolean  @default(false)
   csatMessage  String   @default("Thanks for chatting with us! How would you rate your experience?")
   updatedAt    DateTime @updatedAt

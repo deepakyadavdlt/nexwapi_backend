@@ -90,7 +90,7 @@ async function sendViaZeptoMail(payload) {
   const endpoint = String(process.env.ZEPTOMAIL_API_URL || "https://api.zeptomail.in/v1.1/email").trim();
   const fromAddress = MAIL_FROM;
   const fromName = MAIL_FROM_NAME;
-  const replyTo = MAIL_SUPPORT;
+  const replyTo = MAIL_FROM;
 
   const body = {
     from: { address: fromAddress, name: fromName },
@@ -100,7 +100,7 @@ async function sendViaZeptoMail(payload) {
     textbody: payload.text || payload.subject,
   };
   if (replyTo) {
-    body.reply_to = [{ address: replyTo, name: "Nexwapi Support" }];
+    body.reply_to = [{ address: replyTo, name: fromName }];
   }
   if (payload.attachments?.length) {
     body.attachments = payload.attachments.map((a) => {
@@ -205,8 +205,7 @@ function wrap(title, bodyHtml) {
     </div>
     <div style="padding:28px;font-size:15px;line-height:1.6">${bodyHtml}</div>
     <div style="padding:16px 28px;background:#f8fbfa;font-size:12px;color:#6b7280">
-      Support: <a href="mailto:${MAIL_SUPPORT}" style="color:#00735c">${MAIL_SUPPORT}</a>
-      · Sent from ${MAIL_FROM}
+      Sent from ${MAIL_FROM}
     </div>
   </div></body></html>`;
 }
@@ -220,7 +219,7 @@ export async function sendMail({ to, subject, html, text, attachments }) {
 
   const payload = {
     from: `${MAIL_FROM_NAME} <${MAIL_FROM}>`,
-    replyTo: MAIL_SUPPORT,
+    replyTo: MAIL_FROM,
     to,
     subject,
     html,
@@ -312,7 +311,7 @@ export async function sendOtpEmail(to, code, purpose) {
     text: `Your Nexwapi code is ${code}. It expires in 10 minutes.`,
     html: wrap(title, `<p>Use this code to continue:</p>
       <p style="font-size:32px;font-weight:800;letter-spacing:8px;color:#075E54">${code}</p>
-      <p>This code expires in 10 minutes. If you did not request it, ignore this email or write to ${MAIL_SUPPORT}.</p>`),
+      <p>This code expires in 10 minutes. If you did not request it, you can ignore this email.</p>`),
   });
   if (r?.skipped || r?.dryRun) {
     throw new Error("OTP email could not be sent. Configure ZEPTOMAIL_TOKEN or SMTP in backend .env.");
@@ -326,8 +325,7 @@ export async function sendWelcome(to, name) {
     subject: "Welcome to Nexwapi — your 7-day trial is live",
     html: wrap("Welcome", `<p>Hi ${name || "there"},</p>
       <p>Your Nexwapi workspace is ready. You have a <b>7-day free trial</b> to connect WhatsApp, send campaigns, and run your inbox.</p>
-      <p><a href="${APP_DASHBOARD_URL}/dashboard" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Open dashboard</a></p>
-      <p>Need help? ${MAIL_SUPPORT}</p>`),
+      <p><a href="${APP_DASHBOARD_URL}/dashboard" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Open dashboard</a></p>`),
   });
 }
 
@@ -357,8 +355,7 @@ export async function sendInvoiceEmail(to, { invoiceNo, amount, plan }) {
     subject: `Invoice ${invoiceNo || ""} from Nexwapi`,
     html: wrap("Invoice", `<p>Thanks for your payment.</p>
       <p>Invoice: <b>${invoiceNo || "—"}</b><br/>Plan: ${plan || "—"}<br/>Amount: ₹${((amount || 0) / 100).toFixed(2)}</p>
-      <p><a href="${APP_DASHBOARD_URL}/dashboard/upgrade">Download from Billing</a></p>
-      <p>Questions? ${MAIL_SUPPORT}</p>`),
+      <p><a href="${APP_DASHBOARD_URL}/dashboard/upgrade">Download from Billing</a></p>`),
   });
 }
 
@@ -368,7 +365,7 @@ export async function sendSuspension(to, name, reason) {
     subject: "Your Nexwapi workspace was suspended",
     html: wrap("Account suspended", `<p>Hi ${name || "there"},</p>
       <p>Your workspace has been suspended${reason ? `: ${reason}` : ""}.</p>
-      <p>Contact ${MAIL_SUPPORT} to restore access.</p>`),
+      <p>Open your dashboard or reply to this email if you need help restoring access.</p>`),
   });
 }
 

@@ -136,6 +136,16 @@ async function applyCriticalPatches() {
 
     `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "webhookUrl" TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "rejectOptedOutApi" BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "teamShowMembersInAssignee" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "teamLeadCanAssignContacts" BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "teamLeadCanViewTeamContacts" BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "maxCustomTags" INTEGER NOT NULL DEFAULT 15`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "maxCustomEvents" INTEGER NOT NULL DEFAULT 2`,
+    `ALTER TABLE "QuickReply" ADD COLUMN IF NOT EXISTS "createdBy" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "QuickReply" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "language" TEXT NOT NULL DEFAULT 'en'`,
+    `ALTER TABLE "Team" ADD COLUMN IF NOT EXISTS "leadIds" TEXT[] DEFAULT ARRAY[]::TEXT[]`,
+    `ALTER TABLE "Team" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
   ];
 
   const tablePatches = [
@@ -239,6 +249,36 @@ async function applyCriticalPatches() {
     )`,
     `CREATE UNIQUE INDEX IF NOT EXISTS "RolePermission_companyId_role_key" ON "RolePermission"("companyId", "role")`,
     `CREATE INDEX IF NOT EXISTS "RolePermission_companyId_idx" ON "RolePermission"("companyId")`,
+
+    `CREATE TABLE IF NOT EXISTS "Tag" (
+      "id" TEXT NOT NULL,
+      "companyId" TEXT NOT NULL,
+      "name" TEXT NOT NULL,
+      "color" TEXT NOT NULL DEFAULT '#25D366',
+      "isDefault" BOOLEAN NOT NULL DEFAULT false,
+      "createdBy" TEXT NOT NULL DEFAULT '',
+      "deletedAt" TIMESTAMP(3),
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "Tag_pkey" PRIMARY KEY ("id")
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "Tag_companyId_name_key" ON "Tag"("companyId", "name")`,
+    `CREATE INDEX IF NOT EXISTS "Tag_companyId_idx" ON "Tag"("companyId")`,
+    `CREATE INDEX IF NOT EXISTS "Tag_companyId_deletedAt_idx" ON "Tag"("companyId", "deletedAt")`,
+
+    `CREATE TABLE IF NOT EXISTS "CustomEvent" (
+      "id" TEXT NOT NULL,
+      "companyId" TEXT NOT NULL,
+      "name" TEXT NOT NULL,
+      "traits" TEXT[] DEFAULT ARRAY[]::TEXT[],
+      "description" TEXT NOT NULL DEFAULT '',
+      "createdBy" TEXT NOT NULL DEFAULT '',
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "CustomEvent_pkey" PRIMARY KEY ("id")
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "CustomEvent_companyId_name_key" ON "CustomEvent"("companyId", "name")`,
+    `CREATE INDEX IF NOT EXISTS "CustomEvent_companyId_idx" ON "CustomEvent"("companyId")`,
 
     `CREATE TABLE IF NOT EXISTS "CommerceSetting" (
       "id" TEXT NOT NULL,

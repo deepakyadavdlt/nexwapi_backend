@@ -38,7 +38,7 @@ import {
   attachCompany, companyIdOf, tenantWhere, publicCompanyUser, uniqueSlug,
   requireNotSuspended, requireFeature, isSuperAdmin,
 } from "../lib/tenant.js";
-import { PLAN_CATALOG, normalizePlan, hasFeature, isPaidPlan } from "../lib/plans.js";
+import { PLAN_CATALOG, normalizePlan, hasFeature, isPaidPlan, planFeatures } from "../lib/plans.js";
 import { createAgentSeat, ensureOwnerAgent, listAgentsEnriched, updateAgentSeat, resetAgentInvitePassword, companySeatUsage, AGENT_ROLES } from "../lib/teamSeats.js";
 import {
   getAllRolePermissions,
@@ -333,9 +333,12 @@ router.patch("/me", requireAuth, attachCompany, async (req, res) => {
   const name = String(req.body?.name || "").trim();
   const companyName = String(req.body?.company || req.body?.companyName || "").trim();
   const phone = req.body?.phone != null ? String(req.body.phone).trim() : null;
+  const language = req.body?.language != null ? String(req.body.language).trim().toLowerCase() : null;
+  const allowedLangs = new Set(["en", "hi", "es", "pt", "id", "ar"]);
   const data = {};
   if (name) data.name = name;
   if (phone != null) data.phone = phone || null;
+  if (language && allowedLangs.has(language)) data.language = language;
   if (req.body?.password) {
     const next = String(req.body.password);
     if (next.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
@@ -364,7 +367,14 @@ router.patch("/me", requireAuth, attachCompany, async (req, res) => {
   const company = user.companyId
     ? await prisma.company.findUnique({ where: { id: user.companyId }, include: { subscription: true } })
     : user.company;
-  res.json(publicCompanyUser({ ...user, name: data.name || user.name }, company));
+  const rbac = user.companyId
+    ? await resolveWorkspaceRole({ user, companyId: user.companyId })
+    : { role: "Owner", permissions: {} };
+  res.json({
+    ...publicCompanyUser({ ...user, name: data.name || user.name }, company),
+    workspaceRole: rbac.role,
+    workspacePermissions: rbac.permissions,
+  });
 });
 
 router.post("/otp/send", requireAuth, async (req, res) => {
@@ -924,6 +934,26 @@ router.get("/v1/templates", async (req, res) => {
   });
 });
 
+/** Track a contact event (Interakt-style Event API). Auth via x-api-key. */
+router.post("/v1/events", apiMessageLimiter, async (req, res) => {
+  const auth = await requireApiKey(req, res);
+  if (!auth) return;
+  try {
+    const body = req.body || {};
+    const { trackContactEvent } = await import("../lib/customEvents.js");
+    const result = await trackContactEvent(auth.companyId, {
+      event: body.event || body.eventName || body.name,
+      phone: body.phone || body.phone_number || body.to,
+      userId: body.userId || body.user_id,
+      traits: body.traits || body.properties || {},
+    });
+    res.json(result);
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message, code: e.code || "ERROR" });
+    throw e;
+  }
+});
+
 router.post("/sales-leads", async (req, res) => {
   const name = String(req.body?.name || "").trim();
   const email = String(req.body?.email || "").toLowerCase().trim();
@@ -1316,21 +1346,78 @@ router.patch("/conversations/:id/status", async (req, res) => {
 });
 
 /* ---------------------------- Quick Replies ---------------------------- */
+function serializeQuickReply(q) {
+  return {
+    id: q.id,
+    title: q.title,
+    name: q.title,
+    text: q.text,
+    message: q.text,
+    createdBy: q.createdBy || "",
+    createdAt: q.createdAt instanceof Date ? q.createdAt.getTime() : q.createdAt,
+    updatedAt: q.updatedAt instanceof Date ? q.updatedAt.getTime() : q.updatedAt,
+  };
+}
+
 router.get("/quick-replies", async (req, res) => {
-  const items = await prisma.quickReply.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
-  res.json(items.map((q) => ({ ...q, createdAt: q.createdAt.getTime() })));
+  const q = String(req.query.q || "").trim();
+  const items = await prisma.quickReply.findMany({
+    where: {
+      ...tenantWhere(req),
+      ...(q
+        ? {
+            OR: [
+              { title: { contains: q, mode: "insensitive" } },
+              { text: { contains: q, mode: "insensitive" } },
+            ],
+          }
+        : {}),
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json(items.map(serializeQuickReply));
 });
 
 router.post("/quick-replies", async (req, res) => {
-  const { title, text } = req.body || {};
-  if (!title || !text) return res.status(400).json({ error: "title and text required" });
-  const q = await prisma.quickReply.create({ data: { companyId: companyIdOf(req), title, text } });
-  res.status(201).json({ ...q, createdAt: q.createdAt.getTime() });
+  const title = String(req.body?.title || req.body?.name || "").trim();
+  const text = String(req.body?.text || req.body?.message || "").trim();
+  if (!title || !text) return res.status(400).json({ error: "name and message required" });
+  if (text.length > 4000) return res.status(400).json({ error: "Message max 4000 characters" });
+  const q = await prisma.quickReply.create({
+    data: {
+      companyId: companyIdOf(req),
+      title,
+      text,
+      createdBy: req.user?.name || req.user?.email || "",
+    },
+  });
+  res.status(201).json(serializeQuickReply(q));
+});
+
+router.patch("/quick-replies/:id", async (req, res) => {
+  const existing = await prisma.quickReply.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.status(404).json({ error: "Not found" });
+  const title = req.body?.title != null || req.body?.name != null
+    ? String(req.body?.title || req.body?.name || "").trim()
+    : existing.title;
+  const text = req.body?.text != null || req.body?.message != null
+    ? String(req.body?.text || req.body?.message || "").trim()
+    : existing.text;
+  if (!title || !text) return res.status(400).json({ error: "name and message required" });
+  if (text.length > 4000) return res.status(400).json({ error: "Message max 4000 characters" });
+  const q = await prisma.quickReply.update({
+    where: { id: existing.id },
+    data: { title, text },
+  });
+  res.json(serializeQuickReply(q));
 });
 
 router.delete("/quick-replies/:id", async (req, res) => {
   try {
-    if (!(await otpGate(req, res, "quick_reply_delete"))) return;
+    // OTP optional: if body/query has otpRequired flow from inbox; settings page may skip
+    if (req.body?.otp !== undefined || req.query?.otp !== undefined) {
+      if (!(await otpGate(req, res, "quick_reply_delete"))) return;
+    }
     const deleted = await prisma.quickReply.deleteMany({ where: { id: req.params.id, ...tenantWhere(req) } });
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
@@ -1483,43 +1570,56 @@ router.patch("/agents/:id/availability", async (req, res) => {
 
 /* ------------------------------- Teams --------------------------------- */
 router.get("/teams", async (req, res) => {
-  const teams = await prisma.team.findMany({
-    where: tenantWhere(req),
-    orderBy: { name: "asc" },
-    include: { _count: { select: { agents: true } } },
-  });
-  res.json(teams.map((t) => ({
-    id: t.id,
-    name: t.name,
-    agentCount: t._count.agents,
-    createdAt: t.createdAt.getTime(),
-  })));
+  const { listTeamsDetailed } = await import("../lib/teams.js");
+  const teams = await listTeamsDetailed(companyIdOf(req), { q: req.query.q });
+  res.json(teams);
+});
+
+router.get("/teams/controls", async (req, res) => {
+  const { getTeamControls } = await import("../lib/teams.js");
+  res.json(await getTeamControls(companyIdOf(req)));
+});
+
+router.patch("/teams/controls", async (req, res) => {
+  const { updateTeamControls } = await import("../lib/teams.js");
+  res.json(await updateTeamControls(companyIdOf(req), req.body || {}));
+});
+
+router.get("/teams/:id", async (req, res) => {
+  const { getTeamDetailed } = await import("../lib/teams.js");
+  const team = await getTeamDetailed(companyIdOf(req), req.params.id);
+  if (!team) return res.status(404).json({ error: "Team not found" });
+  res.json(team);
 });
 
 router.post("/teams", async (req, res) => {
-  const name = String(req.body?.name || "").trim();
-  if (!name) return res.status(400).json({ error: "name required" });
   try {
-    const t = await prisma.team.create({
-      data: { companyId: companyIdOf(req), name },
+    const { upsertTeamMembers } = await import("../lib/teams.js");
+    const team = await upsertTeamMembers(companyIdOf(req), null, {
+      name: req.body?.name,
+      leadIds: req.body?.leadIds || [],
+      memberIds: req.body?.memberIds || req.body?.agentIds || [],
     });
-    res.status(201).json({ id: t.id, name: t.name, agentCount: 0, createdAt: t.createdAt.getTime() });
+    res.status(201).json(team);
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "Team already exists" });
+    if (e.status) return res.status(e.status).json({ error: e.message });
     throw e;
   }
 });
 
 router.patch("/teams/:id", async (req, res) => {
-  const name = String(req.body?.name || "").trim();
-  if (!name) return res.status(400).json({ error: "name required" });
-  const existing = await prisma.team.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
-  if (!existing) return res.sendStatus(404);
   try {
-    const t = await prisma.team.update({ where: { id: existing.id }, data: { name } });
-    res.json({ id: t.id, name: t.name, createdAt: t.createdAt.getTime() });
+    const { upsertTeamMembers } = await import("../lib/teams.js");
+    const team = await upsertTeamMembers(companyIdOf(req), req.params.id, {
+      name: req.body?.name,
+      leadIds: req.body?.leadIds,
+      memberIds: req.body?.memberIds ?? req.body?.agentIds,
+    });
+    res.json(team);
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "Team already exists" });
+    if (e.status) return res.status(e.status).json({ error: e.message });
     throw e;
   }
 });
@@ -2290,6 +2390,84 @@ router.delete("/labels/:id", async (req, res) => {
     if (deleted.count === 0) return res.sendStatus(404);
     res.sendStatus(204);
   } catch {
+    res.sendStatus(404);
+  }
+});
+
+/* ----------------------- Audience / contact tags ----------------------- */
+router.get("/tags", async (req, res) => {
+  if (!(await userHasWorkspacePermission(req, "settings.tags")) && !(await userHasWorkspacePermission(req, "contacts.access"))) {
+    // allow if either tags manage or contacts
+  }
+  const { listTags, tagsMeta } = await import("../lib/tags.js");
+  const deleted = String(req.query.deleted || "") === "1" || String(req.query.deleted || "") === "true";
+  const [tags, meta] = await Promise.all([
+    listTags(companyIdOf(req), { q: req.query.q, deleted }),
+    tagsMeta(companyIdOf(req)),
+  ]);
+  res.json({ tags, meta, viewDeleted: deleted });
+});
+
+router.get("/tags/meta", async (req, res) => {
+  const { tagsMeta } = await import("../lib/tags.js");
+  res.json(await tagsMeta(companyIdOf(req)));
+});
+
+router.post("/tags", async (req, res) => {
+  if (!(await userHasWorkspacePermission(req, "settings.tags")) && !(await userHasWorkspacePermission(req, "contacts.bulk_tag"))) {
+    const rbac = await resolveWorkspaceRole(req);
+    if (!["Owner", "Admin", "Super Admin"].includes(rbac.role)) {
+      return res.status(403).json({ error: "You do not have permission to manage tags", code: "PERMISSION_DENIED" });
+    }
+  }
+  try {
+    const { createTag } = await import("../lib/tags.js");
+    const tag = await createTag(companyIdOf(req), {
+      name: req.body?.name,
+      color: req.body?.color,
+      createdBy: req.user?.name || req.user?.email || "",
+    });
+    res.status(201).json(tag);
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message, code: e.code });
+    throw e;
+  }
+});
+
+router.post("/tags/bulk-delete", async (req, res) => {
+  try {
+    const { softDeleteTags } = await import("../lib/tags.js");
+    const result = await softDeleteTags(companyIdOf(req), req.body?.ids || []);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    throw e;
+  }
+});
+
+router.post("/tags/:id/restore", async (req, res) => {
+  try {
+    const { restoreTag } = await import("../lib/tags.js");
+    res.json(await restoreTag(companyIdOf(req), req.params.id));
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message, code: e.code });
+    throw e;
+  }
+});
+
+router.delete("/tags/:id", async (req, res) => {
+  try {
+    const hard = String(req.query.hard || "") === "1";
+    if (hard) {
+      const { hardDeleteTag } = await import("../lib/tags.js");
+      await hardDeleteTag(companyIdOf(req), req.params.id);
+      return res.sendStatus(204);
+    }
+    const { softDeleteTags } = await import("../lib/tags.js");
+    await softDeleteTags(companyIdOf(req), [req.params.id]);
+    res.sendStatus(204);
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
     res.sendStatus(404);
   }
 });
@@ -3249,7 +3427,103 @@ router.delete("/flows/:id", asyncRoute(async (req, res) => {
   res.sendStatus(204);
 }));
 
+/* ------------------------------ Events Settings ------------------------------- */
+router.get("/events-settings", async (req, res) => {
+  const { listEventsSettings } = await import("../lib/customEvents.js");
+  res.json(await listEventsSettings(companyIdOf(req)));
+});
+
+router.post("/events-settings/custom", async (req, res) => {
+  try {
+    const { createCustomEvent } = await import("../lib/customEvents.js");
+    const row = await createCustomEvent(companyIdOf(req), {
+      name: req.body?.name,
+      traits: req.body?.traits,
+      description: req.body?.description,
+      createdBy: req.user?.name || req.user?.email || "",
+    });
+    res.status(201).json(row);
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message, code: e.code });
+    throw e;
+  }
+});
+
+router.delete("/events-settings/custom/:id", async (req, res) => {
+  try {
+    const { deleteCustomEvent } = await import("../lib/customEvents.js");
+    await deleteCustomEvent(companyIdOf(req), req.params.id);
+    res.sendStatus(204);
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    res.sendStatus(404);
+  }
+});
+
 /* ------------------------------ Settings ------------------------------- */
+router.get("/account-details", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const company = await prisma.company.findUnique({
+    where: { id: companyId },
+    include: { subscription: true },
+  });
+  if (!company) return res.status(404).json({ error: "Company not found" });
+  const waAccounts = await prisma.whatsAppAccount.findMany({
+    where: { companyId },
+    orderBy: [{ isDefault: "desc" }, { createdAt: "asc" }],
+  });
+  const wa = waAccounts.find((a) => a.isDefault) || waAccounts[0] || null;
+  const plan = normalizePlan(company.plan || "trial");
+  const planMeta = planFeatures(plan);
+  const sub = company.subscription;
+  const trialEndsAt = company.trialEndsAt || sub?.trialEndsAt || null;
+  const startAt = sub?.activatedAt || company.upgradedAt || company.trialStartedAt || company.createdAt;
+  const endAt = sub?.expiresAt || (plan === "trial" ? trialEndsAt : null);
+  const isTrial = plan === "trial" || company.status === "TRIAL";
+  const subscriptionType = isTrial
+    ? `${planMeta.name || "Growth"} (free trial)`
+    : `${planMeta.name || plan}${sub?.billingCycle ? ` · ${sub.billingCycle}` : ""}`;
+
+  const accounts = [
+    {
+      id: company.id,
+      name: company.name,
+      initial: String(company.name || "N").slice(0, 1).toUpperCase(),
+      type: "whatsapp",
+    },
+  ];
+
+  res.json({
+    accounts,
+    activeAccountId: company.id,
+    organization: {
+      name: company.name,
+      creationDate: company.createdAt.getTime(),
+      organizationId: company.id,
+      facebookBusinessManagerId: wa?.businessId || null,
+      whatsappBusinessId: wa?.wabaId || null,
+      phoneNumberId: wa?.phoneNumberId || null,
+      displayPhoneNumber: wa?.displayPhoneNumber || wa?.phoneNumber || null,
+      subscriptionType,
+      subscriptionStartDate: startAt ? new Date(startAt).getTime() : null,
+      subscriptionEndDate: endAt ? new Date(endAt).getTime() : null,
+      plan,
+      planName: planMeta.name || plan,
+      status: company.status,
+      freeAccess: Boolean(company.freeAccess),
+    },
+    whatsappAccounts: waAccounts.map((a) => ({
+      id: a.id,
+      name: a.businessName || a.verifiedName || a.displayPhoneNumber || "WhatsApp",
+      phone: a.displayPhoneNumber || a.phoneNumber || null,
+      wabaId: a.wabaId || null,
+      businessId: a.businessId || null,
+      isConnected: Boolean(a.isConnected),
+      isDefault: Boolean(a.isDefault),
+    })),
+  });
+});
+
 router.get("/settings", async (req, res) => {
   const companyId = companyIdOf(req);
   const s = await prisma.setting.upsert({

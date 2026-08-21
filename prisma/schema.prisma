@@ -79,8 +79,11 @@ model Company {
   commerceOrders   CommerceOrder[]
   integrations     Integration[]
   labels           Label[]
+  tags             Tag[]
+  customEvents     CustomEvent[]
   assignmentRules  AssignmentRule[]
   apiKeys          ApiKey[]
+  quickReplies     QuickReply[]
   setting          Setting?
   couponsRedemptions CouponRedemption[]
   usage            Usage[]
@@ -102,6 +105,7 @@ model User {
   lastLoginAt  DateTime?
   lastActiveAt DateTime?
   permissions  Json?
+  language     String    @default("en")
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   payments     Payment[]
@@ -348,7 +352,10 @@ model Team {
   companyId String
   company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
   name      String
+  /// Agent IDs who are team leads
+  leadIds   String[] @default([])
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
   agents    Agent[]
 
   @@unique([companyId, name])
@@ -449,6 +456,40 @@ model Label {
   name      String
   color     String   @default("#25D366")
   createdAt DateTime @default(now())
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+/** Audience / contact tags for campaigns & filters (Interakt Manage Tags). */
+model Tag {
+  id         String    @id @default(cuid())
+  companyId  String
+  company    Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name       String
+  color      String    @default("#25D366")
+  isDefault  Boolean   @default(false)
+  createdBy  String    @default("")
+  deletedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([companyId, deletedAt])
+}
+
+/** Custom contact events (Interakt-style Events Settings + Event API). */
+model CustomEvent {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name        String
+  traits      String[] @default([])
+  description String   @default("")
+  createdBy   String   @default("")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   @@unique([companyId, name])
   @@index([companyId])
@@ -670,6 +711,12 @@ model Setting {
   webhookUrl         String   @default("")
   /** When true, public Message Send API returns error for opted-out contacts. */
   rejectOptedOutApi  Boolean  @default(true)
+  /** Team controls — Interakt-style manage teams */
+  teamShowMembersInAssignee Boolean @default(false)
+  teamLeadCanAssignContacts Boolean @default(true)
+  teamLeadCanViewTeamContacts Boolean @default(true)
+  maxCustomTags Int @default(15)
+  maxCustomEvents Int @default(2)
   csatEnabled  Boolean  @default(false)
   csatMessage  String   @default("Thanks for chatting with us! How would you rate your experience?")
   updatedAt    DateTime @updatedAt
@@ -799,9 +846,12 @@ model Template {
 model QuickReply {
   id        String   @id @default(cuid())
   companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
   title     String
   text      String
+  createdBy String   @default("")
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([companyId])
 }

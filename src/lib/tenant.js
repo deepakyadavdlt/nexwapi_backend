@@ -113,6 +113,7 @@ export function publicCompanyUser(user, company) {
     name: user.name,
     email: user.email,
     phone: user.phone || "",
+    language: user.language || "en",
     role: user.role,
     companyId: company?.id || user.companyId || null,
     companyName: company?.name || null,

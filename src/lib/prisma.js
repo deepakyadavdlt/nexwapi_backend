@@ -28,6 +28,7 @@ export const toMessage = (m) => ({
   mediaUrl: m.mediaUrl || null,
   filename: m.filename || null,
   status: m.status,
+  error: m.error || null,
   senderName: m.senderName || null,
   senderUserId: m.senderUserId || null,
   at: m.at.getTime(),

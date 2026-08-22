@@ -45,21 +45,142 @@ async function send(payload, creds) {
     body: JSON.stringify({ messaging_product: "whatsapp", ...payload }),
   });
   const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`WhatsApp send failed: ${res.status} ${JSON.stringify(data)}`);
-  }
+  if (!res.ok || data?.error) throwWaError(data, res.status);
   return data;
 }
 
-function waTo(to) {
-  return String(to || "").replace(/\D/g, "");
+const META_HINTS = {
+  131049: "Meta blocked this marketing template (quality / recipient preference). Use a Utility template, or send only after the customer messages you first.",
+  131026: "This number is not on WhatsApp or cannot receive the message. Use country code (e.g. 91…).",
+  132001: "Template name/language was not found on this WhatsApp account. Open Templates → Sync from Meta.",
+  132015: "Meta paused this template. Create a new Utility template and wait for approval.",
+  131047: "24-hour session closed. Send an approved template, not free text.",
+  132000: "Template variables do not match Meta ({{1}}, {{2}}, header/buttons). Sync from Meta and fill every variable.",
+  131008: "Required template parameter is missing.",
+  133010: "Phone number is not registered on Cloud API. Reconnect WhatsApp.",
+};
+
+function throwWaError(data, status) {
+  const err = data?.error || {};
+  const code = err.code;
+  const details = err.error_data?.details || err.error_user_msg || err.message || JSON.stringify(data);
+  const hint = META_HINTS[code];
+  const e = new Error(hint ? `${code}: ${hint}` : code ? `${code}: ${details}` : String(details));
+  e.metaCode = code;
+  e.status = status >= 400 ? status : 502;
+  throw e;
 }
 
-function waLang(code) {
-  const c = String(code || "en").trim();
-  if (c === "en") return "en_US";
-  if (c === "hi") return "hi_IN";
-  return c;
+/** E.164 digits. 10-digit local IN numbers get 91. */
+export function waTo(to) {
+  let d = String(to || "").replace(/\D/g, "");
+  if (d.startsWith("00")) d = d.slice(2);
+  if (d.startsWith("0") && d.length === 11) d = d.slice(1);
+  if (d.length === 10) d = `91${d}`;
+  return d;
+}
+
+export function waLang(code) {
+  const raw = String(code || "en").trim().replace(/-/g, "_");
+  if (!raw) return "en_US";
+  const lower = raw.toLowerCase();
+  if (lower === "en" || lower === "en_us") return "en_US";
+  if (lower === "hi" || lower === "hi_in") return "hi_IN";
+  const [lang, region] = raw.split("_");
+  if (region) return `${lang.toLowerCase()}_${region.toUpperCase()}`;
+  return lower;
+}
+
+function templateVarCount(text) {
+  const nums = [...String(text || "").matchAll(/\{\{(\d+)\}\}/g)].map((m) => Number(m[1]));
+  return nums.length ? Math.max(...nums) : 0;
+}
+
+/**
+ * Send an approved template using Meta's live definition (language + body vars).
+ * Falls back to the local language/body if the WABA list is unavailable.
+ */
+export async function sendResolvedTemplate(to, name, { params = [], language, body, creds } = {}) {
+  let meta = null;
+  try {
+    const list = await listTemplates(creds);
+    meta = (list || []).find((t) => t.name === name && String(t.status).toUpperCase() === "APPROVED")
+      || (list || []).find((t) => t.name === name)
+      || null;
+  } catch (e) {
+    console.warn("[wa] template lookup failed:", e.message);
+  }
+
+  if (meta && String(meta.status || "").toUpperCase() === "PAUSED") {
+    const err = new Error("132015: Meta paused this template. Create a new Utility template.");
+    err.metaCode = 132015;
+    err.status = 400;
+    throw err;
+  }
+
+  const lang = waLang(meta?.language || language || "en");
+  const components = [];
+  const comps = Array.isArray(meta?.components) ? meta.components : [];
+  const bodyComp = comps.find((c) => String(c.type).toUpperCase() === "BODY");
+  const headerComp = comps.find((c) => String(c.type).toUpperCase() === "HEADER");
+  const bodyText = bodyComp?.text || body || "";
+  const bodyVars = templateVarCount(bodyText);
+  const headerTextVars = headerComp && String(headerComp.format || "").toUpperCase() === "TEXT"
+    ? templateVarCount(headerComp.text || "")
+    : 0;
+
+  const filled = Array.from({ length: Math.max(bodyVars, params.length) }, (_, i) => {
+    const v = params[i];
+    return String(v == null || v === "" ? (params[0] || "Customer") : v).slice(0, 1024);
+  });
+
+  if (headerTextVars) {
+    components.push({
+      type: "header",
+      parameters: Array.from({ length: headerTextVars }, (_, i) => ({
+        type: "text",
+        text: filled[i] || "Customer",
+      })),
+    });
+  }
+
+  if (bodyVars) {
+    components.push({
+      type: "body",
+      parameters: Array.from({ length: bodyVars }, (_, i) => ({
+        type: "text",
+        text: filled[i] || "Customer",
+      })),
+    });
+  } else if (params.filter(Boolean).length && !meta) {
+    components.push({
+      type: "body",
+      parameters: params.filter(Boolean).map((t) => ({ type: "text", text: String(t) })),
+    });
+  }
+
+  const buttons = comps.find((c) => String(c.type).toUpperCase() === "BUTTONS")?.buttons || [];
+  buttons.forEach((b, idx) => {
+    const urlVars = templateVarCount(b.url || "");
+    if (String(b.type).toUpperCase() === "URL" && urlVars) {
+      components.push({
+        type: "button",
+        sub_type: "url",
+        index: String(idx),
+        parameters: Array.from({ length: urlVars }, () => ({ type: "text", text: "https://nexwapi.com" })),
+      });
+    }
+  });
+
+  return send({
+    to: waTo(to),
+    type: "template",
+    template: {
+      name,
+      language: { code: lang },
+      ...(components.length ? { components } : {}),
+    },
+  }, creds);
 }
 
 export function sendText(to, body, creds) {
@@ -180,7 +301,7 @@ export function sendMediaById(to, waType, mediaId, { filename, caption } = {}, c
   const media = { id: mediaId };
   if (filename) media.filename = filename;
   if (caption) media.caption = caption;
-  return send({ to, type: waType, [waType]: media }, creds);
+  return send({ to: waTo(to), type: waType, [waType]: media }, creds);
 }
 
 export function sendTemplateWithParams(to, name, params = [], lang = "en", creds) {
@@ -311,11 +432,11 @@ export async function getCompanyCreds(companyId) {
   };
 }
 
-/** Tenant creds first; fall back to platform Meta env when live (for admin / unconnected clients). */
+/** Tenant creds first. Never send a connected client's campaigns from the platform number. */
 export async function getEffectiveCreds(companyId) {
   const tenant = await getCompanyCreds(companyId);
   if (tenant?.incomplete) return tenant;
-  if (tenant?.phoneNumberId && tenant?.accessToken && tenant?.wabaId) return tenant;
+  if (tenant?.phoneNumberId && tenant?.accessToken) return tenant;
   if (WA_LIVE && WA.phoneNumberId && WA.accessToken && WA.wabaId) {
     return {
       phoneNumberId: WA.phoneNumberId,
@@ -334,6 +455,19 @@ export function assertLiveCreds(creds) {
       "WhatsApp Meta credentials are incomplete. Open Dashboard → WhatsApp and reconnect with Facebook."
     );
     err.code = "WA_CREDS_INCOMPLETE";
+    err.status = 400;
+    throw err;
+  }
+}
+
+/** Campaigns / templates must go out from the workspace number, not Nexwapi platform. */
+export function assertTenantOutbound(creds) {
+  assertLiveCreds(creds);
+  if (creds?.platformFallback || !creds?.phoneNumberId || !creds?.accessToken) {
+    const err = new Error(
+      "Connect this workspace WhatsApp (Dashboard → WhatsApp) before sending campaigns. Reconnect with Facebook so Phone ID and WABA are saved."
+    );
+    err.code = "WA_NOT_CONNECTED";
     err.status = 400;
     throw err;
   }

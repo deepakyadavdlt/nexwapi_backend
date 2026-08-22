@@ -815,6 +815,7 @@ model Message {
   mediaUrl  String?
   filename  String?
   status    String   @default("sent")
+  error     String?
   senderName String?
   senderUserId String?
   automationSource String?

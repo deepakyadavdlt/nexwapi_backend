@@ -1,6 +1,6 @@
 // lib/campaignRunner.js — runs a broadcast campaign (used by the API route and the scheduler).
 import { prisma } from "./prisma.js";
-import { sendTemplate, sendTemplateWithParams } from "./whatsappService.js";
+import { sendResolvedTemplate, getEffectiveCreds, assertTenantOutbound } from "./whatsappService.js";
 import { buildSegmentContactWhere } from "./segmentFilters.js";
 
 // Build the contact filter for a campaign audience: "All contacts", "Tag: x", or "Segment: name".
@@ -59,10 +59,9 @@ export async function runCampaign(id) {
     throw new Error("Plan expired — add wallet credits or upgrade");
   }
 
-  const { getEffectiveCreds, assertLiveCreds } = await import("./whatsappService.js");
   const { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } = await import("./wallet.js");
   const creds = await getEffectiveCreds(companyId);
-  assertLiveCreds(creds);
+  assertTenantOutbound(creds);
   const pricing = await getPlatformPricing();
   const creditsNeeded = pricing.creditPerOutbound || 1;
 
@@ -78,10 +77,11 @@ export async function runCampaign(id) {
 
   await prisma.campaign.update({
     where: { id },
-    data: { status: "running", recipients: contacts.length, sent: 0, delivered: 0, read: 0, replied: 0 },
+    data: { status: "running", recipients: contacts.length, sent: 0, delivered: 0, read: 0, replied: 0, failed: 0 },
   });
 
-  let sent = 0, delivered = 0;
+  let sent = 0;
+  let failed = 0;
   for (const c of contacts) {
     let debited = false;
     try {
@@ -92,13 +92,16 @@ export async function runCampaign(id) {
         });
         if (charge.charged) debited = true;
       }
-      const params = Array.from({ length: varCount }, () => c.name);
-      const r = params.length
-        ? await sendTemplateWithParams(c.phone, campaign.template, params, lang, creds)
-        : await sendTemplate(c.phone, campaign.template, lang, creds);
+      const params = Array.from({ length: varCount }, () => c.name || "Customer");
+      const r = await sendResolvedTemplate(c.phone, campaign.template, {
+        params,
+        language: lang,
+        body: tpl.body,
+        creds,
+      });
       sent++;
       let text = tpl?.body || `[Template: ${campaign.template}]`;
-      params.forEach((p, i) => { text = text.replace(`{{${i + 1}}}`, p); });
+      params.forEach((p, i) => { text = text.replace(new RegExp(`\\{\\{${i + 1}\\}\\}`, "g"), p); });
       await prisma.message.create({
         data: {
           companyId,
@@ -112,7 +115,20 @@ export async function runCampaign(id) {
       });
       await prisma.campaign.update({ where: { id }, data: { sent } });
     } catch (e) {
+      failed++;
       console.error("[campaign] failed to", c.phone, ":", e.message);
+      await prisma.message.create({
+        data: {
+          companyId,
+          contactId: c.id,
+          direction: "out",
+          type: "template",
+          text: tpl?.body || `[Template: ${campaign.template}]`,
+          status: "failed",
+          error: String(e.message || "Send failed").slice(0, 500),
+        },
+      }).catch(() => {});
+      await prisma.campaign.update({ where: { id }, data: { failed } }).catch(() => {});
       if (debited) {
         await refundCredits(companyId, creditsNeeded, "message_refund", {
           campaignId: id,
@@ -123,8 +139,9 @@ export async function runCampaign(id) {
       if (e.code === "NO_CREDITS") break;
     }
   }
-  await prisma.campaign.update({ where: { id }, data: { status: "completed", scheduledAt: null } });
-  console.log(`[campaign] "${campaign.name}" done: ${sent}/${contacts.length} sent`);
+  const status = sent === 0 ? "failed" : "completed";
+  await prisma.campaign.update({ where: { id }, data: { status, scheduledAt: null, sent, failed } });
+  console.log(`[campaign] "${campaign.name}" done: ${sent}/${contacts.length} sent, ${failed} failed`);
   try {
     const owner = await prisma.user.findFirst({
       where: { companyId: campaign.companyId, role: { in: ["OWNER", "ADMIN"] } },
@@ -132,7 +149,7 @@ export async function runCampaign(id) {
     });
     if (owner?.email) {
       const { sendCampaignStatus } = await import("./mailer.js");
-      await sendCampaignStatus(owner.email, campaign.name, "completed");
+      await sendCampaignStatus(owner.email, campaign.name, status);
     }
   } catch (e) {
     console.warn("[mail campaign]", e.message);

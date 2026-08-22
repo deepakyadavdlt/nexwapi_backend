@@ -1,6 +1,6 @@
 // lib/dripRunner.js — sends drip campaign steps on schedule.
 import { prisma } from "./prisma.js";
-import { sendTemplate, sendTemplateWithParams, getCompanyCreds } from "./whatsappService.js";
+import { sendResolvedTemplate, getCompanyCreds, getEffectiveCreds, assertTenantOutbound } from "./whatsappService.js";
 import { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } from "./wallet.js";
 
 const HOUR = 60 * 60 * 1000;
@@ -45,7 +45,8 @@ export async function runDueDrips() {
     const company = await prisma.company.findUnique({ where: { id: companyId } });
     if (company?.status === "SUSPENDED") continue;
 
-    const creds = await getCompanyCreds(companyId);
+    const creds = await getEffectiveCreds(companyId);
+    assertTenantOutbound(creds);
     let debited = false;
 
     try {
@@ -58,10 +59,13 @@ export async function runDueDrips() {
       }
       const tpl = await prisma.template.findFirst({ where: { name: step.template, companyId } });
       const varCount = tpl ? (tpl.body.match(/\{\{\d+\}\}/g) || []).length : 0;
-      const params = Array.from({ length: varCount }, () => contact.name);
-      const r = params.length
-        ? await sendTemplateWithParams(contact.phone, step.template, params, tpl?.language || "en", creds)
-        : await sendTemplate(contact.phone, step.template, tpl?.language || "en", creds);
+      const params = Array.from({ length: varCount }, () => contact.name || "Customer");
+      const r = await sendResolvedTemplate(contact.phone, step.template, {
+        params,
+        language: tpl?.language || "en",
+        body: tpl?.body,
+        creds,
+      });
       let text = tpl?.body || `[Template: ${step.template}]`;
       params.forEach((p, i) => { text = text.replace(`{{${i + 1}}}`, p); });
       await prisma.message.create({

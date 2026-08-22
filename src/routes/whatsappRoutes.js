@@ -544,36 +544,43 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
         for (const s of value.statuses || []) {
           const next = String(s.status || "").toLowerCase();
           if (!s.id || !next) continue;
+          const err0 = Array.isArray(s.errors) ? s.errors[0] : null;
+          const errorText = err0
+            ? `${err0.code || ""}: ${err0.error_data?.details || err0.title || err0.message || "failed"}`.replace(/^: /, "").trim()
+            : null;
+          const prev = await prisma.message.findFirst({ where: { waId: s.id } });
           const updated = await prisma.message.updateMany({
             where: { waId: s.id },
-            data: { status: next },
+            data: { status: next, ...(errorText ? { error: errorText } : {}) },
           });
           if (updated.count === 0) {
             console.log("[wa] status unmatched", s.id, next);
             continue;
           }
-          console.log("[wa] status", s.id, "->", next);
-          const statusCompanyId = companyId || (await prisma.message.findFirst({ where: { waId: s.id } }))?.companyId;
+          console.log("[wa] status", s.id, "->", next, errorText || "");
+          const msg = prev || (await prisma.message.findFirst({ where: { waId: s.id } }));
+          const statusCompanyId = companyId || msg?.companyId;
           if (statusCompanyId) {
             fireEvent(statusCompanyId, "message.status", {
               waId: s.id,
               status: next,
               recipient: s.recipient_id || null,
               timestamp: s.timestamp || null,
+              error: errorText,
             }).catch(() => {});
           }
-          if (next === "delivered" || next === "read") {
-            const msg = await prisma.message.findFirst({ where: { waId: s.id } });
-            if (msg?.type === "template" && msg.companyId) {
-              const camp = await prisma.campaign.findFirst({
-                where: { companyId: msg.companyId, status: { in: ["running", "completed"] } },
-                orderBy: { updatedAt: "desc" },
-              });
-              if (camp) {
-                await prisma.campaign.update({
-                  where: { id: camp.id },
-                  data: next === "read" ? { read: { increment: 1 } } : { delivered: { increment: 1 } },
-                }).catch(() => {});
+          if (msg?.type === "template" && msg.companyId) {
+            const camp = await prisma.campaign.findFirst({
+              where: { companyId: msg.companyId, status: { in: ["running", "completed"] } },
+              orderBy: { updatedAt: "desc" },
+            });
+            if (camp) {
+              const data = {};
+              if (next === "read") data.read = { increment: 1 };
+              else if (next === "delivered") data.delivered = { increment: 1 };
+              else if (next === "failed" && prev?.status !== "failed") data.failed = { increment: 1 };
+              if (Object.keys(data).length) {
+                await prisma.campaign.update({ where: { id: camp.id }, data }).catch(() => {});
               }
             }
           }

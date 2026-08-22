@@ -1202,15 +1202,6 @@ router.delete("/sales-leads/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
-router.get("/campaigns", async (_req, res) => {
-  const campaigns = await prisma.campaign.findMany({
-    orderBy: { createdAt: "desc" },
-    take: 50,
-    include: { company: { select: { name: true } } },
-  });
-  res.json(campaigns.map((c) => ({ ...c, companyName: c.company?.name })));
-});
-
 async function requirePlatformWa() {
   const creds = platformWaCreds();
   if (!creds) {

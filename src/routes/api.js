@@ -7,8 +7,8 @@ import fs from "fs";
 import path from "path";
 import { prisma, toMessage, pickColor } from "../lib/prisma.js";
 import {
-  sendText, sendTemplate, sendTemplateWithParams, createTemplate, listTemplates,
-  uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getEffectiveCreds, assertLiveCreds,
+  sendText, sendTemplate, sendTemplateWithParams, sendResolvedTemplate, createTemplate, listTemplates,
+  uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getEffectiveCreds, assertLiveCreds, assertTenantOutbound,
 } from "../lib/whatsappService.js";
 import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits, templateChargeCredits } from "../lib/wallet.js";
 import {
@@ -782,9 +782,12 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
   try {
     let result;
     if (template) {
-      result = params?.length
-        ? await sendTemplateWithParams(to, template, params, language, creds)
-        : await sendTemplate(to, template, language, creds);
+      assertTenantOutbound(creds);
+      result = await sendResolvedTemplate(to, template, {
+        params: params || [],
+        language,
+        creds,
+      });
     } else if (text) {
       result = await sendText(to, text, creds);
     } else {
@@ -2591,10 +2594,13 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
   const creds = await getEffectiveCreds(companyId);
   let waId = null;
   try {
-    assertLiveCreds(creds);
-    const result = params.length
-      ? await sendTemplateWithParams(contact.phone, template, params, language, creds)
-      : await sendTemplate(contact.phone, template, language, creds);
+    assertTenantOutbound(creds);
+    const result = await sendResolvedTemplate(contact.phone, template, {
+      params,
+      language,
+      body: (await prisma.template.findFirst({ where: { name: template, ...tenantWhere(req) } }))?.body,
+      creds,
+    });
     waId = result.messages?.[0]?.id || null;
   } catch (e) {
     if (charge.charged) {
@@ -2604,7 +2610,7 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
         template,
       }).catch(() => {});
     }
-    const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" ? 400 : 502);
+    const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" || e.code === "WA_NOT_CONNECTED" ? 400 : 502);
     return res.status(status).json({ error: e.message, code: e.code || undefined });
   }
 
@@ -2874,11 +2880,17 @@ router.post("/templates/sync", async (req, res) => {
       const existing = await prisma.template.findFirst({ where: { name: mt.name, ...tenantWhere(req) } });
       if (existing) {
         const prev = existing.status;
-        await prisma.template.update({ where: { id: existing.id }, data: { status, category: cap(mt.category), language: mt.language } });
+        const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
+        const body = bodyComp?.text || existing.body;
+        await prisma.template.update({
+          where: { id: existing.id },
+          data: { status, category: cap(mt.category), language: mt.language, body },
+        });
         if (prev !== status && /approv|reject/i.test(status)) {
           notifyOwnerTemplate(companyIdOf(req), mt.name, status);
         }
       } else {
+        const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
         await prisma.template.create({
           data: {
             companyId: companyIdOf(req),
@@ -2886,7 +2898,7 @@ router.post("/templates/sync", async (req, res) => {
             status,
             category: cap(mt.category),
             language: mt.language,
-            body: "(synced from Meta — edit in WhatsApp Manager)",
+            body: bodyComp?.text || "(synced from Meta)",
           },
         });
       }

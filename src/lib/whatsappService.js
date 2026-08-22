@@ -80,15 +80,21 @@ export function waTo(to) {
   return d;
 }
 
-export function waLang(code) {
-  const raw = String(code || "en").trim().replace(/-/g, "_");
-  if (!raw) return "en_US";
-  const lower = raw.toLowerCase();
-  if (lower === "en" || lower === "en_us") return "en_US";
-  if (lower === "hi" || lower === "hi_in") return "hi_IN";
+/** Casing only. Never map en → en_US — Meta treats those as two different templates. */
+export function metaLangCode(code) {
+  const raw = String(code || "").trim().replace(/-/g, "_");
+  if (!raw) return "";
   const [lang, region] = raw.split("_");
   if (region) return `${lang.toLowerCase()}_${region.toUpperCase()}`;
-  return lower;
+  return lang.toLowerCase();
+}
+
+/** Default for *creating* templates. Do not use this as the only send language. */
+export function waLang(code) {
+  const c = metaLangCode(code) || "en_US";
+  if (c === "en") return "en_US";
+  if (c === "hi") return "hi_IN";
+  return c;
 }
 
 function templateVarCount(text) {
@@ -96,21 +102,66 @@ function templateVarCount(text) {
   return nums.length ? Math.max(...nums) : 0;
 }
 
+function sendLanguageTries(metaLanguage, requested) {
+  const tries = [];
+  const push = (c) => {
+    const v = metaLangCode(c);
+    if (v && !tries.includes(v)) tries.push(v);
+  };
+  push(metaLanguage);
+  push(requested);
+  // Most Cloud API English templates are en_US; old sends used `en` and hit 132001.
+  push("en_US");
+  push("en");
+  return tries;
+}
+
+async function wabaIdForSending(creds) {
+  const stored = creds?.wabaId || null;
+  const phoneNumberId = creds?.phoneNumberId;
+  const accessToken = creds?.accessToken;
+  if (!phoneNumberId || !accessToken) return stored;
+  try {
+    const version = WA.version || "v22.0";
+    const res = await fetch(
+      `https://graph.facebook.com/${version}/${phoneNumberId}?fields=whatsapp_business_account`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    const data = await res.json();
+    const live = data?.whatsapp_business_account?.id;
+    if (live && stored && live !== stored) {
+      console.warn("[wa] stored WABA", stored, "!= phone WABA", live, "— using phone WABA for templates");
+    }
+    return live || stored;
+  } catch (e) {
+    console.warn("[wa] phone WABA lookup failed:", e.message);
+    return stored;
+  }
+}
+
 /**
  * Send an approved template using Meta's live definition (language + body vars).
- * Falls back to the local language/body if the WABA list is unavailable.
+ * Retries en / en_US on 132001 because Meta stores one code and rejects the other.
  */
 export async function sendResolvedTemplate(to, name, { params = [], language, body, creds } = {}) {
-  let meta = null;
+  const wabaId = await wabaIdForSending(creds);
+  const sendCreds = { ...creds, wabaId };
+  if (!wabaId) {
+    const err = new Error("Connect WhatsApp (Dashboard → WhatsApp) so the WABA ID is saved, then Sync from Meta.");
+    err.code = "WA_NOT_CONNECTED";
+    err.status = 400;
+    throw err;
+  }
+
+  let list = [];
   try {
-    const list = await listTemplates(creds);
-    meta = (list || []).find((t) => t.name === name && String(t.status).toUpperCase() === "APPROVED")
-      || (list || []).find((t) => t.name === name)
-      || null;
+    list = await listTemplates(sendCreds);
   } catch (e) {
     console.warn("[wa] template lookup failed:", e.message);
   }
 
+  const asked = String(name || "").trim();
+  const meta = pickMetaTemplate(list, asked);
   if (meta && String(meta.status || "").toUpperCase() === "PAUSED") {
     const err = new Error("132015: Meta paused this template. Create a new Utility template.");
     err.metaCode = 132015;
@@ -118,8 +169,23 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
     throw err;
   }
 
-  const lang = waLang(meta?.language || language || "en");
-  const components = [];
+  const approved = (list || [])
+    .filter((t) => String(t.status).toUpperCase() === "APPROVED")
+    .map((t) => `${t.name} (${t.language})`);
+
+  // Nexwapi DB can say Approved while this sending number's WABA does not have the template.
+  if (!meta && approved.length) {
+    const err = new Error(
+      `132001: "${asked}" is WhatsApp number pe nahi mila. Nexwapi pe Approved dikhna kaafi nahi.`
+      + ` Is number pe approved: ${approved.join(", ")}.`
+      + " Templates → Sync from Meta, phir wahi exact name Inbox/Campaign se bhejo."
+    );
+    err.metaCode = 132001;
+    err.status = 400;
+    throw err;
+  }
+
+  const tplName = meta?.name || asked.toLowerCase().replace(/\s+/g, "_");
   const comps = Array.isArray(meta?.components) ? meta.components : [];
   const bodyComp = comps.find((c) => String(c.type).toUpperCase() === "BODY");
   const headerComp = comps.find((c) => String(c.type).toUpperCase() === "HEADER");
@@ -134,6 +200,7 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
     return String(v == null || v === "" ? (params[0] || "Customer") : v).slice(0, 1024);
   });
 
+  const components = [];
   if (headerTextVars) {
     components.push({
       type: "header",
@@ -143,7 +210,6 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
       })),
     });
   }
-
   if (bodyVars) {
     components.push({
       type: "body",
@@ -152,13 +218,7 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
         text: filled[i] || "Customer",
       })),
     });
-  } else if (params.filter(Boolean).length && !meta) {
-    components.push({
-      type: "body",
-      parameters: params.filter(Boolean).map((t) => ({ type: "text", text: String(t) })),
-    });
   }
-
   const buttons = comps.find((c) => String(c.type).toUpperCase() === "BUTTONS")?.buttons || [];
   buttons.forEach((b, idx) => {
     const urlVars = templateVarCount(b.url || "");
@@ -172,15 +232,34 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
     }
   });
 
-  return send({
-    to: waTo(to),
-    type: "template",
-    template: {
-      name,
-      language: { code: lang },
-      ...(components.length ? { components } : {}),
-    },
-  }, creds);
+  const langs = sendLanguageTries(meta?.language, language);
+
+  for (const lang of langs) {
+    try {
+      console.log("[wa] send template", tplName, lang, "to", waTo(to));
+      return await send({
+        to: waTo(to),
+        type: "template",
+        template: {
+          name: tplName,
+          language: { code: lang },
+          ...(components.length ? { components } : {}),
+        },
+      }, sendCreds);
+    } catch (e) {
+      if (e.metaCode !== 132001) throw e;
+    }
+  }
+
+  const err = new Error(
+    `132001: Template "${tplName}" name/language Meta pe nahi mila.`
+    + (approved.length
+      ? ` Is WABA pe approved: ${approved.join(", ")}. Inbox/Campaign mein yahi exact name pick karo, phir Templates → Sync from Meta.`
+      : " Is WhatsApp account pe koi approved template nahi. Templates → Sync from Meta, ya naya Utility template banao.")
+  );
+  err.metaCode = 132001;
+  err.status = 400;
+  throw err;
 }
 
 export function sendText(to, body, creds) {
@@ -277,8 +356,8 @@ export function sendSingleProduct(to, { catalogId, productRetailerId, body }, cr
   }, creds);
 }
 
-export function sendTemplate(to, name, lang = "en", creds) {
-  return send({ to: waTo(to), type: "template", template: { name, language: { code: waLang(lang) } } }, creds);
+export function sendTemplate(to, name, lang = "en_US", creds) {
+  return send({ to: waTo(to), type: "template", template: { name, language: { code: metaLangCode(lang) || "en_US" } } }, creds);
 }
 
 export async function uploadMedia(buffer, mimetype, filename, creds) {
@@ -304,14 +383,14 @@ export function sendMediaById(to, waType, mediaId, { filename, caption } = {}, c
   return send({ to: waTo(to), type: waType, [waType]: media }, creds);
 }
 
-export function sendTemplateWithParams(to, name, params = [], lang = "en", creds) {
+export function sendTemplateWithParams(to, name, params = [], lang = "en_US", creds) {
   const components = params.length
     ? [{ type: "body", parameters: params.map((t) => ({ type: "text", text: String(t) })) }]
     : [];
   return send({
     to: waTo(to),
     type: "template",
-    template: { name, language: { code: waLang(lang) }, components },
+    template: { name, language: { code: metaLangCode(lang) || "en_US" }, components },
   }, creds);
 }
 
@@ -379,16 +458,28 @@ export async function createTemplate(payload, creds) {
 
 export async function listTemplates(creds) {
   if (creds?.incomplete) return [];
-  const wabaId = creds?.wabaId;
   const accessToken = creds?.accessToken;
+  const wabaId = await wabaIdForSending(creds);
   if (!wabaId || !accessToken) return [];
   const version = WA.version || "v22.0";
   const res = await fetch(
-    `https://graph.facebook.com/${version}/${wabaId}/message_templates?limit=100`,
+    `https://graph.facebook.com/${version}/${wabaId}/message_templates?limit=250&fields=name,status,language,category,components`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const data = await res.json();
+  if (!res.ok) {
+    console.warn("[wa] listTemplates failed:", data?.error?.message || JSON.stringify(data));
+    return [];
+  }
   return data.data || [];
+}
+
+export function pickMetaTemplate(list, name) {
+  const n = String(name || "").toLowerCase().trim();
+  const matches = (list || []).filter((t) => String(t.name || "").toLowerCase().trim() === n);
+  return matches.find((t) => String(t.status).toUpperCase() === "APPROVED")
+    || matches[0]
+    || null;
 }
 
 export async function createCarouselTemplate(payload, creds) {

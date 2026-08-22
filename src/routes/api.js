@@ -122,6 +122,7 @@ async function buildConversations(req) {
   return contacts
     .map((c) => {
       const last = c.messages[0];
+      const lastIn = c.messages.find((m) => m.direction === "in");
       const unread = c.messages.filter((m) => m.direction === "in" && m.status !== "read").length;
       return {
         id: c.id,
@@ -132,6 +133,7 @@ async function buildConversations(req) {
         lastMessage: last ? last.text : "No messages yet",
         lastAt: last ? last.at.getTime() : c.createdAt.getTime(),
         lastDirection: last ? last.direction : null,
+        lastInboundAt: lastIn ? lastIn.at.getTime() : null,
         unread,
         chatStatus: c.chatStatus,
         labels: c.labels,
@@ -499,7 +501,17 @@ router.get("/billing/config", async (_req, res) => {
   const rows = await prisma.plan.findMany().catch(() => []);
   const plans = { ...PLAN_CATALOG };
   for (const row of rows) {
-    if (plans[row.key]) plans[row.key] = { ...plans[row.key], amount: row.amount, name: row.name };
+    if (plans[row.key]) {
+      plans[row.key] = {
+        ...plans[row.key],
+        amount: row.amount,
+        name: row.name,
+        active: row.active !== false,
+      };
+    }
+  }
+  for (const key of Object.keys(plans)) {
+    if (plans[key].active == null) plans[key].active = true;
   }
   res.json({ enabled: RAZORPAY_ENABLED, keyId: RAZORPAY_KEY_ID, plans, legacyPlans: PLANS });
 });
@@ -512,6 +524,9 @@ router.post("/billing/create-order", requireAuth, attachCompany, async (req, res
     return res.status(400).json({ error: "planKey must be starter, growth or professional" });
   }
   const planRow = await prisma.plan.findUnique({ where: { key: planKey } }).catch(() => null);
+  if (planRow && planRow.active === false) {
+    return res.status(400).json({ error: "This plan is currently unavailable. Choose another plan or contact support." });
+  }
   const plan = planRow
     ? { ...PLAN_CATALOG[planKey], amount: planRow.amount, name: planRow.name }
     : PLAN_CATALOG[planKey];
@@ -754,7 +769,7 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
   const auth = await requireApiKey(req, res);
   if (!auth) return;
 
-  const { to, text, template, params, language = "en" } = req.body || {};
+  const { to, text, template, params, language } = req.body || {};
   if (!to) return res.status(400).json({ error: "to (phone number) required", code: "VALIDATION_ERROR" });
 
   const cleanPhone = digitsPhone(to);
@@ -2530,10 +2545,13 @@ router.get("/conversations/:id/messages", async (req, res) => {
     where: { contactId: contact.id },
     orderBy: { at: "asc" },
   });
+  const lastInbound = [...messages].reverse().find((m) => m.direction === "in");
   res.json({
     contact: {
       ...contact,
       createdAt: contact.createdAt.getTime(),
+      lastInboundAt: lastInbound ? lastInbound.at.getTime() : null,
+      sessionOpen: lastInbound ? (Date.now() - lastInbound.at.getTime()) < 24 * 60 * 60 * 1000 : false,
       assignedAgent: contact.assignedAgent
         ? { id: contact.assignedAgent.id, name: contact.assignedAgent.name, color: contact.assignedAgent.color }
         : null,
@@ -2581,7 +2599,7 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
 router.post("/conversations/:id/send-template", requireNotSuspended, async (req, res) => {
   const contact = await tenantContact(req, req.params.id);
   if (!contact) return res.sendStatus(404);
-  const { template, params = [], language = "en" } = req.body || {};
+  const { template, params = [], language } = req.body || {};
   if (!template) return res.status(400).json({ error: "template required" });
   const companyId = companyIdOf(req);
   let charge = { charged: false, creditsNeeded: 0 };
@@ -2610,7 +2628,21 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
         template,
       }).catch(() => {});
     }
-    const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" || e.code === "WA_NOT_CONNECTED" ? 400 : 502);
+    const tplFailed = await prisma.template.findFirst({ where: { name: template, ...tenantWhere(req) } }).catch(() => null);
+    await prisma.message.create({
+      data: {
+        companyId,
+        contactId: contact.id,
+        direction: "out",
+        type: "template",
+        text: tplFailed?.body || `[Template: ${template}]`,
+        status: "failed",
+        error: String(e.message || "Send failed").slice(0, 500),
+        senderName: req.user?.name || null,
+        senderUserId: req.user?.id || null,
+      },
+    }).catch(() => {});
+    const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" || e.code === "WA_NOT_CONNECTED" || e.metaCode === 132001 ? 400 : 502);
     return res.status(status).json({ error: e.message, code: e.code || undefined });
   }
 
@@ -2984,6 +3016,14 @@ router.post("/campaigns/:id/send", requireNotSuspended, async (req, res) => {
     // Mark liveAt
     await prisma.campaign.update({ where: { id: campaign.id }, data: { liveAt: new Date() } });
     const result = await runCampaign(campaign.id);
+    if (!result?.sent) {
+      return res.status(400).json({
+        ok: false,
+        status: "failed",
+        error: result?.error || "Campaign sent 0 messages. Templates → Sync from Meta, then pick a template that Meta has Approved.",
+        ...result,
+      });
+    }
     res.json({ ok: true, status: "completed", ...result });
   } catch (e) {
     console.error("[campaign] run error:", e.message);

@@ -71,7 +71,7 @@ export async function runCampaign(id) {
     throw new Error(`Template "${campaign.template}" is ${tpl.status}. Wait for Meta approval, then Sync from Meta.`);
   }
   const varCount = tpl ? (tpl.body.match(/\{\{\d+\}\}/g) || []).length : 0;
-  const lang = tpl?.language || "en";
+  const lang = tpl?.language || undefined;
   const contacts = await resolveAudienceContacts(campaign.audience, companyId);
   if (!contacts.length) throw new Error("No opted-in contacts in this audience");
 
@@ -82,6 +82,7 @@ export async function runCampaign(id) {
 
   let sent = 0;
   let failed = 0;
+  let lastError = "";
   for (const c of contacts) {
     let debited = false;
     try {
@@ -116,6 +117,7 @@ export async function runCampaign(id) {
       await prisma.campaign.update({ where: { id }, data: { sent } });
     } catch (e) {
       failed++;
+      lastError = String(e.message || "Send failed");
       console.error("[campaign] failed to", c.phone, ":", e.message);
       await prisma.message.create({
         data: {
@@ -154,7 +156,7 @@ export async function runCampaign(id) {
   } catch (e) {
     console.warn("[mail campaign]", e.message);
   }
-  return { sent, recipients: contacts.length };
+  return { sent, failed, recipients: contacts.length, error: lastError || undefined };
 }
 
 export async function runDueCampaigns() {

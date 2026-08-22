@@ -41,10 +41,12 @@ export function hasPermission(user, key) {
 
 const PATH_PERM = [
   [/^\/users/, "users"],
+  [/^\/clients\/[^/]+\/wallet/, "payments"],
   [/^\/clients/, "clients"],
   [/^\/pricing/, "pricing"],
   [/^\/plans/, "plans"],
   [/^\/payments/, "payments"],
+  [/^\/wallets/, "payments"],
   [/^\/revenue/, "revenue"],
   [/^\/coupons/, "coupons"],
   [/^\/tickets/, "tickets"],

@@ -62,7 +62,7 @@ export async function runDueDrips() {
       const params = Array.from({ length: varCount }, () => contact.name || "Customer");
       const r = await sendResolvedTemplate(contact.phone, step.template, {
         params,
-        language: tpl?.language || "en",
+        language: tpl?.language || undefined,
         body: tpl?.body,
         creds,
       });

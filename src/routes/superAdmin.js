@@ -8,7 +8,7 @@ import { createAgentSeat, ensureOwnerAgent } from "../lib/teamSeats.js";
 import { razorpay, RAZORPAY_ENABLED } from "../lib/razorpay.js";
 import { PLAN_CATALOG, normalizePlan, isPaidPlan } from "../lib/plans.js";
 import { WA_LIVE } from "../config/whatsapp.js";
-import { creditWallet, getPlatformPricing } from "../lib/wallet.js";
+import { creditWallet, debitWallet, getPlatformPricing } from "../lib/wallet.js";
 import { otpGate } from "../lib/otp.js";
 import { notify } from "../lib/notify.js";
 import { hasPermission, permissionForPath, normalizePermissions, PERMISSIONS } from "../lib/permissions.js";
@@ -455,9 +455,13 @@ router.post("/clients/:id/free-access", async (req, res) => {
 
 /** Super Admin: top-up wallet / credits for a client */
 router.post("/clients/:id/wallet-credit", async (req, res) => {
-  const amountPaise = Math.max(0, Number(req.body?.amountPaise) || 0);
-  const credits = Math.max(0, Number(req.body?.credits) || 0);
+  const amountPaise = Math.max(0, Math.floor(Number(req.body?.amountPaise) || 0));
+  const credits = Math.max(0, Math.floor(Number(req.body?.credits) || 0));
+  const note = String(req.body?.note || "").trim();
   if (!amountPaise && !credits) return res.status(400).json({ error: "amountPaise or credits required" });
+  if (credits > 10_000_000 || amountPaise > 100_000_000) {
+    return res.status(400).json({ error: "Amount is too large" });
+  }
   const company = await prisma.company.findUnique({ where: { id: req.params.id } });
   if (!company) return res.status(404).json({ error: "not found" });
   const r = await creditWallet({
@@ -466,9 +470,79 @@ router.post("/clients/:id/wallet-credit", async (req, res) => {
     credits,
     reason: "admin_grant",
     createdBy: req.user.id,
-    meta: { note: req.body?.note || "Admin top-up" },
+    meta: { note: note || "Admin credit" },
   });
-  res.json(r.company);
+  await prisma.auditLog.create({
+    data: {
+      companyId: company.id,
+      userId: req.user.id,
+      action: "wallet_credit",
+      entity: "Company",
+      entityId: company.id,
+      meta: { credits, amountPaise, note, creditsAfter: r.company.messageCredits },
+    },
+  }).catch(() => {});
+  notify({
+    audience: "client",
+    companyId: company.id,
+    title: "Credits added",
+    body: credits
+      ? `Admin credited ${credits.toLocaleString()} message credits.${note ? " " + note : ""}`
+      : `Admin added wallet funds.${note ? " " + note : ""}`,
+    href: "/dashboard/wallet",
+  }).catch(() => {});
+  res.json({
+    walletBalancePaise: r.company.walletBalancePaise,
+    messageCredits: r.company.messageCredits,
+    txn: r.txn,
+  });
+});
+
+/** Super Admin: debit / claw back wallet / credits */
+router.post("/clients/:id/wallet-debit", async (req, res) => {
+  const amountPaise = Math.max(0, Math.floor(Number(req.body?.amountPaise) || 0));
+  const credits = Math.max(0, Math.floor(Number(req.body?.credits) || 0));
+  const note = String(req.body?.note || "").trim();
+  if (!amountPaise && !credits) return res.status(400).json({ error: "amountPaise or credits required" });
+  if (!note) return res.status(400).json({ error: "Note is required for debit" });
+  const company = await prisma.company.findUnique({ where: { id: req.params.id } });
+  if (!company) return res.status(404).json({ error: "not found" });
+  try {
+    const r = await debitWallet({
+      companyId: company.id,
+      amountPaise,
+      credits,
+      reason: "admin_debit",
+      createdBy: req.user.id,
+      meta: { note },
+    });
+    await prisma.auditLog.create({
+      data: {
+        companyId: company.id,
+        userId: req.user.id,
+        action: "wallet_debit",
+        entity: "Company",
+        entityId: company.id,
+        meta: { credits, amountPaise, note, creditsAfter: r.company.messageCredits },
+      },
+    }).catch(() => {});
+    notify({
+      audience: "client",
+      companyId: company.id,
+      title: "Credits deducted",
+      body: credits
+        ? `Admin deducted ${credits.toLocaleString()} message credits. ${note}`
+        : `Admin deducted wallet funds. ${note}`,
+      href: "/dashboard/wallet",
+    }).catch(() => {});
+    res.json({
+      walletBalancePaise: r.company.walletBalancePaise,
+      messageCredits: r.company.messageCredits,
+      txn: r.txn,
+    });
+  } catch (e) {
+    return res.status(e.status || 400).json({ error: e.message, code: e.code, available: e.available });
+  }
 });
 
 router.get("/clients/:id/wallet", async (req, res) => {
@@ -700,24 +774,44 @@ router.post("/whatsapp-accounts/:id/profile/photo", profileUpload.single("file")
 });
 
 /* ---------- Plans ---------- */
+function serializePlan(row, cat, subscribers = 0) {
+  const c = cat || PLAN_CATALOG[row.key] || PLAN_CATALOG.starter;
+  return {
+    key: row.key,
+    name: row.name || c.name,
+    amount: row.amount ?? c.amount,
+    currency: row.currency || c.currency || "INR",
+    inbox: row.inbox ?? c.features?.inbox !== false,
+    campaign: row.campaign ?? c.features?.campaign !== false,
+    chatbot: row.chatbot ?? c.features?.chatbot !== false,
+    automation: row.automation ?? c.features?.automation !== false,
+    api: row.api ?? Boolean(c.features?.api),
+    unlimitedAgents: row.unlimitedAgents ?? Boolean(c.features?.unlimitedAgents),
+    agentLimit: row.agentLimit ?? c.agentLimit ?? 3,
+    contactLimit: row.contactLimit ?? c.contactLimit ?? 1000,
+    messageLimit: row.messageLimit ?? c.messageLimit ?? 5000,
+    active: row.active !== false,
+    subscribers,
+  };
+}
+
 router.get("/plans", async (_req, res) => {
-  let plans = await prisma.plan.findMany({ orderBy: { amount: "asc" } });
-  if (!plans.length) {
-    plans = Object.values(PLAN_CATALOG).map((p) => ({
-      key: p.key,
-      name: p.name,
-      amount: p.amount,
-      ...p.features,
-      agentLimit: p.agentLimit,
-      contactLimit: p.contactLimit,
-      messageLimit: p.messageLimit,
-    }));
-  }
-  res.json(plans);
+  const rows = await prisma.plan.findMany();
+  const byKey = Object.fromEntries(rows.map((p) => [p.key, p]));
+  let counts = [];
+  try {
+    counts = await prisma.company.groupBy({ by: ["plan"], _count: { id: true } });
+  } catch {}
+  const countMap = Object.fromEntries(counts.map((c) => [c.plan, c._count.id]));
+  const keys = ["starter", "growth", "professional", "enterprise"];
+  res.json(keys.map((key) => serializePlan(byKey[key] || { key, active: true, ...PLAN_CATALOG[key], ...PLAN_CATALOG[key]?.features }, PLAN_CATALOG[key], countMap[key] || 0)));
 });
 
 router.patch("/plans/:key", async (req, res) => {
   const key = normalizePlan(req.params.key);
+  if (!["starter", "growth", "professional", "enterprise"].includes(key)) {
+    return res.status(400).json({ error: "Only sellable plans can be updated" });
+  }
   const body = req.body || {};
   const update = {};
   if (body.name != null) update.name = String(body.name);
@@ -749,9 +843,22 @@ router.patch("/plans/:key", async (req, res) => {
       agentLimit: update.agentLimit ?? cat.agentLimit ?? 3,
       contactLimit: update.contactLimit ?? cat.contactLimit ?? 1000,
       messageLimit: update.messageLimit ?? cat.messageLimit ?? 5000,
+      active: update.active !== false,
     },
   });
-  res.json(plan);
+  if (typeof body.active === "boolean") {
+    await prisma.auditLog.create({
+      data: {
+        userId: req.user.id,
+        action: body.active ? "plan_activate" : "plan_deactivate",
+        entity: "Plan",
+        entityId: plan.id,
+        meta: { key, active: body.active },
+      },
+    }).catch(() => {});
+  }
+  const subscribers = await prisma.company.count({ where: { plan: key } }).catch(() => 0);
+  res.json(serializePlan(plan, cat, subscribers));
 });
 
 /* ---------- Payments ---------- */

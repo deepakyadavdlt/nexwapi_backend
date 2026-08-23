@@ -3640,11 +3640,63 @@ router.get("/whatsapp/account", async (req, res) => {
       lastError: wa.lastError,
       hasToken: Boolean(wa.accessToken),
       live: Boolean(wa.phoneNumberId && wa.accessToken),
+      businessId: wa.businessId || null,
     },
     webhook: {
       url: `${process.env.PUBLIC_API_URL || ""}/api/whatsapp/webhook`,
       verifyToken: wa.verifyToken || process.env.WHATSAPP_VERIFY_TOKEN || null,
     },
+  });
+});
+
+/** Meta conversation billing (currency + card) — not Nexwapi subscription. */
+router.get("/whatsapp/billing-status", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+  if (!wa?.isConnected || !wa.wabaId || !wa.accessToken) {
+    return res.json({
+      connected: false,
+      currencySet: false,
+      timezoneSet: false,
+      ready: false,
+      billingUrl: null,
+      hint: "Connect WhatsApp first, then complete Meta conversation billing from this page.",
+    });
+  }
+  const version = process.env.WHATSAPP_API_VERSION || "v22.0";
+  let currency = null;
+  let timezone = null;
+  try {
+    const r = await fetch(
+      `https://graph.facebook.com/${version}/${wa.wabaId}?fields=id,name,currency,timezone_id`,
+      { headers: { Authorization: `Bearer ${wa.accessToken}` } }
+    );
+    const j = await r.json();
+    if (r.ok) {
+      currency = j.currency || null;
+      timezone = j.timezone_id || null;
+    }
+  } catch (e) {
+    console.warn("[wa billing-status]", e.message);
+  }
+  const businessId = wa.businessId;
+  const billingUrl = businessId
+    ? `https://business.facebook.com/billing_hub/accounts/details/?business_id=${encodeURIComponent(businessId)}&asset_id=${encodeURIComponent(wa.wabaId)}&wizard_id=business-account`
+    : `https://business.facebook.com/latest/whatsapp_manager/overview?waba_id=${encodeURIComponent(wa.wabaId)}`;
+  const currencySet = Boolean(currency);
+  res.json({
+    connected: true,
+    wabaId: wa.wabaId,
+    businessId: businessId || null,
+    currency,
+    timezone,
+    currencySet,
+    timezoneSet: Boolean(timezone),
+    ready: currencySet,
+    billingUrl,
+    hint: currencySet
+      ? "Currency is set. If templates still fail with 131042, add a card on the same billing page and assign it to this WhatsApp account."
+      : "Template campaigns stay blocked until currency (INR) and a card are set on this WhatsApp account — Facebook Business billing, not Facebook Developer.",
   });
 });
 

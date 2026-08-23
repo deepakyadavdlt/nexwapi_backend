@@ -50,6 +50,7 @@ async function send(payload, creds) {
 }
 
 const META_HINTS = {
+  131042: "WhatsApp billing is incomplete (usually currency not set). Open Dashboard → WhatsApp → Complete WhatsApp billing. Do not use Facebook Developer.",
   131049: "Meta blocked this marketing template (quality / recipient preference). Use a Utility template, or send only after the customer messages you first.",
   131026: "This number is not on WhatsApp or cannot receive the message. Use country code (e.g. 91…).",
   132001: "Template name/language was not found on this WhatsApp account. Open Templates → Sync from Meta.",

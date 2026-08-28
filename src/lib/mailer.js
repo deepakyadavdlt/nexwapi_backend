@@ -89,7 +89,7 @@ async function sendViaZeptoMail(payload) {
   if (!token) return null;
   const endpoint = String(process.env.ZEPTOMAIL_API_URL || "https://api.zeptomail.in/v1.1/email").trim();
   const fromAddress = MAIL_FROM;
-  const fromName = MAIL_FROM_NAME;
+  const fromName = payload.fromName || MAIL_FROM_NAME;
   const replyTo = MAIL_FROM;
 
   const body = {
@@ -133,7 +133,7 @@ async function sendViaZeptoMail(payload) {
 async function sendViaResend(payload) {
   const key = String(process.env.RESEND_API_KEY || "").trim();
   if (!key) return null;
-  const from = process.env.RESEND_FROM || `${MAIL_FROM_NAME} <${MAIL_FROM}>`;
+  const from = process.env.RESEND_FROM || `${payload.fromName || MAIL_FROM_NAME} <${MAIL_FROM}>`;
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -196,29 +196,48 @@ function getTransport() {
   return transporter;
 }
 
-function wrap(title, bodyHtml) {
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function brandName(brand) {
+  const n = String(brand?.productName || "").trim();
+  return n || MAIL_FROM_NAME;
+}
+
+function wrap(title, bodyHtml, brand) {
+  const product = escapeHtml(brandName(brand));
+  const color = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(brand?.primaryColor || ""))
+    ? brand.primaryColor
+    : "#00a884";
   return `<!DOCTYPE html><html><body style="margin:0;background:#f4f7f6;font-family:Inter,Segoe UI,sans-serif;color:#111827">
   <div style="max-width:560px;margin:24px auto;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e5eee9">
-    <div style="background:linear-gradient(135deg,#00a884,#075E54);padding:22px 28px;color:#fff">
-      <div style="font-weight:800;font-size:20px">Nexwapi</div>
-      <div style="opacity:.85;font-size:13px;margin-top:4px">${title}</div>
+    <div style="background:linear-gradient(135deg,${color},#075E54);padding:22px 28px;color:#fff">
+      <div style="font-weight:800;font-size:20px">${product}</div>
+      <div style="opacity:.85;font-size:13px;margin-top:4px">${escapeHtml(title)}</div>
     </div>
     <div style="padding:28px;font-size:15px;line-height:1.6">${bodyHtml}</div>
     <div style="padding:16px 28px;background:#f8fbfa;font-size:12px;color:#6b7280">
-      Sent from ${MAIL_FROM}
+      Sent from ${product}
     </div>
   </div></body></html>`;
 }
 
-export async function sendMail({ to, subject, html, text, attachments }) {
+export async function sendMail({ to, subject, html, text, attachments, fromName, brand }) {
   if (!to) return { skipped: true };
   if (!emailDeliveryConfigured()) {
     console.log(`[mail:dry-run] to=${to} subject=${subject}\n${text || ""}`);
     return { skipped: true, dryRun: true };
   }
 
+  const name = fromName || brandName(brand);
   const payload = {
-    from: `${MAIL_FROM_NAME} <${MAIL_FROM}>`,
+    from: `${name} <${MAIL_FROM}>`,
+    fromName: name,
     replyTo: MAIL_FROM,
     to,
     subject,
@@ -292,7 +311,7 @@ export async function sendMail({ to, subject, html, text, attachments }) {
   );
 }
 
-export async function sendOtpEmail(to, code, purpose) {
+export async function sendOtpEmail(to, code, purpose, brand) {
   const labels = {
     login: "Login verification",
     signup: "Account verification",
@@ -305,13 +324,16 @@ export async function sendOtpEmail(to, code, purpose) {
     api_delete: "Delete API key",
   };
   const title = labels[purpose] || "Verification code";
+  const product = brandName(brand);
   const r = await sendMail({
     to,
-    subject: `${code} is your Nexwapi ${title} code`,
-    text: `Your Nexwapi code is ${code}. It expires in 10 minutes.`,
+    brand,
+    fromName: product,
+    subject: `${code} is your ${product} ${title} code`,
+    text: `Your ${product} code is ${code}. It expires in 10 minutes.`,
     html: wrap(title, `<p>Use this code to continue:</p>
       <p style="font-size:32px;font-weight:800;letter-spacing:8px;color:#075E54">${code}</p>
-      <p>This code expires in 10 minutes. If you did not request it, you can ignore this email.</p>`),
+      <p>This code expires in 10 minutes. If you did not request it, you can ignore this email.</p>`, brand),
   });
   if (r?.skipped || r?.dryRun) {
     throw new Error("OTP email could not be sent. Configure ZEPTOMAIL_TOKEN or SMTP in backend .env.");
@@ -319,33 +341,58 @@ export async function sendOtpEmail(to, code, purpose) {
   return r;
 }
 
-export async function sendWelcome(to, name) {
+export async function sendWelcome(to, name, brand) {
+  const product = brandName(brand);
+  const dash = brand?.slug ? `${APP_DASHBOARD_URL}/login?partner=${encodeURIComponent(brand.slug)}` : `${APP_DASHBOARD_URL}/dashboard`;
   return sendMail({
     to,
-    subject: "Welcome to Nexwapi — your 7-day trial is live",
-    html: wrap("Welcome", `<p>Hi ${name || "there"},</p>
-      <p>Your Nexwapi workspace is ready. You have a <b>7-day free trial</b> to connect WhatsApp, send campaigns, and run your inbox.</p>
-      <p><a href="${APP_DASHBOARD_URL}/dashboard" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Open dashboard</a></p>`),
+    brand,
+    fromName: product,
+    subject: `Welcome to ${product} — your 7-day trial is live`,
+    html: wrap("Welcome", `<p>Hi ${escapeHtml(name) || "there"},</p>
+      <p>Your ${escapeHtml(product)} workspace is ready. You have a <b>7-day free trial</b> to connect WhatsApp, send campaigns, and run your inbox.</p>
+      <p><a href="${dash}" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Open dashboard</a></p>`, brand),
   });
 }
 
-export async function sendAgentInvite({ to, name, inviterName, password, role }) {
-  const loginUrl = `${APP_DASHBOARD_URL}/login`;
+export async function sendPartnerActivated({ to, name, productName, slug, loginUrl }) {
+  const product = productName || name || "your white-label CRM";
+  const url = loginUrl || `${APP_DASHBOARD_URL}/login`;
   return sendMail({
     to,
-    subject: `${inviterName || "Your team"} invited you to Nexwapi`,
-    text: `Hi ${name || "there"}, you have been invited to join a Nexwapi workspace as ${role || "Teammate"}. Login: ${loginUrl} Email: ${to} Temporary password: ${password}`,
+    fromName: MAIL_FROM_NAME,
+    subject: `${product} is live — payment confirmed`,
+    html: wrap("You're activated", `<p>Hi ${escapeHtml(name) || "there"},</p>
+      <p>Nexwapi confirmed your payment. Your agency console is live as <b>${escapeHtml(product)}</b>.</p>
+      <p>Log in, set your logo, and add clients. They will see your brand — not Nexwapi.</p>
+      <p><a href="${url}" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Open agency console</a></p>
+      <p style="color:#64748b;font-size:13px">Share client login: ${escapeHtml(APP_DASHBOARD_URL)}/login?partner=${escapeHtml(slug || "")}</p>`),
+  });
+}
+
+export async function sendAgentInvite({ to, name, inviterName, password, role, brand }) {
+  const product = brandName(brand);
+  const loginUrl = brand?.slug
+    ? `${APP_DASHBOARD_URL}/login?partner=${encodeURIComponent(brand.slug)}`
+    : `${APP_DASHBOARD_URL}/login`;
+  return sendMail({
+    to,
+    brand,
+    fromName: product,
+    subject: `${inviterName || "Your team"} invited you to ${product}`,
+    text: `Hi ${name || "there"}, you have been invited to join a ${product} workspace as ${role || "Teammate"}. Login: ${loginUrl} Email: ${to} Temporary password: ${password}`,
     html: wrap(
       "You're invited",
-      `<p>Hi ${name || "there"},</p>
-      <p><b>${inviterName || "A teammate"}</b> invited you to Nexwapi as <b>${role || "Teammate"}</b>.</p>
+      `<p>Hi ${escapeHtml(name) || "there"},</p>
+      <p><b>${escapeHtml(inviterName) || "A teammate"}</b> invited you to ${escapeHtml(product)} as <b>${escapeHtml(role) || "Teammate"}</b>.</p>
       <p>Login with:</p>
       <ul>
-        <li>Email: <b>${to}</b></li>
-        <li>Temporary password: <b style="letter-spacing:1px">${password}</b></li>
+        <li>Email: <b>${escapeHtml(to)}</b></li>
+        <li>Temporary password: <b style="letter-spacing:1px">${escapeHtml(password)}</b></li>
       </ul>
       <p><a href="${loginUrl}" style="display:inline-block;background:#00a884;color:#fff;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700">Accept invitation</a></p>
-      <p style="color:#64748b;font-size:13px">Change your password after first login.</p>`
+      <p style="color:#64748b;font-size:13px">Change your password after first login.</p>`,
+      brand
     ),
   });
 }

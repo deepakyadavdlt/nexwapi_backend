@@ -6,6 +6,7 @@ import multer from "multer";
 import fs from "fs";
 import path from "path";
 import { prisma, toMessage, pickColor } from "../lib/prisma.js";
+import { syncCompanyTemplates } from "../lib/templateSync.js";
 import {
   sendText, sendTemplate, sendTemplateWithParams, sendResolvedTemplate, createTemplate, listTemplates,
   uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getEffectiveCreds, assertLiveCreds, assertTenantOutbound,
@@ -36,7 +37,7 @@ import {
 import { hashPassword, comparePassword, signToken, requireAuth } from "../lib/auth.js";
 import {
   attachCompany, companyIdOf, tenantWhere, publicCompanyUser, uniqueSlug,
-  requireNotSuspended, requireFeature, isSuperAdmin,
+  requireNotSuspended, requireFeature, isSuperAdmin, publicPartnerBranding, DEFAULT_BRANDING,
 } from "../lib/tenant.js";
 import { PLAN_CATALOG, normalizePlan, hasFeature, isPaidPlan, planFeatures } from "../lib/plans.js";
 import { createAgentSeat, ensureOwnerAgent, listAgentsEnriched, updateAgentSeat, resetAgentInvitePassword, companySeatUsage, AGENT_ROLES } from "../lib/teamSeats.js";
@@ -144,15 +145,25 @@ async function buildConversations(req) {
 }
 
 /* -------------------------------- Auth --------------------------------- */
+router.get("/branding", async (req, res) => {
+  const slug = String(req.query.slug || req.query.partner || "").trim().toLowerCase();
+  const host = String(req.query.host || req.headers.host || "").split(":")[0].toLowerCase();
+  const { resolvePartnerByHost } = await import("../lib/branding.js");
+  const partner = await resolvePartnerByHost(prisma, { slug, host });
+  if (!partner || partner.status !== "ACTIVE") return res.json({ ...DEFAULT_BRANDING });
+  res.json(publicPartnerBranding(partner));
+});
+
 // Create a new account (name, email, password) with a bcrypt-hashed password.
 router.post("/auth/signup", signupLimiter, async (req, res) => {
   const { name, email, password, company: companyName, otp } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: "name, email and password required" });
   if (String(password).length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
   const em = String(email).toLowerCase().trim();
+  const partnerSlug = String(req.body?.partnerSlug || "").trim().toLowerCase();
   if (!otp) {
     try {
-      const otpResult = await issueOtp(em, "signup", { name, email: em, password, company: companyName });
+      const otpResult = await issueOtp(em, "signup", { name, email: em, password, company: companyName, partnerSlug });
       return res.json({ otpRequired: true, otpHint: otpResult.otpHint });
     } catch (e) {
       console.error("[signup otp]", e?.message || e);
@@ -168,6 +179,13 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
 
     const { getPlatformPricing } = await import("../lib/wallet.js");
     const pricing = await getPlatformPricing();
+    const partnerSlug = String(req.body?.partnerSlug || v.payload?.partnerSlug || "").trim().toLowerCase();
+    let partnerId = null;
+    let partnerRow = null;
+    if (partnerSlug) {
+      partnerRow = await prisma.partner.findUnique({ where: { slug: partnerSlug } });
+      if (partnerRow && partnerRow.status === "ACTIVE") partnerId = partnerRow.id;
+    }
 
     const company = await prisma.company.create({
       data: {
@@ -180,6 +198,7 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
         trialStartedAt: new Date(),
         messageCredits: pricing.trialCredits,
         walletBalancePaise: 0,
+        partnerId,
       },
     });
 
@@ -211,8 +230,9 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
       },
     }).catch(() => {});
 
-    sendWelcome(user.email, user.name).catch((e) => console.warn("[mail welcome]", e.message));
-    res.status(201).json({ token: signToken(user), user: publicCompanyUser(user, company) });
+    sendWelcome(user.email, user.name, partnerRow && partnerId ? publicPartnerBranding(partnerRow) : null).catch((e) => console.warn("[mail welcome]", e.message));
+    const companyWithPartner = partnerRow && partnerId ? { ...company, partner: partnerRow } : company;
+    res.status(201).json({ token: signToken(user), user: publicCompanyUser(user, companyWithPartner) });
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "An account with this email already exists" });
     throw e;
@@ -226,15 +246,31 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
 
   const user = await prisma.user.findUnique({
     where: { email: em },
-    include: { company: { include: { subscription: true } } },
+    include: { company: { include: { subscription: true, partner: true } }, partner: true },
   });
   if (user?.password && (await comparePassword(password, user.password))) {
     if (user.isActive === false) {
       return res.status(403).json({ error: "This account has been deactivated" });
     }
-    // Super Admin bypasses OTP (they authenticate via strong password only).
-    // Regular users still go through OTP email verification.
-    const skipOtp = user.role === "SUPER_ADMIN";
+    if (user.role === "PARTNER") {
+      const partner = user.partner || (user.partnerId ? await prisma.partner.findUnique({ where: { id: user.partnerId } }) : null);
+      if (!partner) return res.status(403).json({ error: "Partner account is not linked" });
+      if (partner.status === "SUSPENDED") {
+        return res.status(403).json({ error: "This partner account is suspended. Contact Nexwapi." });
+      }
+      if (partner.status === "PENDING") {
+        return res.status(403).json({ error: "Partner access is pending payment confirmation by Nexwapi. You cannot log in until Nexwapi marks payment received." });
+      }
+    }
+    const companyPartner = user.company?.partner;
+    if (companyPartner && companyPartner.status !== "ACTIVE" && user.role !== "SUPER_ADMIN") {
+      const msg = companyPartner.status === "SUSPENDED"
+        ? "This workspace is temporarily unavailable. Contact your provider."
+        : "This workspace is not active yet.";
+      return res.status(403).json({ error: msg, code: "PARTNER_INACTIVE" });
+    }
+    // Super Admin and Partner skip OTP (console operators).
+    const skipOtp = user.role === "SUPER_ADMIN" || user.role === "PARTNER";
     if (!skipOtp) {
       if (!otp) {
         let otpResult;
@@ -275,7 +311,7 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
       userId: user.id,
       title: "New sign-in",
       body: `${user.name || user.email} signed in`,
-      href: user.role === "SUPER_ADMIN" ? "/admin" : "/dashboard",
+      href: user.role === "SUPER_ADMIN" ? "/admin" : user.role === "PARTNER" ? "/partner" : "/dashboard",
     }).catch(() => {});
     return res.json({ token: signToken(user), user: publicCompanyUser(user, user.company) });
   }
@@ -314,7 +350,7 @@ router.post("/auth/reset", signupLimiter, async (req, res) => {
 router.get("/me", requireAuth, attachCompany, async (req, res) => {
   const user = await prisma.user.findUnique({
     where: { id: req.user.id },
-    include: { company: { include: { subscription: true } } },
+    include: { company: { include: { subscription: true, partner: true } }, partner: true },
   });
   if (!user) return res.status(404).json({ error: "User not found" });
   if (user.isActive === false) return res.status(403).json({ error: "Account disabled" });
@@ -336,7 +372,7 @@ router.patch("/me", requireAuth, attachCompany, async (req, res) => {
   const companyName = String(req.body?.company || req.body?.companyName || "").trim();
   const phone = req.body?.phone != null ? String(req.body.phone).trim() : null;
   const language = req.body?.language != null ? String(req.body.language).trim().toLowerCase() : null;
-  const allowedLangs = new Set(["en", "hi", "es", "pt", "id", "ar"]);
+  const allowedLangs = new Set(["en", "es", "pt", "id", "ar"]);
   const data = {};
   if (name) data.name = name;
   if (phone != null) data.phone = phone || null;
@@ -1117,11 +1153,9 @@ router.get("/contacts", async (req, res) => {
   const contacts = await prisma.contact.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   res.json(contacts.map((c) => {
     const row = { ...c, createdAt: c.createdAt.getTime() };
+    // Phone numbers always stay visible. Other fields can still be restricted.
     if (permissions["contacts.hide_fields"]) {
-      return { ...row, phone: "••••••••••", email: null, attributes: {}, tags: row.tags || [] };
-    }
-    if (permissions["contacts.hide_phone"] || permissions["contacts.hide_phone_legacy"]) {
-      return { ...row, phone: "••••••••••" };
+      return { ...row, email: null, attributes: {}, tags: row.tags || [] };
     }
     return row;
   }));
@@ -1510,6 +1544,7 @@ router.post("/agents", async (req, res) => {
         inviterName: req.user?.name || "Your teammate",
         password: login.password,
         role: agent.role,
+        brand: req.company?.partner ? publicPartnerBranding(req.company.partner) : null,
       }).catch((e) => console.warn("[agents] invite email:", e?.message || e));
     }
     res.status(201).json({
@@ -1548,6 +1583,7 @@ router.post("/agents/:id/resend-invitation", async (req, res) => {
       inviterName: req.user?.name || "Your teammate",
       password: invite.password,
       role: "Teammate",
+      brand: req.company?.partner ? publicPartnerBranding(req.company.partner) : null,
     }).catch(() => {});
     res.json({ ok: true, email: invite.email, tempPassword: invite.password });
   } catch (e) {
@@ -2806,6 +2842,10 @@ router.get("/templates/library", async (req, res) => {
 
 router.get("/templates", async (req, res) => {
   const tab = req.query.tab; // "active" (default) | "deleted"
+  const companyId = companyIdOf(req);
+  if (tab !== "deleted" && companyId) {
+    await syncCompanyTemplates(companyId).catch((e) => console.warn("[templates] auto-sync", e?.message || e));
+  }
   const whereClause = {
     ...tenantWhere(req),
     deletedAt: tab === "deleted" ? { not: null } : null,
@@ -2829,9 +2869,13 @@ router.post("/templates", async (req, res) => {
 
   let status = "pending";
   try {
-    const creds = await getEffectiveCreds(companyIdOf(req));
+    const companyId = companyIdOf(req);
+    const { templateSyncCreds } = await import("../lib/templateSync.js");
+    const creds = await templateSyncCreds(companyId);
     assertLiveCreds(creds);
-    if (!creds?.wabaId) throw Object.assign(new Error("Connect WhatsApp first (Dashboard → WhatsApp), then submit templates."), { status: 400 });
+    if (!creds) {
+      throw Object.assign(new Error("Connect WhatsApp first (Dashboard → WhatsApp), then submit templates."), { status: 400 });
+    }
     const r = format === "carousel" && Array.isArray(cards) && cards.length
       ? await createCarouselTemplate({ name: cleanName, category, language, body, cards }, creds)
       : await createTemplate({ name: cleanName, category, language, body, headerType, headerText, headerImageUrl, buttons }, creds);
@@ -2903,39 +2947,16 @@ router.delete("/templates/:id", async (req, res) => {
 // Pull the latest template statuses from Meta and reconcile the local list.
 router.post("/templates/sync", async (req, res) => {
   try {
-    const creds = await getEffectiveCreds(companyIdOf(req));
+    const companyId = companyIdOf(req);
+    const { templateSyncCreds } = await import("../lib/templateSync.js");
+    const creds = await templateSyncCreds(companyId);
     assertLiveCreds(creds);
-    if (!creds?.wabaId) return res.status(400).json({ error: "Connect WhatsApp first, then sync templates." });
-    const metaTemplates = await listTemplates(creds);
-    for (const mt of metaTemplates) {
-      const status = (mt.status || "").toLowerCase();
-      const existing = await prisma.template.findFirst({ where: { name: mt.name, ...tenantWhere(req) } });
-      if (existing) {
-        const prev = existing.status;
-        const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
-        const body = bodyComp?.text || existing.body;
-        await prisma.template.update({
-          where: { id: existing.id },
-          data: { status, category: cap(mt.category), language: mt.language, body },
-        });
-        if (prev !== status && /approv|reject/i.test(status)) {
-          notifyOwnerTemplate(companyIdOf(req), mt.name, status);
-        }
-      } else {
-        const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
-        await prisma.template.create({
-          data: {
-            companyId: companyIdOf(req),
-            name: mt.name,
-            status,
-            category: cap(mt.category),
-            language: mt.language,
-            body: bodyComp?.text || "(synced from Meta)",
-          },
-        });
-      }
+    if (!creds) {
+      return res.status(400).json({
+        error: "Connect WhatsApp first (Dashboard → WhatsApp). Phone ID and access token must be saved.",
+      });
     }
-    const all = await prisma.template.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
+    const all = await syncCompanyTemplates(companyId);
     res.json(all.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
   } catch (e) {
     res.status(502).json({ error: e.message });
@@ -3020,7 +3041,7 @@ router.post("/campaigns/:id/send", requireNotSuspended, async (req, res) => {
       return res.status(400).json({
         ok: false,
         status: "failed",
-        error: result?.error || "Campaign sent 0 messages. Templates → Sync from Meta, then pick a template that Meta has Approved.",
+        error: result?.error || "Campaign sent 0 messages. Wait until WhatsApp marks the template Approved, then send again.",
         ...result,
       });
     }
@@ -3344,15 +3365,171 @@ router.post("/automation/ai-agent/documents", asyncRoute(async (req, res) => {
   res.status(201).json({ knowledge: updated.aiAgentKnowledge });
 }));
 
-router.get("/automation/voice-ai", asyncRoute(async (req, res) => {
+router.get("/whatsapp/calling", asyncRoute(async (req, res) => {
   const companyId = requireWorkspace(req, res);
   if (!companyId) return;
+  const { callingStatusForAccount } = await import("../lib/waCalling.js");
+  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+  const status = await callingStatusForAccount(wa);
   const s = await prisma.setting.findUnique({ where: { companyId } });
   res.json({
-    enabled: s?.voiceAiEnabled ?? false,
+    ...status,
+    planEnabled: s?.voiceAiEnabled ?? false,
     plan: s?.voiceAiPlan ?? "business",
     credits: s?.voiceAiCredits ?? 100,
   });
+}));
+
+router.post("/whatsapp/calling/enable", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { callingStatusForAccount, setCallingEnabled, ensureCallsWebhookSubscription } = await import("../lib/waCalling.js");
+  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+  if (!wa?.isConnected || !wa.phoneNumberId || !wa.accessToken) {
+    return res.status(400).json({ error: "Connect WhatsApp first (Dashboard → WhatsApp)." });
+  }
+  const before = await callingStatusForAccount(wa);
+  if (!before.eligible) {
+    return res.status(400).json({
+      error: "Meta only enables WhatsApp Calling after your number can message 2,000 unique customers per day (typically TIER_10K).",
+      ...before,
+    });
+  }
+  await setCallingEnabled(wa.phoneNumberId, wa.accessToken, true);
+  const hook = await ensureCallsWebhookSubscription().catch((e) => ({ ok: false, error: e.message }));
+  await prisma.setting.upsert({
+    where: { companyId },
+    update: { voiceAiEnabled: true, voiceAiPlan: "business" },
+    create: { companyId, businessName: req.company?.name || "Nexwapi", voiceAiEnabled: true, voiceAiPlan: "business" },
+  });
+  const after = await callingStatusForAccount(wa);
+  res.json({ ok: true, webhook: hook, ...after, planEnabled: true });
+}));
+
+router.post("/whatsapp/calling/disable", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { callingStatusForAccount, setCallingEnabled } = await import("../lib/waCalling.js");
+  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+  if (!wa?.phoneNumberId || !wa.accessToken) {
+    return res.status(400).json({ error: "WhatsApp is not connected." });
+  }
+  await setCallingEnabled(wa.phoneNumberId, wa.accessToken, false);
+  await prisma.setting.upsert({
+    where: { companyId },
+    update: { voiceAiEnabled: false },
+    create: { companyId, businessName: req.company?.name || "Nexwapi", voiceAiEnabled: false },
+  });
+  const after = await callingStatusForAccount(wa);
+  res.json({ ok: true, ...after, planEnabled: false });
+}));
+
+async function callingContact(companyId, contactId) {
+  if (!contactId) return null;
+  return prisma.contact.findFirst({ where: { id: String(contactId), companyId } });
+}
+
+router.get("/whatsapp/calling/permission", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const contact = await callingContact(companyId, req.query.contactId);
+  if (!contact?.phone) return res.status(400).json({ error: "Open a contact with a phone number." });
+  const { waAccountForCompany, getCallPermission } = await import("../lib/waCalling.js");
+  const wa = await waAccountForCompany(companyId);
+  if (!wa?.phoneNumberId || !wa.accessToken) {
+    return res.status(400).json({ error: "Connect WhatsApp first (Dashboard → WhatsApp)." });
+  }
+  const phone = String(contact.phone).replace(/\D/g, "");
+  const perm = await getCallPermission(wa.phoneNumberId, wa.accessToken, phone);
+  res.json({ ...perm, phone, contactId: contact.id });
+}));
+
+router.post("/whatsapp/calling/permission-request", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const contact = await callingContact(companyId, req.body?.contactId);
+  if (!contact?.phone) return res.status(400).json({ error: "Open a contact with a phone number." });
+  const creds = await getEffectiveCreds(companyId);
+  assertTenantOutbound(creds);
+  const { sendCallPermissionRequest } = await import("../lib/whatsappService.js");
+  const { logCallMessage } = await import("../lib/waCalling.js");
+  const sent = await sendCallPermissionRequest(
+    contact.phone,
+    creds,
+    "We would like to call you on WhatsApp. Tap Allow if that is okay."
+  );
+  await logCallMessage({
+    companyId,
+    contactId: contact.id,
+    callId: sent?.messages?.[0]?.id,
+    event: "permission",
+    text: "Asked for permission to call on WhatsApp",
+    direction: "out",
+  });
+  res.json({ ok: true, sent });
+}));
+
+router.post("/whatsapp/calling/start", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { contactId, sdp, sdpType } = req.body || {};
+  if (!sdp) return res.status(400).json({ error: "Missing WebRTC offer." });
+  const contact = await callingContact(companyId, contactId);
+  if (!contact?.phone) return res.status(400).json({ error: "Open a contact with a phone number." });
+  const { waAccountForCompany, graphCall, callingStatusForAccount, logCallMessage } = await import("../lib/waCalling.js");
+  const wa = await waAccountForCompany(companyId);
+  if (!wa?.phoneNumberId || !wa.accessToken) {
+    return res.status(400).json({ error: "Connect WhatsApp first (Dashboard → WhatsApp)." });
+  }
+  const status = await callingStatusForAccount(wa);
+  if (!status.callingEnabled) {
+    return res.status(400).json({
+      error: "Turn on WhatsApp Calling first (Automation → WhatsApp Calling).",
+    });
+  }
+  const to = String(contact.phone).replace(/\D/g, "");
+  const data = await graphCall(wa.phoneNumberId, wa.accessToken, {
+    to,
+    action: "connect",
+    session: { sdp_type: sdpType || "offer", sdp },
+  });
+  const callId = data?.calls?.[0]?.id || data?.id || null;
+  await logCallMessage({
+    companyId,
+    contactId: contact.id,
+    callId,
+    event: "outbound",
+    text: `Calling +${to}`,
+    direction: "out",
+  });
+  res.json({ ok: true, callId, contactId: contact.id, phone: to, meta: data });
+}));
+
+router.post("/whatsapp/calling/action", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const { callId, action, sdp, sdpType } = req.body || {};
+  if (!callId || !action) return res.status(400).json({ error: "callId and action required" });
+  const { waAccountForCompany, graphCall } = await import("../lib/waCalling.js");
+  const wa = await waAccountForCompany(companyId);
+  if (!wa?.phoneNumberId || !wa.accessToken) {
+    return res.status(400).json({ error: "Connect WhatsApp first (Dashboard → WhatsApp)." });
+  }
+  const body = { call_id: callId, action: String(action) };
+  if (sdp) body.session = { sdp_type: sdpType || "answer", sdp };
+  const data = await graphCall(wa.phoneNumberId, wa.accessToken, body);
+  res.json({ ok: true, meta: data });
+}));
+
+router.get("/whatsapp/calling/events", asyncRoute(async (req, res) => {
+  const companyId = requireWorkspace(req, res);
+  if (!companyId) return;
+  const after = Number(req.query.after || 0) || 0;
+  const wait = Math.min(10000, Math.max(0, Number(req.query.wait || 0) || 0));
+  const { takeCallSignals } = await import("../lib/callBus.js");
+  const events = await takeCallSignals(companyId, after, wait, req);
+  const last = events.length ? events[events.length - 1].id : after;
+  res.json({ events, after: last });
 }));
 
 router.patch("/automation/voice-ai", asyncRoute(async (req, res) => {
@@ -3695,8 +3872,8 @@ router.get("/whatsapp/billing-status", async (req, res) => {
     ready: currencySet,
     billingUrl,
     hint: currencySet
-      ? "Currency is set. If templates still fail with 131042, add a card on the same billing page and assign it to this WhatsApp account."
-      : "Template campaigns stay blocked until currency (INR) and a card are set on this WhatsApp account — Facebook Business billing, not Facebook Developer.",
+      ? "WhatsApp conversation billing is already set on this account."
+      : "Conversation billing (currency and card) is handled by Nexwapi. Clients only create templates and send campaigns.",
   });
 });
 
@@ -3782,7 +3959,7 @@ router.post("/whatsapp/connect", async (req, res) => {
     webhook: {
       url: `${host}/api/whatsapp/webhook`,
       verifyToken: wa.verifyToken,
-      fields: ["messages", "message_template_status_update"],
+      fields: ["messages", "message_template_status_update", "calls"],
     },
   });
 });
@@ -3838,6 +4015,9 @@ router.post("/whatsapp/refresh", async (req, res) => {
         status: "connected",
       },
     });
+    const { templateSyncCreds, syncCompanyTemplates } = await import("../lib/templateSync.js");
+    await templateSyncCreds(companyId).catch(() => {});
+    syncCompanyTemplates(companyId).catch((e) => console.warn("[wa] template sync on refresh", e?.message || e));
     res.json({ ok: true, account: updated });
   } catch (e) {
     await prisma.whatsAppAccount.update({

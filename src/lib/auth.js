@@ -25,6 +25,7 @@ export function signToken(user, extras = {}) {
       name: user.name,
       role: user.role,
       companyId: user.companyId || null,
+      partnerId: user.partnerId || extras.partnerId || null,
       permissions: Array.isArray(user.permissions) ? user.permissions : [],
       ...extras,
     },
@@ -41,7 +42,8 @@ export function signImpersonationToken(admin, targetUser) {
       email: targetUser.email,
       name: targetUser.name,
       role: targetUser.role,
-      companyId: targetUser.companyId,
+      companyId: targetUser.companyId || null,
+      partnerId: targetUser.partnerId || null,
       impersonatedBy: admin.id,
       impersonating: true,
     },
@@ -76,8 +78,14 @@ export function requireAuth(req, res, next) {
 export function requireSuperAdmin(req, res, next) {
   if (!req.user) return res.status(401).json({ error: "Authentication required" });
   if (req.user.role === "SUPER_ADMIN" || req.user.role === "SuperAdmin") return next();
-  if ((req.user.role === "ADMIN" || req.user.role === "Admin") && !req.user.companyId) return next();
+  if ((req.user.role === "ADMIN" || req.user.role === "Admin") && !req.user.companyId && req.user.role !== "PARTNER") return next();
   return res.status(403).json({ error: "Super Admin access only" });
+}
+
+export function requirePartner(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: "Authentication required" });
+  if (req.user.role === "PARTNER" && req.user.partnerId) return next();
+  return res.status(403).json({ error: "Agency admin access only" });
 }
 
 export function requireAdmin(req, res, next) {

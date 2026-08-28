@@ -36,12 +36,12 @@ export const PERMISSION_GROUPS = [
       {
         key: "contacts.hide_phone_legacy",
         label: "Hide Contact's Phone number (old logic)",
-        note: "Enabling this will hide Templates, Notifications, All Users and Analytics modules where phone numbers may appear.",
+        note: "Phone numbers stay visible. This flag is kept for compatibility and no longer hides numbers.",
       },
       {
         key: "contacts.hide_phone",
         label: "Hide Contact's Phone number",
-        note: "Enabling this will hide only the Phone Number of contacts from all places on the interface.",
+        note: "Phone numbers stay visible on Contacts, Inbox, and campaigns so teams can message customers.",
       },
       {
         key: "contacts.hide_fields",

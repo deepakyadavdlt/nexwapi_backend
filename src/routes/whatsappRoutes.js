@@ -16,6 +16,8 @@ import { assignContactToAgent } from "../lib/assignmentEngine.js";
 import { maybeWelcome, maybeAway } from "../lib/inboxAutomations.js";
 import { buildTriggerCatalog, matchIntent } from "../lib/intentMatcher.js";
 import { maybeAiAgentReply } from "../lib/aiAgent.js";
+import { applyTemplateStatusUpdate, syncCompanyTemplates } from "../lib/templateSync.js";
+import { handleCallingWebhook } from "../lib/waCalling.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
 const EXT = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf", "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3" };
@@ -46,16 +48,21 @@ async function saveInboundMedia(mediaId, hostUrl, companyId) {
   }
 }
 
-/** Resolve tenant companyId from webhook metadata.phone_number_id (or env fallback). */
-async function resolveCompanyId(value) {
-  const phoneNumberId = value?.metadata?.phone_number_id || WA.phoneNumberId;
+/** Resolve tenant companyId from phone_number_id, then WABA id (template webhooks have no phone id). */
+async function resolveCompanyId(value, wabaId) {
+  const phoneNumberId = value?.metadata?.phone_number_id || null;
   if (phoneNumberId) {
     const acct = await prisma.whatsAppAccount.findFirst({
       where: { phoneNumberId: String(phoneNumberId) },
     });
     if (acct?.companyId) return acct.companyId;
   }
-  // Platform number fallback only when it matches env phoneNumberId
+  if (wabaId) {
+    const byWaba = await prisma.whatsAppAccount.findFirst({
+      where: { wabaId: String(wabaId) },
+    });
+    if (byWaba?.companyId) return byWaba.companyId;
+  }
   if (phoneNumberId && WA.phoneNumberId && String(phoneNumberId) === String(WA.phoneNumberId)) {
     const co = await prisma.company.findFirst({
       where: { status: { in: ["TRIAL", "ACTIVE"] } },
@@ -63,7 +70,9 @@ async function resolveCompanyId(value) {
     });
     return co?.id || null;
   }
-  console.warn("[webhook] unmatched phone_number_id:", phoneNumberId);
+  if (phoneNumberId || wabaId) {
+    console.warn("[webhook] unmatched account", { phoneNumberId, wabaId });
+  }
   return null;
 }
 
@@ -216,8 +225,22 @@ function textOf(m) {
   switch (m.type) {
     case "text": return m.text?.body || "";
     case "button": return m.button?.text || "";
-    case "interactive":
+    case "interactive": {
+      const perm = m.interactive?.call_permission_reply;
+      if (m.interactive?.type === "call_permission_reply" || perm) {
+        const r = String(perm?.response || "").toLowerCase();
+        if (r === "accept" || r === "approve" || r === "granted") return "Allowed WhatsApp calls";
+        if (r === "reject" || r === "deny" || r === "declined") return "Declined WhatsApp calls";
+        return "Call permission reply";
+      }
       return m.interactive?.button_reply?.title || m.interactive?.list_reply?.title || "";
+    }
+    case "call_permission_reply": {
+      const r = String(m.call_permission_reply?.response || "").toLowerCase();
+      if (r === "accept" || r === "approve" || r === "granted") return "Allowed WhatsApp calls";
+      if (r === "reject" || r === "deny" || r === "declined") return "Declined WhatsApp calls";
+      return "Call permission reply";
+    }
     case "order": {
       const items = m.order?.product_items || [];
       return `🛒 Cart · ${items.length} item(s)`;
@@ -273,28 +296,38 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
 
   try {
     for (const entry of event?.entry || []) {
+      const wabaId = entry?.id ? String(entry.id) : null;
       for (const change of entry?.changes || []) {
         const value = change?.value;
         if (!value) continue;
-        const companyId = await resolveCompanyId(value);
+        const companyId = await resolveCompanyId(value, wabaId);
+        if (change.field === "calls" || (value.calls && value.calls.length)) {
+          await handleCallingWebhook(value, companyId).catch((e) =>
+            console.warn("[wa] calling webhook", e?.message || e)
+          );
+        }
         if (change.field === "message_template_status_update" || value.message_template_name) {
-          const tName = value.message_template_name;
-          const tStatus = String(value.event || value.message_template_status || "").toLowerCase();
-          if (tName && tStatus) {
-            const tpl = await prisma.template.findFirst({
-              where: { name: tName, ...(companyId ? { companyId } : {}) },
+          let tplCompanyId = companyId;
+          if (!tplCompanyId && wabaId) {
+            const byWaba = await prisma.whatsAppAccount.findFirst({
+              where: { wabaId: String(wabaId) },
             });
-            if (tpl) {
-              await prisma.template.update({ where: { id: tpl.id }, data: { status: tStatus } });
-              const owner = await prisma.user.findFirst({
-                where: { companyId: tpl.companyId, role: { in: ["OWNER", "ADMIN"] } },
-                orderBy: { createdAt: "asc" },
-              });
-              if (owner?.email) {
-                const { sendTemplateStatus } = await import("../lib/mailer.js");
-                sendTemplateStatus(owner.email, tName, tStatus).catch(() => {});
-              }
-            }
+            tplCompanyId = byWaba?.companyId || null;
+          }
+          const tName = value.message_template_name;
+          const tEvent = value.event || value.message_template_status || value.status || "";
+          if (tName && tEvent) {
+            await applyTemplateStatusUpdate({
+              companyId: tplCompanyId,
+              name: tName,
+              language: value.message_template_language,
+              event: tEvent,
+            }).catch((e) => console.warn("[wa] template status", e?.message || e));
+          }
+          if (tplCompanyId) {
+            syncCompanyTemplates(tplCompanyId).catch((e) => console.warn("[wa] template sync", e?.message || e));
+          } else if (wabaId) {
+            console.warn("[wa] template webhook: no company for WABA", wabaId, tName);
           }
         }
         if (!companyId && !(value.statuses || []).length) {
@@ -363,6 +396,18 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
               at: m.timestamp ? new Date(Number(m.timestamp) * 1000) : new Date(),
             },
           });
+          const permReply = m.interactive?.call_permission_reply || m.call_permission_reply;
+          if (m.type === "call_permission_reply" || m.interactive?.type === "call_permission_reply" || permReply) {
+            const r = String(permReply?.response || "").toLowerCase();
+            const accepted = r === "accept" || r === "approve" || r === "granted";
+            const { pushCallSignal } = await import("../lib/callBus.js");
+            pushCallSignal(companyId, {
+              kind: "permission",
+              phone,
+              contactId: contact.id,
+              accepted,
+            });
+          }
           console.log("[wa] incoming from", m.from, ":", bodyText);
           fireEvent(companyId, "message.received", { from: m.from, name: contact.name, text: bodyText, type: m.type }).catch(() => {});
           notify({

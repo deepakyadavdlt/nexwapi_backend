@@ -65,10 +65,14 @@ export async function runCampaign(id) {
   const pricing = await getPlatformPricing();
   const creditsNeeded = pricing.creditPerOutbound || 1;
 
-  const tpl = await prisma.template.findFirst({ where: { name: campaign.template, companyId } });
+  let tpl = await prisma.template.findFirst({ where: { name: campaign.template, companyId } });
   if (!tpl) throw new Error(`Template "${campaign.template}" not found. Create it under Templates first.`);
   if (String(tpl.status).toLowerCase() !== "approved") {
-    throw new Error(`Template "${campaign.template}" is ${tpl.status}. Wait for Meta approval, then Sync from Meta.`);
+    const { refreshTemplateFromMeta } = await import("./templateSync.js");
+    tpl = (await refreshTemplateFromMeta(companyId, campaign.template)) || tpl;
+  }
+  if (String(tpl.status).toLowerCase() !== "approved") {
+    throw new Error(`Template "${campaign.template}" is still ${tpl.status} on WhatsApp. Campaigns send automatically once Meta marks it Approved.`);
   }
   const varCount = tpl ? (tpl.body.match(/\{\{\d+\}\}/g) || []).length : 0;
   const lang = tpl?.language || undefined;

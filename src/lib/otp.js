@@ -53,7 +53,9 @@ export async function issueOtp(email, purpose, payload = {}) {
   let devConsole = false;
 
   try {
-    await sendOtpEmail(em, code, purpose);
+    const { resolveClientMailBrand } = await import("./branding.js");
+    const brand = await resolveClientMailBrand({ email: em, partnerSlug: payload?.partnerSlug });
+    await sendOtpEmail(em, code, purpose, brand);
     emailSent = true;
   } catch (e) {
     const msg = String(e?.message || e);

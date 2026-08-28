@@ -68,5 +68,8 @@ export function corsOriginCheck(origin, cb) {
   if (allowed.includes(origin)) return cb(null, true);
   if (/^https?:\/\/([a-z0-9-]+\.)*nexwapi\.com(:\d+)?$/i.test(origin)) return cb(null, true);
   if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return cb(null, true);
-  return cb(null, false);
+  import("./partnerDomain.js")
+    .then((m) => m.isPartnerCorsOrigin(origin))
+    .then((ok) => cb(null, Boolean(ok)))
+    .catch(() => cb(null, false));
 }

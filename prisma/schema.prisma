@@ -9,10 +9,17 @@ datasource db {
 
 enum UserRole {
   SUPER_ADMIN
+  PARTNER
   OWNER
   ADMIN
   AGENT
   MEMBER
+}
+
+enum PartnerStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
 }
 
 enum CompanyStatus {
@@ -32,6 +39,34 @@ enum PlanKey {
   expired
 }
 
+model Partner {
+  id             String        @id @default(cuid())
+  name           String
+  slug           String        @unique
+  email          String?
+  phone          String?
+  status         PartnerStatus @default(PENDING)
+  plan           String        @default("agency")
+  maxClients     Int           @default(50)
+  paidAt         DateTime?
+  paymentNote    String?
+  paymentAmount  Int           @default(0)
+  productName    String        @default("")
+  logoUrl        String?
+  primaryColor   String        @default("#0f8a3c")
+  customDomain   String?
+  websiteUrl     String        @default("")
+  notes          String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  companies Company[]
+  users     User[]
+
+  @@index([status])
+  @@index([customDomain])
+}
+
 model Company {
   id             String        @id @default(cuid())
   name           String
@@ -39,6 +74,8 @@ model Company {
   email          String?
   phone          String?
   website        String?
+  partnerId      String?
+  partner        Partner?      @relation(fields: [partnerId], references: [id], onDelete: SetNull)
   status         CompanyStatus @default(TRIAL)
   plan           PlanKey       @default(trial)
   trialEndsAt    DateTime?
@@ -90,6 +127,8 @@ model Company {
   auditLogs        AuditLog[]
   tickets          Ticket[]
   walletTxns       WalletTransaction[]
+
+  @@index([partnerId])
 }
 
 model User {
@@ -102,6 +141,8 @@ model User {
   isActive     Boolean   @default(true)
   companyId    String?
   company      Company?  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  partnerId    String?
+  partner      Partner?  @relation(fields: [partnerId], references: [id], onDelete: SetNull)
   lastLoginAt  DateTime?
   lastActiveAt DateTime?
   permissions  Json?
@@ -112,6 +153,7 @@ model User {
   tickets      Ticket[]  @relation("TicketUser")
 
   @@index([companyId])
+  @@index([partnerId])
 }
 
 model Subscription {

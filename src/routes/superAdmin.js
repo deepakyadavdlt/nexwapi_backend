@@ -2,8 +2,8 @@
 import express from "express";
 import { prisma } from "../lib/prisma.js";
 import { buildSegmentContactWhere } from "../lib/segmentFilters.js";
-import { requireAuth, requireSuperAdmin, signImpersonationToken, hashPassword } from "../lib/auth.js";
-import { publicCompanyUser, uniqueSlug } from "../lib/tenant.js";
+import { requireAuth, requireSuperAdmin, signImpersonationToken, signToken, hashPassword } from "../lib/auth.js";
+import { publicCompanyUser, uniqueSlug, uniquePartnerSlug, publicPartnerBranding } from "../lib/tenant.js";
 import { createAgentSeat, ensureOwnerAgent } from "../lib/teamSeats.js";
 import { razorpay, RAZORPAY_ENABLED } from "../lib/razorpay.js";
 import { PLAN_CATALOG, normalizePlan, isPaidPlan } from "../lib/plans.js";
@@ -12,6 +12,8 @@ import { creditWallet, debitWallet, getPlatformPricing } from "../lib/wallet.js"
 import { otpGate } from "../lib/otp.js";
 import { notify } from "../lib/notify.js";
 import { hasPermission, permissionForPath, normalizePermissions, PERMISSIONS } from "../lib/permissions.js";
+import { isExplicitTrue, normalizeHost, normalizeWebsiteUrl, assertUniqueCustomDomain, bumpPartnerCorsCache } from "../lib/partnerDomain.js";
+import { sendPartnerActivated } from "../lib/mailer.js";
 import multer from "multer";
 import {
   fetchBusinessProfile, updateBusinessProfile, uploadProfilePicture, VERTICALS, platformWaCreds,
@@ -77,18 +79,63 @@ function mapClient(c) {
     lastActiveAt: c.lastActiveAt ? c.lastActiveAt.getTime() : null,
     phone: c.phone || "",
     website: c.website || "",
+    partnerId: c.partnerId || c.partner?.id || null,
+    partnerName: c.partner?.name || null,
   };
+}
+
+function serializePartner(p, extra = {}) {
+  return {
+    id: p.id,
+    name: p.name,
+    slug: p.slug,
+    email: p.email,
+    phone: p.phone || "",
+    status: p.status,
+    maxClients: p.maxClients,
+    paidAt: p.paidAt ? p.paidAt.getTime() : null,
+    paymentNote: p.paymentNote || "",
+    paymentAmount: p.paymentAmount || 0,
+    productName: p.productName || "",
+    logoUrl: p.logoUrl || null,
+    primaryColor: p.primaryColor || "#0f8a3c",
+    customDomain: p.customDomain || "",
+    websiteUrl: p.websiteUrl || "",
+    notes: p.notes || "",
+    createdAt: p.createdAt.getTime(),
+    branding: publicPartnerBranding(p),
+    loginPath: `/login?partner=${p.slug}`,
+    portalPath: `/p/${p.slug}`,
+    clientCount: extra.clientCount ?? p._count?.companies ?? 0,
+    ownerEmail: extra.ownerEmail || p.users?.[0]?.email || p.email,
+    ownerName: extra.ownerName || p.users?.[0]?.name || p.name,
+    ...extra,
+  };
+}
+
+function notifyPartnerActivated(partner) {
+  const to = partner.users?.[0]?.email || partner.email;
+  if (!to) return;
+  const dash = (process.env.APP_DASHBOARD_URL || "https://app.nexwapi.com").replace(/\/$/, "");
+  sendPartnerActivated({
+    to,
+    name: partner.name,
+    productName: partner.productName || partner.name,
+    slug: partner.slug,
+    loginUrl: `${dash}/partner`,
+  }).catch((e) => console.warn("[partner activate mail]", e?.message || e));
 }
 
 /* ---------- Dashboard overview ---------- */
 router.get("/overview", async (_req, res) => {
-  const [companies, payments, messagesToday, campaigns] = await Promise.all([
-    prisma.company.findMany({ include: { payments: true, whatsappAccounts: true, users: { take: 1, orderBy: { createdAt: "asc" } } } }),
+  const [companies, payments, messagesToday, campaigns, partnerCount] = await Promise.all([
+    prisma.company.findMany({ include: { payments: true, whatsappAccounts: true, partner: true, users: { take: 1, orderBy: { createdAt: "asc" } } } }),
     prisma.payment.findMany({ where: { status: "paid" } }),
     prisma.message.count({
       where: { direction: "out", at: { gte: new Date(new Date().setHours(0, 0, 0, 0)) } },
     }),
     prisma.campaign.findMany({ orderBy: { createdAt: "desc" }, take: 10 }),
+    prisma.partner.count().catch(() => 0),
   ]);
 
   const clients = companies.map(mapClient);
@@ -151,6 +198,7 @@ router.get("/overview", async (_req, res) => {
       openTickets,
       waConnected: clients.filter((c) => c.whatsappConnected).length,
       campaigns: campaigns.length,
+      partners: partnerCount,
     },
     planMix,
     topClients: [...clients].sort((a, b) => b.revenue - a.revenue).slice(0, 6),
@@ -168,13 +216,225 @@ router.get("/overview", async (_req, res) => {
   });
 });
 
+/* ---------- Partners (agencies) ---------- */
+router.get("/partners", async (_req, res) => {
+  const rows = await prisma.partner.findMany({
+    orderBy: { createdAt: "desc" },
+    include: { _count: { select: { companies: true } }, users: { where: { role: "PARTNER" }, take: 1, orderBy: { createdAt: "asc" } } },
+  });
+  res.json({
+    partners: rows.map((p) => serializePartner(p)),
+    summary: {
+      total: rows.length,
+      active: rows.filter((p) => p.status === "ACTIVE").length,
+      pending: rows.filter((p) => p.status === "PENDING").length,
+      suspended: rows.filter((p) => p.status === "SUSPENDED").length,
+    },
+  });
+});
+
+router.post("/partners", async (req, res) => {
+  if (req.user.role !== "SUPER_ADMIN") {
+    return res.status(403).json({ error: "Only Super Admin can create partners" });
+  }
+  const name = String(req.body?.name || "").trim();
+  const email = String(req.body?.email || "").toLowerCase().trim();
+  const password = String(req.body?.password || "");
+  const phone = String(req.body?.phone || "").trim();
+  const productName = String(req.body?.productName || "").trim();
+  const maxClients = Math.max(1, Math.min(10000, Number(req.body?.maxClients) || 50));
+  const activate = isExplicitTrue(req.body?.activate) || isExplicitTrue(req.body?.paid);
+  const paymentNote = String(req.body?.paymentNote || "").trim();
+  const paymentAmount = Math.max(0, Math.floor(Number(req.body?.paymentAmount || req.body?.paymentAmountPaise) || 0));
+  if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) return res.status(409).json({ error: "An account with this email already exists" });
+  try {
+    const slug = await uniquePartnerSlug(req.body?.slug || name);
+    const partner = await prisma.partner.create({
+      data: {
+        name,
+        slug,
+        email,
+        phone: phone || null,
+        status: activate ? "ACTIVE" : "PENDING",
+        plan: String(req.body?.plan || "agency").slice(0, 40),
+        maxClients,
+        productName: productName || name,
+        websiteUrl: normalizeWebsiteUrl(req.body?.websiteUrl || ""),
+        primaryColor: /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(req.body?.primaryColor || ""))
+          ? String(req.body.primaryColor)
+          : "#0f8a3c",
+        paidAt: activate ? new Date() : null,
+        paymentNote: paymentNote || (activate ? "Marked paid by Super Admin" : null),
+        paymentAmount,
+        notes: String(req.body?.notes || "").trim() || null,
+      },
+    });
+    const owner = await prisma.user.create({
+      data: {
+        name,
+        email,
+        phone: phone || null,
+        password: await hashPassword(password),
+        role: "PARTNER",
+        companyId: null,
+        partnerId: partner.id,
+        isActive: true,
+      },
+    });
+    await prisma.auditLog.create({
+      data: {
+        userId: req.user.id,
+        action: "partner_create",
+        entity: "Partner",
+        entityId: partner.id,
+        meta: { email, activate, maxClients },
+      },
+    }).catch(() => {});
+    res.status(201).json({
+      ok: true,
+      partner: serializePartner(partner, { clientCount: 0, ownerEmail: owner.email, ownerName: owner.name }),
+    });
+  } catch (e) {
+    if (e.code === "P2002") return res.status(409).json({ error: "Email or slug already exists" });
+    res.status(400).json({ error: e.message || "Could not create partner" });
+  }
+});
+
+router.patch("/partners/:id", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const data = {};
+  if (req.body?.name != null) data.name = String(req.body.name).trim();
+  if (req.body?.email != null) data.email = String(req.body.email).toLowerCase().trim();
+  if (req.body?.phone != null) data.phone = String(req.body.phone).trim() || null;
+  if (req.body?.productName != null) data.productName = String(req.body.productName).trim();
+  if (req.body?.maxClients != null) data.maxClients = Math.max(1, Math.min(10000, Number(req.body.maxClients) || partner.maxClients));
+  if (req.body?.notes != null) data.notes = String(req.body.notes).trim() || null;
+  if (req.body?.logoUrl != null) data.logoUrl = String(req.body.logoUrl).trim() || null;
+  if (req.body?.websiteUrl != null) data.websiteUrl = normalizeWebsiteUrl(req.body.websiteUrl);
+  if (req.body?.customDomain != null) {
+    const host = String(req.body.customDomain).trim() ? normalizeHost(req.body.customDomain) : null;
+    if (String(req.body.customDomain).trim() && !host) {
+      return res.status(400).json({ error: "Enter a valid domain like crm.yourcompany.com." });
+    }
+    try {
+      await assertUniqueCustomDomain(prisma, host, partner.id);
+    } catch (e) {
+      return res.status(e.status || 400).json({ error: e.message });
+    }
+    data.customDomain = host;
+  }
+  if (req.body?.plan != null) data.plan = String(req.body.plan).trim().slice(0, 40);
+  if (req.body?.primaryColor && /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(req.body.primaryColor))) {
+    data.primaryColor = String(req.body.primaryColor);
+  }
+  const updated = await prisma.partner.update({ where: { id: partner.id }, data });
+  bumpPartnerCorsCache();
+  if (req.body?.password && String(req.body.password).length >= 6) {
+    await prisma.user.updateMany({
+      where: { partnerId: partner.id, role: "PARTNER" },
+      data: { password: await hashPassword(String(req.body.password)) },
+    });
+  }
+  const withCount = await prisma.partner.findUnique({
+    where: { id: updated.id },
+    include: { _count: { select: { companies: true } }, users: { where: { role: "PARTNER" }, take: 1 } },
+  });
+  res.json(serializePartner(withCount));
+});
+
+router.post("/partners/:id/activate", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const paymentNote = String(req.body?.paymentNote || "Payment received").trim();
+  const paymentAmount = Math.max(0, Math.floor(Number(req.body?.paymentAmount || req.body?.paymentAmountPaise) || partner.paymentAmount || 0));
+  const updated = await prisma.partner.update({
+    where: { id: partner.id },
+    data: {
+      status: "ACTIVE",
+      paidAt: partner.paidAt || new Date(),
+      paymentNote,
+      paymentAmount,
+    },
+    include: { _count: { select: { companies: true } }, users: { where: { role: "PARTNER" }, take: 1 } },
+  });
+  await prisma.auditLog.create({
+    data: { userId: req.user.id, action: "partner_activate", entity: "Partner", entityId: partner.id, meta: { paymentNote, paymentAmount } },
+  }).catch(() => {});
+  bumpPartnerCorsCache();
+  notifyPartnerActivated(updated);
+  res.json(serializePartner(updated));
+});
+
+router.post("/partners/:id/suspend", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const updated = await prisma.partner.update({
+    where: { id: partner.id },
+    data: { status: "SUSPENDED", notes: req.body?.reason ? String(req.body.reason).trim() : partner.notes },
+    include: { _count: { select: { companies: true } }, users: { where: { role: "PARTNER" }, take: 1 } },
+  });
+  bumpPartnerCorsCache();
+  res.json(serializePartner(updated));
+});
+
+router.post("/partners/:id/unsuspend", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const status = partner.paidAt ? "ACTIVE" : "PENDING";
+  const updated = await prisma.partner.update({
+    where: { id: partner.id },
+    data: { status },
+    include: { _count: { select: { companies: true } }, users: { where: { role: "PARTNER" }, take: 1 } },
+  });
+  res.json(serializePartner(updated));
+});
+
+router.get("/partners/:id/clients", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const companies = await prisma.company.findMany({
+    where: { partnerId: partner.id },
+    orderBy: { createdAt: "desc" },
+    include: { payments: true, whatsappAccounts: true, partner: true, users: { take: 1, orderBy: { createdAt: "asc" } } },
+  });
+  res.json({ partner: serializePartner(partner, { clientCount: companies.length }), clients: companies.map(mapClient) });
+});
+
+router.post("/partners/:id/login-as", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const owner = await prisma.user.findFirst({ where: { partnerId: partner.id, role: "PARTNER" }, orderBy: { createdAt: "asc" } });
+  if (!owner) return res.status(404).json({ error: "No partner login on this agency" });
+  const token = signToken(owner, { impersonatedBy: req.user.id, impersonating: true });
+  await prisma.auditLog.create({
+    data: { userId: req.user.id, action: "partner_login_as", entity: "Partner", entityId: partner.id },
+  }).catch(() => {});
+  res.json({
+    token,
+    user: {
+      ...publicCompanyUser(owner, null),
+      isPartner: true,
+      partnerId: partner.id,
+      impersonating: true,
+      impersonatedBy: req.user.id,
+    },
+  });
+});
+
 /* ---------- Clients ---------- */
-router.get("/clients", async (_req, res) => {
+router.get("/clients", async (req, res) => {
+  const partnerId = String(req.query?.partnerId || "").trim();
   const withOwners = await prisma.company.findMany({
+    where: partnerId ? { partnerId } : {},
     orderBy: { createdAt: "desc" },
     include: {
       payments: true,
       whatsappAccounts: true,
+      partner: true,
       users: { take: 5, orderBy: { createdAt: "asc" } },
     },
   });
@@ -203,10 +463,15 @@ router.post("/clients", async (req, res) => {
   const phone = String(req.body?.phone || "").trim();
   const plan = normalizePlan(req.body?.plan || "trial");
   const credits = Math.max(0, Number(req.body?.credits) || 0);
+  const partnerId = String(req.body?.partnerId || "").trim() || null;
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
   if (password && password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
   const existing = await prisma.user.findUnique({ where: { email } });
   if (existing) return res.status(409).json({ error: "An account with this email already exists" });
+  if (partnerId) {
+    const partnerRow = await prisma.partner.findUnique({ where: { id: partnerId } });
+    if (!partnerRow) return res.status(400).json({ error: "Partner not found" });
+  }
   try {
     const pricing = await getPlatformPricing();
     const slug = await uniqueSlug(companyName);
@@ -225,6 +490,7 @@ router.post("/clients", async (req, res) => {
         messageCredits: credits || pricing.trialCredits,
         walletBalancePaise: 0,
         freeAccess: Boolean(req.body?.freeAccess),
+        partnerId,
       },
     });
     const user = await prisma.user.create({
@@ -616,7 +882,7 @@ router.post("/clients/:id/trial", async (req, res) => {
 router.post("/clients/:id/login-as", async (req, res) => {
   const company = await prisma.company.findUnique({
     where: { id: req.params.id },
-    include: { users: { orderBy: { createdAt: "asc" } } },
+    include: { users: { orderBy: { createdAt: "asc" } }, partner: true },
   });
   if (!company) return res.status(404).json({ error: "Client not found" });
   const owner = company.users.find((u) => u.role === "OWNER" || u.role === "Owner") || company.users[0];
@@ -635,6 +901,203 @@ router.post("/clients/:id/login-as", async (req, res) => {
     token,
     user: { ...publicCompanyUser(owner, company), impersonating: true, impersonatedBy: req.user.id },
   });
+});
+
+function partnerInclude() {
+  return { users: { where: { role: "PARTNER" }, take: 3, orderBy: { createdAt: "asc" } }, _count: { select: { companies: true } } };
+}
+
+router.get("/partners", async (_req, res) => {
+  const rows = await prisma.partner.findMany({
+    orderBy: { createdAt: "desc" },
+    include: partnerInclude(),
+  });
+  res.json({
+    partners: rows.map((p) => serializePartner(p)),
+    summary: {
+      total: rows.length,
+      active: rows.filter((p) => p.status === "ACTIVE").length,
+      pending: rows.filter((p) => p.status === "PENDING").length,
+      suspended: rows.filter((p) => p.status === "SUSPENDED").length,
+      clients: rows.reduce((s, p) => s + (p._count?.companies || 0), 0),
+    },
+  });
+});
+
+router.post("/partners", async (req, res) => {
+  if (req.user.role !== "SUPER_ADMIN" && req.user.role !== "SuperAdmin") {
+    return res.status(403).json({ error: "Only Super Admin can create partners" });
+  }
+  const name = String(req.body?.name || "").trim();
+  const email = String(req.body?.email || "").toLowerCase().trim();
+  const password = String(req.body?.password || "");
+  const ownerName = String(req.body?.ownerName || name).trim();
+  const phone = String(req.body?.phone || "").trim();
+  if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  if (!password || password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) return res.status(409).json({ error: "An account with this email already exists" });
+  const activate = isExplicitTrue(req.body?.activate) || isExplicitTrue(req.body?.paid);
+  const slug = await uniquePartnerSlug(req.body?.slug || name);
+  const partner = await prisma.partner.create({
+    data: {
+      name,
+      slug,
+      email,
+      phone: phone || null,
+      status: activate ? "ACTIVE" : "PENDING",
+      maxClients: Math.max(1, Number(req.body?.maxClients) || 50),
+      paidAt: activate ? new Date() : null,
+      paymentNote: String(req.body?.paymentNote || "").trim() || (activate ? "Marked paid by Super Admin" : null),
+      paymentAmount: Math.max(0, Math.floor(Number(req.body?.paymentAmount) || 0)),
+      productName: String(req.body?.productName || name).trim(),
+      logoUrl: String(req.body?.logoUrl || "").trim() || null,
+      primaryColor: /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(req.body?.primaryColor || ""))
+        ? String(req.body.primaryColor)
+        : "#0f8a3c",
+      notes: String(req.body?.notes || "").trim() || null,
+    },
+  });
+  const user = await prisma.user.create({
+    data: {
+      name: ownerName,
+      email,
+      password: await hashPassword(password),
+      phone: phone || null,
+      role: "PARTNER",
+      companyId: null,
+      partnerId: partner.id,
+      isActive: true,
+    },
+  });
+  await prisma.auditLog.create({
+    data: {
+      userId: req.user.id,
+      action: "partner_create",
+      entity: "Partner",
+      entityId: partner.id,
+      meta: { email, activate, slug },
+    },
+  }).catch(() => {});
+  res.status(201).json({
+    ok: true,
+    partner: serializePartner(partner, { clientCount: 0, ownerEmail: user.email, ownerName: user.name }),
+  });
+});
+
+router.patch("/partners/:id", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const data = {};
+  if (req.body?.name != null) data.name = String(req.body.name).trim();
+  if (req.body?.email != null) data.email = String(req.body.email).toLowerCase().trim();
+  if (req.body?.phone != null) data.phone = String(req.body.phone).trim() || null;
+  if (req.body?.maxClients != null) data.maxClients = Math.max(1, Number(req.body.maxClients) || partner.maxClients);
+  if (req.body?.productName != null) data.productName = String(req.body.productName).trim();
+  if (req.body?.logoUrl != null) data.logoUrl = String(req.body.logoUrl).trim() || null;
+  if (req.body?.primaryColor && /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(req.body.primaryColor))) {
+    data.primaryColor = String(req.body.primaryColor);
+  }
+  if (req.body?.customDomain != null) data.customDomain = String(req.body.customDomain).trim().toLowerCase() || null;
+  if (req.body?.notes != null) data.notes = String(req.body.notes).trim() || null;
+  if (req.body?.paymentNote != null) data.paymentNote = String(req.body.paymentNote).trim() || null;
+  if (req.body?.paymentAmount != null) data.paymentAmount = Math.max(0, Math.floor(Number(req.body.paymentAmount) || 0));
+  const updated = await prisma.partner.update({ where: { id: partner.id }, data, include: partnerInclude() });
+  bumpPartnerCorsCache();
+  if (req.body?.ownerPassword && String(req.body.ownerPassword).length >= 6) {
+    const owner = updated.users[0];
+    if (owner) await prisma.user.update({ where: { id: owner.id }, data: { password: await hashPassword(String(req.body.ownerPassword)) } });
+  }
+  res.json(serializePartner(updated));
+});
+
+router.post("/partners/:id/activate", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id }, include: partnerInclude() });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const updated = await prisma.partner.update({
+    where: { id: partner.id },
+    data: {
+      status: "ACTIVE",
+      paidAt: partner.paidAt || new Date(),
+      paymentNote: String(req.body?.paymentNote || partner.paymentNote || "Activated by Super Admin").trim(),
+      paymentAmount: req.body?.paymentAmount != null ? Math.max(0, Math.floor(Number(req.body.paymentAmount) || 0)) : partner.paymentAmount,
+    },
+    include: partnerInclude(),
+  });
+  const owner = updated.users[0];
+  if (owner && owner.isActive === false) {
+    await prisma.user.update({ where: { id: owner.id }, data: { isActive: true } });
+  }
+  await prisma.auditLog.create({
+    data: { userId: req.user.id, action: "partner_activate", entity: "Partner", entityId: partner.id, meta: { paymentNote: updated.paymentNote } },
+  }).catch(() => {});
+  bumpPartnerCorsCache();
+  notifyPartnerActivated(updated);
+  res.json(serializePartner(updated));
+});
+
+router.post("/partners/:id/suspend", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const updated = await prisma.partner.update({
+    where: { id: partner.id },
+    data: { status: "SUSPENDED", notes: String(req.body?.reason || partner.notes || "Suspended").trim() },
+    include: partnerInclude(),
+  });
+  res.json(serializePartner(updated));
+});
+
+router.post("/partners/:id/unsuspend", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const updated = await prisma.partner.update({
+    where: { id: partner.id },
+    data: { status: partner.paidAt ? "ACTIVE" : "PENDING" },
+    include: partnerInclude(),
+  });
+  res.json(serializePartner(updated));
+});
+
+router.post("/partners/:id/login-as", async (req, res) => {
+  const partner = await prisma.partner.findUnique({
+    where: { id: req.params.id },
+    include: { users: { where: { role: "PARTNER" }, orderBy: { createdAt: "asc" } } },
+  });
+  if (!partner) return res.status(404).json({ error: "Partner not found" });
+  const owner = partner.users[0];
+  if (!owner) return res.status(404).json({ error: "No partner login on this account" });
+  if (owner.role === "SUPER_ADMIN") return res.status(403).json({ error: "Cannot impersonate Super Admin" });
+  const token = signImpersonationToken(req.user, owner);
+  res.json({
+    token,
+    user: {
+      id: owner.id,
+      name: owner.name,
+      email: owner.email,
+      role: "PARTNER",
+      partnerId: partner.id,
+      isPartner: true,
+      isSuperAdmin: false,
+      isPlatformStaff: false,
+      impersonating: true,
+      impersonatedBy: req.user.id,
+    },
+  });
+});
+
+router.get("/partners/:id/clients", async (req, res) => {
+  const partner = await prisma.partner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return res.status(404).json({ error: "not found" });
+  const withOwners = await prisma.company.findMany({
+    where: { partnerId: partner.id },
+    orderBy: { createdAt: "desc" },
+    include: { payments: true, whatsappAccounts: true, partner: true, users: { take: 5, orderBy: { createdAt: "asc" } } },
+  });
+  const clients = withOwners.map((c) => {
+    const owner = c.users.find((u) => u.role === "OWNER" || u.role === "ADMIN") || c.users[0];
+    return mapClient({ ...c, users: owner ? [owner] : [] });
+  });
+  res.json({ partner: serializePartner(partner, { clientCount: clients.length }), clients });
 });
 
 /* ---------- WhatsApp accounts ---------- */
@@ -1195,11 +1658,23 @@ router.get("/logs", async (req, res) => {
   }
 });
 
+router.post("/templates/sync", async (_req, res) => {
+  const { syncAllConnectedTemplateStatuses } = await import("../lib/templateSync.js");
+  const result = await syncAllConnectedTemplateStatuses();
+  res.json({ ok: true, ...result });
+});
+
 router.get("/templates", async (_req, res) => {
+  try {
+    const { syncAllConnectedTemplateStatuses } = await import("../lib/templateSync.js");
+    await syncAllConnectedTemplateStatuses();
+  } catch (e) {
+    console.warn("[admin templates] sync", e?.message || e);
+  }
   const templates = await prisma.template.findMany({
     orderBy: { createdAt: "desc" },
     take: 300,
-    include: { company: { select: { name: true, email: true } } },
+    include: { company: { select: { name: true, email: true, phone: true } } },
   });
   res.json(templates.map((t) => ({
     id: t.id,
@@ -1212,6 +1687,7 @@ router.get("/templates", async (_req, res) => {
     companyId: t.companyId,
     companyName: t.company?.name || "—",
     companyEmail: t.company?.email || "—",
+    companyPhone: t.company?.phone || "",
     createdAt: t.createdAt.getTime(),
   })));
 });
@@ -1367,7 +1843,7 @@ router.post("/platform-profile/photo", profileUpload.single("file"), async (req,
   }
 });
 
-const USER_ROLES = ["SUPER_ADMIN", "OWNER", "ADMIN", "AGENT", "MEMBER"];
+const USER_ROLES = ["SUPER_ADMIN", "PARTNER", "OWNER", "ADMIN", "AGENT", "MEMBER"];
 
 function serializeManagedUser(u) {
   return {
@@ -1463,10 +1939,14 @@ router.patch("/users/:id/role", async (req, res) => {
     return res.status(403).json({ error: "Only Super Admin can change roles" });
   }
   const role = String(req.body?.role || "");
+  if (role === "PARTNER") return res.status(400).json({ error: "Partner logins are created on the Partners page" });
   if (!USER_ROLES.includes(role)) return res.status(400).json({ error: "Invalid role" });
   if (req.params.id === req.user.id) return res.status(400).json({ error: "You cannot change your own role" });
   const target = await prisma.user.findUnique({ where: { id: req.params.id } });
   if (!target) return res.status(404).json({ error: "User not found" });
+  if (target.role === "PARTNER") {
+    return res.status(400).json({ error: "Partner accounts cannot be promoted to Super Admin. Manage them on Partners." });
+  }
   const data = { role };
   if (role === "SUPER_ADMIN") data.companyId = null;
   if ((role === "OWNER" || role === "AGENT" || role === "MEMBER") && !target.companyId) {

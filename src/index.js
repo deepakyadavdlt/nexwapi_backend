@@ -6,6 +6,7 @@ import morgan from "morgan";
 import whatsappRoutes from "./routes/whatsappRoutes.js";
 import api from "./routes/api.js";
 import superAdmin from "./routes/superAdmin.js";
+import partner from "./routes/partner.js";
 import { WA_LIVE } from "./config/whatsapp.js";
 import { attachUser } from "./lib/auth.js";
 import { validateEnv, corsOriginCheck, isProduction } from "./lib/env.js";
@@ -49,6 +50,7 @@ app.get("/health", (_req, res) =>
 
 app.use("/api/whatsapp", whatsappRoutes); // GET verify + POST receive
 app.use("/api/super-admin", attachUser, superAdmin); // platform Super Admin
+app.use("/api/partner", attachUser, partner); // agency Partner console
 app.use("/api", attachUser, api); // dashboard REST API (attaches req.user if a token is present)
 
 // On boot, ensure Super Admin exists when ADMIN_EMAIL/ADMIN_PASSWORD are set.
@@ -115,6 +117,11 @@ Promise.all([
     delayed.runDelayedReplies().catch(() => {});
     flow.runFlowMaintenance().catch(() => {});
   }, 30 * 1000);
+  import("./lib/templateSync.js").then((ts) => {
+    const tick = () => ts.runPendingTemplateSyncs().catch(() => {});
+    setTimeout(tick, 20 * 1000);
+    setInterval(tick, 60 * 1000);
+  }).catch(() => {});
   setInterval(() => life.runLifecycleEmails().catch(() => {}), 60 * 60 * 1000);
   setTimeout(() => life.runLifecycleEmails().catch(() => {}), 15 * 1000);
 });

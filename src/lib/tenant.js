@@ -6,9 +6,44 @@ export function isSuperAdmin(user) {
   return user?.role === "SUPER_ADMIN" || user?.role === "SuperAdmin";
 }
 
+export function isPartner(user) {
+  return user?.role === "PARTNER";
+}
+
 export function isCompanyAdmin(user) {
   const r = user?.role;
   return r === "OWNER" || r === "Owner" || r === "ADMIN" || r === "Admin" || isSuperAdmin(user);
+}
+
+export const DEFAULT_BRANDING = {
+  productName: "Nexwapi",
+  logoUrl: null,
+  primaryColor: "#0f8a3c",
+  hideNexwapi: false,
+  slug: null,
+  websiteUrl: "",
+  customDomain: "",
+};
+
+export function publicPartnerBranding(partner) {
+  if (!partner) return { ...DEFAULT_BRANDING };
+  return {
+    productName: String(partner.productName || partner.name || "Workspace").trim() || "Workspace",
+    logoUrl: partner.logoUrl || null,
+    primaryColor: partner.primaryColor || "#0f8a3c",
+    hideNexwapi: true,
+    slug: partner.slug || null,
+    websiteUrl: partner.websiteUrl || "",
+    customDomain: partner.customDomain || "",
+  };
+}
+
+export function resolveBranding(user, company) {
+  const partner = company?.partner || user?.partner;
+  if (partner && user?.role !== "SUPER_ADMIN" && user?.role !== "PARTNER") {
+    return publicPartnerBranding(partner);
+  }
+  return { ...DEFAULT_BRANDING };
 }
 
 /** Resolve companyId for the current request (impersonation-aware). */
@@ -33,7 +68,11 @@ export async function attachCompany(req, _res, next) {
     }
     const company = await prisma.company.findUnique({
       where: { id: companyId },
-      include: { subscription: true, whatsappAccounts: { where: { isDefault: true }, take: 1 } },
+      include: {
+        subscription: true,
+        partner: true,
+        whatsappAccounts: { where: { isDefault: true }, take: 1 },
+      },
     });
     req.company = company;
     // Soft-expire trial
@@ -55,6 +94,12 @@ export function requireActiveCompany(req, res, next) {
   if (isSuperAdmin(req.user) && !req.impersonateCompanyId) return next();
   const c = req.company;
   if (!c) return res.status(403).json({ error: "No company linked to this account" });
+  if (c.partner && c.partner.status !== "ACTIVE") {
+    return res.status(403).json({
+      error: "This workspace is temporarily unavailable. Contact your provider.",
+      code: "PARTNER_INACTIVE",
+    });
+  }
   if (c.freeAccess) return next(); // Super Admin free grant
   if (c.status === "SUSPENDED") {
     if (req.allowBilling) return next();
@@ -78,6 +123,12 @@ export function requireActiveCompany(req, res, next) {
 /** Block messaging features when suspended (billing stays open). */
 export function requireNotSuspended(req, res, next) {
   if (isSuperAdmin(req.user) && !req.impersonateCompanyId) return next();
+  if (req.company?.partner && req.company.partner.status !== "ACTIVE") {
+    return res.status(403).json({
+      error: "This workspace is temporarily unavailable. Contact your provider.",
+      code: "PARTNER_INACTIVE",
+    });
+  }
   if (req.company?.status === "SUSPENDED") {
     return res.status(403).json({ error: "Account suspended", code: "SUSPENDED" });
   }
@@ -131,7 +182,10 @@ export function publicCompanyUser(user, company) {
     walletBalancePaise: company?.walletBalancePaise ?? 0,
     messageCredits: company?.messageCredits ?? 0,
     isSuperAdmin: isSuperAdmin(user),
-    isPlatformStaff: isSuperAdmin(user) || ((user.role === "ADMIN" || user.role === "Admin") && !user.companyId),
+    isPartner: isPartner(user),
+    isPlatformStaff: isSuperAdmin(user) || ((user.role === "ADMIN" || user.role === "Admin") && !user.companyId && !isPartner(user)),
+    partnerId: user?.partnerId || company?.partnerId || null,
+    branding: resolveBranding(user, company),
     isActive: user.isActive !== false,
     permissions: Array.isArray(user.permissions) ? user.permissions : [],
   };
@@ -207,5 +261,18 @@ export async function uniqueSlug(base) {
   let slug = slugify(base);
   let n = 0;
   while (await prisma.company.findUnique({ where: { slug: n ? `${slug}-${n}` : slug } })) n++;
+  return n ? `${slug}-${n}` : slug;
+}
+
+const RESERVED_PARTNER_SLUGS = new Set([
+  "app", "www", "api", "admin", "login", "signup", "partner", "partners",
+  "dashboard", "static", "assets", "mail", "support", "help", "status",
+]);
+
+export async function uniquePartnerSlug(base) {
+  let slug = slugify(base);
+  if (RESERVED_PARTNER_SLUGS.has(slug)) slug = `${slug}-app`;
+  let n = 0;
+  while (await prisma.partner.findUnique({ where: { slug: n ? `${slug}-${n}` : slug } })) n++;
   return n ? `${slug}-${n}` : slug;
 }

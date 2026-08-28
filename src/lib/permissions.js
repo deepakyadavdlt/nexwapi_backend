@@ -17,6 +17,7 @@ export const PERMISSIONS = [
   { key: "settings", label: "Account settings" },
   { key: "whatsapp", label: "WhatsApp" },
   { key: "users", label: "User management" },
+  { key: "partners", label: "Partners" },
 ];
 
 export const PERMISSION_KEYS = PERMISSIONS.map((p) => p.key);
@@ -29,6 +30,7 @@ export function normalizePermissions(value) {
 export function isPlatformStaff(user) {
   if (!user) return false;
   if (user.role === "SUPER_ADMIN" || user.role === "SuperAdmin") return true;
+  if (user.role === "PARTNER") return false;
   return (user.role === "ADMIN" || user.role === "Admin") && !user.companyId;
 }
 
@@ -40,6 +42,7 @@ export function hasPermission(user, key) {
 }
 
 const PATH_PERM = [
+  [/^\/partners/, "partners"],
   [/^\/users/, "users"],
   [/^\/clients\/[^/]+\/wallet/, "payments"],
   [/^\/clients/, "clients"],

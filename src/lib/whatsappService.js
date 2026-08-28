@@ -50,13 +50,13 @@ async function send(payload, creds) {
 }
 
 const META_HINTS = {
-  131042: "WhatsApp billing is incomplete (usually currency not set). Open Dashboard → WhatsApp → Complete WhatsApp billing. Do not use Facebook Developer.",
+  131042: "WhatsApp conversation billing is incomplete on the connected account. Nexwapi handles currency and card billing — contact support if this continues.",
   131049: "Meta blocked this marketing template (quality / recipient preference). Use a Utility template, or send only after the customer messages you first.",
   131026: "This number is not on WhatsApp or cannot receive the message. Use country code (e.g. 91…).",
-  132001: "Template name/language was not found on this WhatsApp account. Open Templates → Sync from Meta.",
+  132001: "Template name/language was not found on this WhatsApp account. Wait a moment after Meta approval, then try again.",
   132015: "Meta paused this template. Create a new Utility template and wait for approval.",
   131047: "24-hour session closed. Send an approved template, not free text.",
-  132000: "Template variables do not match Meta ({{1}}, {{2}}, header/buttons). Sync from Meta and fill every variable.",
+  132000: "Template variables do not match Meta ({{1}}, {{2}}, header/buttons). Fill every variable, then send again.",
   131008: "Required template parameter is missing.",
   133010: "Phone number is not registered on Cloud API. Reconnect WhatsApp.",
 };
@@ -117,7 +117,7 @@ function sendLanguageTries(metaLanguage, requested) {
   return tries;
 }
 
-async function wabaIdForSending(creds) {
+export async function wabaIdForSending(creds) {
   const stored = creds?.wabaId || null;
   const phoneNumberId = creds?.phoneNumberId;
   const accessToken = creds?.accessToken;
@@ -148,7 +148,7 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
   const wabaId = await wabaIdForSending(creds);
   const sendCreds = { ...creds, wabaId };
   if (!wabaId) {
-    const err = new Error("Connect WhatsApp (Dashboard → WhatsApp) so the WABA ID is saved, then Sync from Meta.");
+    const err = new Error("Connect WhatsApp (Dashboard → WhatsApp) so the WABA ID is saved, then retry.");
     err.code = "WA_NOT_CONNECTED";
     err.status = 400;
     throw err;
@@ -171,15 +171,15 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
   }
 
   const approved = (list || [])
-    .filter((t) => String(t.status).toUpperCase() === "APPROVED")
+    .filter((t) => ["APPROVED", "ACTIVE", "REINSTATED"].includes(String(t.status).toUpperCase()))
     .map((t) => `${t.name} (${t.language})`);
 
   // Nexwapi DB can say Approved while this sending number's WABA does not have the template.
   if (!meta && approved.length) {
     const err = new Error(
-      `132001: "${asked}" is WhatsApp number pe nahi mila. Nexwapi pe Approved dikhna kaafi nahi.`
-      + ` Is number pe approved: ${approved.join(", ")}.`
-      + " Templates → Sync from Meta, phir wahi exact name Inbox/Campaign se bhejo."
+      `132001: "${asked}" is not on this WhatsApp number. Local Approved status is not enough.`
+      + ` Approved on this number: ${approved.join(", ")}.`
+      + " Pick that exact name from Inbox or Campaigns."
     );
     err.metaCode = 132001;
     err.status = 400;
@@ -253,10 +253,10 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
   }
 
   const err = new Error(
-    `132001: Template "${tplName}" name/language Meta pe nahi mila.`
+    `132001: Template "${tplName}" name/language was not found on Meta.`
     + (approved.length
-      ? ` Is WABA pe approved: ${approved.join(", ")}. Inbox/Campaign mein yahi exact name pick karo, phir Templates → Sync from Meta.`
-      : " Is WhatsApp account pe koi approved template nahi. Templates → Sync from Meta, ya naya Utility template banao.")
+      ? ` Approved on this WhatsApp account: ${approved.join(", ")}. Pick that exact name from Inbox or Campaigns.`
+      : " This WhatsApp account has no approved templates yet. Wait for Meta approval, or create a Utility template.")
   );
   err.metaCode = 132001;
   err.status = 400;
@@ -265,6 +265,21 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
 
 export function sendText(to, body, creds) {
   return send({ to: waTo(to), type: "text", text: { body } }, creds);
+}
+
+/** Ask a WhatsApp user for permission to place a business-initiated call. */
+export function sendCallPermissionRequest(to, creds, bodyText) {
+  return send({
+    to: waTo(to),
+    type: "interactive",
+    interactive: {
+      type: "call_permission_request",
+      action: { name: "call_permission_request" },
+      body: {
+        text: String(bodyText || "We would like to call you on WhatsApp about your request.").slice(0, 1024),
+      },
+    },
+  }, creds);
 }
 
 export function sendButtons(to, bodyText, buttons, creds) {
@@ -477,8 +492,9 @@ export async function listTemplates(creds) {
 
 export function pickMetaTemplate(list, name) {
   const n = String(name || "").toLowerCase().trim();
+  const approvedStatuses = new Set(["APPROVED", "ACTIVE", "REINSTATED"]);
   const matches = (list || []).filter((t) => String(t.name || "").toLowerCase().trim() === n);
-  return matches.find((t) => String(t.status).toUpperCase() === "APPROVED")
+  return matches.find((t) => approvedStatuses.has(String(t.status).toUpperCase()))
     || matches[0]
     || null;
 }

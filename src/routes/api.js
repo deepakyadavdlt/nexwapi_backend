@@ -1103,6 +1103,24 @@ router.use((req, res, next) => {
 router.use(requireAuth);
 router.use(attachCompany);
 
+// Public image upload for template headers etc. Returns HTTPS URL Meta can fetch.
+router.post("/uploads/image", requireNotSuspended, upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Choose an image file (JPG or PNG)" });
+    if (!req.file.mimetype?.startsWith("image/")) {
+      return res.status(400).json({ error: "Only image files are allowed (JPG, PNG, WEBP)" });
+    }
+    const ext = path.extname(req.file.originalname) || ".jpg";
+    const storedName = `img-${Date.now()}-${crypto.randomBytes(4).toString("hex")}${ext}`;
+    fs.renameSync(req.file.path, path.join(UPLOAD_DIR, storedName));
+    const url = publicUploadUrl(req, storedName);
+    res.json({ url });
+  } catch (e) {
+    console.error("[uploads/image]", e?.message || e);
+    res.status(500).json({ error: "Upload failed. Use a JPG/PNG under 5MB and try again." });
+  }
+});
+
 function outboundTextWithAgent(req, text) {
   const raw = String(text || "");
   const name = String(req.user?.name || "").trim();
@@ -2949,25 +2967,30 @@ router.post("/templates", async (req, res) => {
 
 // Upload a header image for a template (stored on API server — Meta can fetch /uploads/*).
 router.post("/templates/:id/header-image", requireNotSuspended, upload.single("file"), async (req, res) => {
-  const existing = await prisma.template.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
-  if (!existing) return res.sendStatus(404);
-  if (!req.file) return res.status(400).json({ error: "file required" });
-  if (!req.file.mimetype?.startsWith("image/")) return res.status(400).json({ error: "image file required" });
+  try {
+    const existing = await prisma.template.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+    if (!existing) return res.sendStatus(404);
+    if (!req.file) return res.status(400).json({ error: "file required" });
+    if (!req.file.mimetype?.startsWith("image/")) return res.status(400).json({ error: "image file required" });
 
-  const ext = path.extname(req.file.originalname) || ".jpg";
-  const storedName = `tpl-header-${existing.id}-${Date.now()}${ext}`;
-  fs.renameSync(req.file.path, path.join(UPLOAD_DIR, storedName));
-  const headerImageUrl = publicUploadUrl(req, storedName);
+    const ext = path.extname(req.file.originalname) || ".jpg";
+    const storedName = `tpl-header-${existing.id}-${Date.now()}${ext}`;
+    fs.renameSync(req.file.path, path.join(UPLOAD_DIR, storedName));
+    const headerImageUrl = publicUploadUrl(req, storedName);
 
-  await patchTemplateHeaderMedia(existing.id, { headerImageUrl, headerFormat: "IMAGE" });
-  const header = await getTemplateHeaderMedia(companyIdOf(req), existing.name);
-  const tpl = await prisma.template.findFirst({ where: { id: existing.id } });
-  res.json({
-    ...tpl,
-    headerImageUrl: header.headerImageUrl || headerImageUrl,
-    headerFormat: header.headerFormat || "IMAGE",
-    createdAt: tpl.createdAt.getTime(),
-  });
+    await patchTemplateHeaderMedia(existing.id, { headerImageUrl, headerFormat: "IMAGE" });
+    const header = await getTemplateHeaderMedia(companyIdOf(req), existing.name);
+    const tpl = await prisma.template.findFirst({ where: { id: existing.id } });
+    res.json({
+      ...tpl,
+      headerImageUrl: header.headerImageUrl || headerImageUrl,
+      headerFormat: header.headerFormat || "IMAGE",
+      createdAt: tpl.createdAt.getTime(),
+    });
+  } catch (e) {
+    console.error("[templates/header-image]", e?.message || e);
+    res.status(500).json({ error: "Upload failed. Use a JPG/PNG under 5MB and try again." });
+  }
 });
 
 router.patch("/templates/:id", async (req, res) => {

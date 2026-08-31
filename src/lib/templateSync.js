@@ -155,7 +155,9 @@ export async function syncCompanyTemplates(companyId) {
         },
       });
       if (Object.keys(headerFields).length) {
-        await patchTemplateHeaderMedia(existing.id, headerFields);
+        await patchTemplateHeaderMedia(existing.id, headerFields).catch((e) => {
+          console.warn("[templateSync] header patch", existing.name, e?.message || e);
+        });
       }
       if (prev !== status && /approv|reject/i.test(status)) {
         notifyOwner(companyId, mt.name, status).catch(() => {});
@@ -174,7 +176,9 @@ export async function syncCompanyTemplates(companyId) {
         },
       });
       if (Object.keys(headerFields).length) {
-        await patchTemplateHeaderMedia(created.id, headerFields);
+        await patchTemplateHeaderMedia(created.id, headerFields).catch((e) => {
+          console.warn("[templateSync] header patch", mt.name, e?.message || e);
+        });
       }
     }
   }

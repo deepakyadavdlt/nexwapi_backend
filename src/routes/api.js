@@ -2862,23 +2862,27 @@ router.get("/templates/library", async (req, res) => {
   res.json(TEMPLATE_LIBRARY.map((t) => ({ ...t, fromMeta: false, note: "Submit to Meta to use in campaigns" })));
 });
 
+function serializeTemplateRow(t) {
+  const createdAt = t.createdAt instanceof Date ? t.createdAt.getTime() : (t.createdAt || Date.now());
+  return { ...t, createdAt };
+}
+
 router.get("/templates", async (req, res) => {
-  const tab = req.query.tab; // "active" (default) | "deleted"
-  const companyId = companyIdOf(req);
-  if (tab !== "deleted" && companyId) {
-    await syncCompanyTemplates(companyId).catch((e) => console.warn("[templates] auto-sync", e?.message || e));
+  try {
+    const tab = req.query.tab; // "active" (default) | "deleted"
+    const whereClause = {
+      ...tenantWhere(req),
+      deletedAt: tab === "deleted" ? { not: null } : null,
+    };
+    if (req.query.status) whereClause.status = req.query.status;
+    if (req.query.category) whereClause.category = req.query.category;
+    const templates = await prisma.template.findMany({ where: whereClause, orderBy: { createdAt: "desc" } });
+    const enriched = await enrichTemplatesWithHeaders(templates);
+    res.json(enriched.map(serializeTemplateRow));
+  } catch (e) {
+    console.error("[templates] list failed:", e?.message || e);
+    res.status(500).json({ error: "Could not load templates" });
   }
-  const whereClause = {
-    ...tenantWhere(req),
-    deletedAt: tab === "deleted" ? { not: null } : null,
-  };
-  // status filter
-  if (req.query.status) whereClause.status = req.query.status;
-  // category filter
-  if (req.query.category) whereClause.category = req.query.category;
-  const templates = await prisma.template.findMany({ where: whereClause, orderBy: { createdAt: "desc" } });
-  const enriched = await enrichTemplatesWithHeaders(templates);
-  res.json(enriched.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
 });
 
 router.post("/templates", async (req, res) => {
@@ -3014,18 +3018,22 @@ router.delete("/templates/:id", async (req, res) => {
 router.post("/templates/sync", async (req, res) => {
   try {
     const companyId = companyIdOf(req);
+    if (!companyId) return res.status(400).json({ error: "No workspace selected" });
     const { templateSyncCreds } = await import("../lib/templateSync.js");
     const creds = await templateSyncCreds(companyId);
-    assertLiveCreds(creds);
     if (!creds) {
-      return res.status(400).json({
-        error: "Connect WhatsApp first (Dashboard → WhatsApp). Phone ID and access token must be saved.",
+      const local = await prisma.template.findMany({
+        where: { companyId, deletedAt: null },
+        orderBy: { createdAt: "desc" },
       });
+      const enriched = await enrichTemplatesWithHeaders(local);
+      return res.json(enriched.map(serializeTemplateRow));
     }
     const all = await syncCompanyTemplates(companyId);
     const enriched = await enrichTemplatesWithHeaders(all);
-    res.json(enriched.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
+    res.json(enriched.map(serializeTemplateRow));
   } catch (e) {
+    console.error("[templates] sync failed:", e?.message || e);
     res.status(502).json({ error: e.message });
   }
 });

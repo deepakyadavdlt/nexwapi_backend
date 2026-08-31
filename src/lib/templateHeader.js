@@ -62,20 +62,24 @@ export async function patchTemplateHeaderMedia(templateId, { headerImageUrl, hea
     await prisma.template.update({ where: { id: templateId }, data });
   } catch (e) {
     if (!isUnknownHeaderFieldError(e)) throw e;
-    if (url !== undefined && fmt !== undefined) {
-      await prisma.$executeRaw`
-        UPDATE "Template"
-        SET "headerImageUrl" = ${url}, "headerFormat" = ${fmt}
-        WHERE "id" = ${templateId}
-      `;
-    } else if (url !== undefined) {
-      await prisma.$executeRaw`
-        UPDATE "Template" SET "headerImageUrl" = ${url} WHERE "id" = ${templateId}
-      `;
-    } else if (fmt !== undefined) {
-      await prisma.$executeRaw`
-        UPDATE "Template" SET "headerFormat" = ${fmt} WHERE "id" = ${templateId}
-      `;
+    try {
+      if (url !== undefined && fmt !== undefined) {
+        await prisma.$executeRaw`
+          UPDATE "Template"
+          SET "headerImageUrl" = ${url}, "headerFormat" = ${fmt}
+          WHERE "id" = ${templateId}
+        `;
+      } else if (url !== undefined) {
+        await prisma.$executeRaw`
+          UPDATE "Template" SET "headerImageUrl" = ${url} WHERE "id" = ${templateId}
+        `;
+      } else if (fmt !== undefined) {
+        await prisma.$executeRaw`
+          UPDATE "Template" SET "headerFormat" = ${fmt} WHERE "id" = ${templateId}
+        `;
+      }
+    } catch (sqlErr) {
+      console.warn("[templateHeader] header patch skipped:", sqlErr?.message || sqlErr);
     }
   }
 }

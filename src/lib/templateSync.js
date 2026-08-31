@@ -3,9 +3,20 @@
  * as soon as WhatsApp approves — no manual "Sync from Meta" required.
  */
 import { prisma } from "./prisma.js";
-import { listTemplates, getEffectiveCreds, wabaIdForSending } from "./whatsappService.js";
+import { listTemplates, getEffectiveCreds, wabaIdForSending, resolveTemplateHeaderMediaUrl } from "./whatsappService.js";
 
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s);
+
+function headerFieldsFromMeta(mt) {
+  const headerComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "HEADER");
+  if (!headerComp) return {};
+  const headerFormat = String(headerComp.format || "").toUpperCase() || null;
+  const headerImageUrl = resolveTemplateHeaderMediaUrl(headerComp);
+  return {
+    ...(headerFormat ? { headerFormat } : {}),
+    ...(headerImageUrl ? { headerImageUrl } : {}),
+  };
+}
 
 export function normalizeTemplateStatus(raw) {
   const s = String(raw || "").trim().toUpperCase();
@@ -132,6 +143,7 @@ export async function syncCompanyTemplates(companyId) {
       const prev = existing.status;
       const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
       const body = bodyComp?.text || existing.body;
+      const headerFields = headerFieldsFromMeta(mt);
       await prisma.template.update({
         where: { id: existing.id },
         data: {
@@ -139,6 +151,7 @@ export async function syncCompanyTemplates(companyId) {
           category: cap(mt.category) || existing.category,
           language: mt.language || existing.language,
           body,
+          ...headerFields,
         },
       });
       if (prev !== status && /approv|reject/i.test(status)) {
@@ -146,6 +159,7 @@ export async function syncCompanyTemplates(companyId) {
       }
     } else {
       const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
+      const headerFields = headerFieldsFromMeta(mt);
       await prisma.template.create({
         data: {
           companyId,
@@ -154,6 +168,7 @@ export async function syncCompanyTemplates(companyId) {
           category: cap(mt.category) || "Utility",
           language: mt.language || "en",
           body: bodyComp?.text || "(synced from Meta)",
+          ...headerFields,
         },
       });
     }

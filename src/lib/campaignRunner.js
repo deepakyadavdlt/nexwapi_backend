@@ -103,6 +103,7 @@ export async function runCampaign(id) {
         language: lang,
         body: tpl.body,
         creds,
+        headerImageUrl: tpl.headerImageUrl || undefined,
       });
       sent++;
       let text = tpl?.body || `[Template: ${campaign.template}]`;

@@ -2896,6 +2896,8 @@ router.post("/templates", async (req, res) => {
         status,
         format,
         cards: format === "carousel" ? cards : undefined,
+        headerFormat: headerType === "image" ? "IMAGE" : headerType === "text" ? "TEXT" : null,
+        headerImageUrl: headerImageUrl ? String(headerImageUrl).trim() : null,
       },
     });
     res.status(201).json({ ...tpl, createdAt: tpl.createdAt.getTime() });
@@ -2927,6 +2929,8 @@ router.patch("/templates/:id", async (req, res) => {
   if (req.body?.language != null) data.language = String(req.body.language);
   if (req.body?.format != null) data.format = String(req.body.format);
   if (req.body?.cards !== undefined) data.cards = req.body.cards;
+  if (req.body?.headerImageUrl !== undefined) data.headerImageUrl = String(req.body.headerImageUrl || "").trim() || null;
+  if (req.body?.headerFormat !== undefined) data.headerFormat = String(req.body.headerFormat || "").trim() || null;
   if (req.body?.name) data.name = String(req.body.name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
   const tpl = await prisma.template.update({ where: { id: existing.id }, data });
   res.json({ ...tpl, createdAt: tpl.createdAt.getTime() });

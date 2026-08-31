@@ -877,6 +877,8 @@ model Template {
   status    String    @default("pending")
   body      String
   format    String    @default("text")
+  headerFormat   String?
+  headerImageUrl String?
   cards     Json?
   deletedAt DateTime?
   createdAt DateTime  @default(now())

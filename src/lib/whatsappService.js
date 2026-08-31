@@ -103,6 +103,41 @@ function templateVarCount(text) {
   return nums.length ? Math.max(...nums) : 0;
 }
 
+/** Public HTTPS URL from Meta template header example or override. */
+export function resolveTemplateHeaderMediaUrl(headerComp, overrideUrl) {
+  const direct = String(overrideUrl || "").trim();
+  if (/^https:\/\//i.test(direct)) return direct;
+  const ex = headerComp?.example || {};
+  const pool = [
+    ...(Array.isArray(ex.header_url) ? ex.header_url : []),
+    ...(Array.isArray(ex.header_handle) ? ex.header_handle : []),
+  ];
+  return pool.find((u) => typeof u === "string" && /^https:\/\//i.test(u)) || null;
+}
+
+function headerComponentFromMeta(headerComp, opts = {}) {
+  const format = String(headerComp?.format || "").toUpperCase();
+  if (!format) return null;
+  const textVars = format === "TEXT" ? templateVarCount(headerComp?.text || "") : 0;
+  if (textVars) return null;
+  const mediaTypes = new Set(["IMAGE", "VIDEO", "DOCUMENT"]);
+  if (!mediaTypes.has(format)) return null;
+  const url = resolveTemplateHeaderMediaUrl(headerComp, opts.headerImageUrl);
+  if (!url) {
+    const err = new Error(
+      `132012: Template header requires ${format}. Add a public HTTPS ${format.toLowerCase()} URL on Dashboard → Templates, or use a text-only template.`
+    );
+    err.metaCode = 132012;
+    err.status = 400;
+    throw err;
+  }
+  const key = format.toLowerCase();
+  return {
+    type: "header",
+    parameters: [{ type: key, [key]: { link: url } }],
+  };
+}
+
 function sendLanguageTries(metaLanguage, requested) {
   const tries = [];
   const push = (c) => {
@@ -144,7 +179,7 @@ export async function wabaIdForSending(creds) {
  * Send an approved template using Meta's live definition (language + body vars).
  * Retries en / en_US on 132001 because Meta stores one code and rejects the other.
  */
-export async function sendResolvedTemplate(to, name, { params = [], language, body, creds } = {}) {
+export async function sendResolvedTemplate(to, name, { params = [], language, body, creds, headerImageUrl } = {}) {
   const wabaId = await wabaIdForSending(creds);
   const sendCreds = { ...creds, wabaId };
   if (!wabaId) {
@@ -202,6 +237,8 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
   });
 
   const components = [];
+  const mediaHeader = headerComponentFromMeta(headerComp, { headerImageUrl });
+  if (mediaHeader) components.push(mediaHeader);
   if (headerTextVars) {
     components.push({
       type: "header",

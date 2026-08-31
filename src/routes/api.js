@@ -29,6 +29,22 @@ function waMediaType(mime) {
   if (mime?.startsWith("audio/")) return "audio";
   return "document";
 }
+
+function publicUploadUrl(req, storedName) {
+  const base = String(process.env.PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
+  return `${base}/uploads/${storedName}`;
+}
+
+async function templateSendOptions(companyId, templateName) {
+  if (!companyId || !templateName) return {};
+  const tpl = await prisma.template.findFirst({ where: { companyId, name: templateName, deletedAt: null } });
+  if (!tpl) return {};
+  return {
+    body: tpl.body,
+    language: tpl.language || undefined,
+    headerImageUrl: tpl.headerImageUrl || undefined,
+  };
+}
 import { WA_LIVE } from "../config/whatsapp.js";
 import { ensureStarterMessaging } from "../lib/starterMessaging.js";
 import {
@@ -834,10 +850,13 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
     let result;
     if (template) {
       assertTenantOutbound(creds);
+      const tplOpts = await templateSendOptions(auth.companyId, template);
       result = await sendResolvedTemplate(to, template, {
         params: params || [],
-        language,
+        language: language || tplOpts.language,
+        body: tplOpts.body,
         creds,
+        headerImageUrl: tplOpts.headerImageUrl,
       });
     } else if (text) {
       result = await sendText(to, text, creds);
@@ -2647,13 +2666,15 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
 
   const creds = await getEffectiveCreds(companyId);
   let waId = null;
+  const tplOpts = await templateSendOptions(companyId, template);
   try {
     assertTenantOutbound(creds);
     const result = await sendResolvedTemplate(contact.phone, template, {
       params,
-      language,
-      body: (await prisma.template.findFirst({ where: { name: template, ...tenantWhere(req) } }))?.body,
+      language: language || tplOpts.language,
+      body: tplOpts.body,
       creds,
+      headerImageUrl: tplOpts.headerImageUrl,
     });
     waId = result.messages?.[0]?.id || null;
   } catch (e) {
@@ -2920,6 +2941,36 @@ router.post("/templates", async (req, res) => {
   }
 });
 
+// Upload a header image for a template (stored on API server — Meta can fetch /uploads/*).
+router.post("/templates/:id/header-image", requireNotSuspended, upload.single("file"), async (req, res) => {
+  const existing = await prisma.template.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
+  if (!existing) return res.sendStatus(404);
+  if (!req.file) return res.status(400).json({ error: "file required" });
+  if (!req.file.mimetype?.startsWith("image/")) return res.status(400).json({ error: "image file required" });
+
+  const ext = path.extname(req.file.originalname) || ".jpg";
+  const storedName = `tpl-header-${existing.id}-${Date.now()}${ext}`;
+  fs.renameSync(req.file.path, path.join(UPLOAD_DIR, storedName));
+  const headerImageUrl = publicUploadUrl(req, storedName);
+
+  try {
+    const tpl = await prisma.template.update({
+      where: { id: existing.id },
+      data: { headerImageUrl, headerFormat: "IMAGE" },
+    });
+    res.json({ ...tpl, headerImageUrl, createdAt: tpl.createdAt.getTime() });
+  } catch (e) {
+    const msg = String(e?.message || "");
+    if (msg.includes("headerImageUrl") || msg.includes("headerFormat")) {
+      return res.status(503).json({
+        error: "Server database is missing template header columns. Run: npx prisma migrate deploy (then restart the API).",
+        code: "MIGRATION_REQUIRED",
+      });
+    }
+    throw e;
+  }
+});
+
 router.patch("/templates/:id", async (req, res) => {
   const existing = await prisma.template.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
   if (!existing) return res.sendStatus(404);
@@ -2932,8 +2983,19 @@ router.patch("/templates/:id", async (req, res) => {
   if (req.body?.headerImageUrl !== undefined) data.headerImageUrl = String(req.body.headerImageUrl || "").trim() || null;
   if (req.body?.headerFormat !== undefined) data.headerFormat = String(req.body.headerFormat || "").trim() || null;
   if (req.body?.name) data.name = String(req.body.name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
-  const tpl = await prisma.template.update({ where: { id: existing.id }, data });
-  res.json({ ...tpl, createdAt: tpl.createdAt.getTime() });
+  try {
+    const tpl = await prisma.template.update({ where: { id: existing.id }, data });
+    res.json({ ...tpl, createdAt: tpl.createdAt.getTime() });
+  } catch (e) {
+    const msg = String(e?.message || "");
+    if (msg.includes("headerImageUrl") || msg.includes("headerFormat") || msg.includes("Unknown argument")) {
+      return res.status(503).json({
+        error: "Server database is missing template header columns. Run: npx prisma migrate deploy (then restart the API).",
+        code: "MIGRATION_REQUIRED",
+      });
+    }
+    throw e;
+  }
 });
 
 router.delete("/templates/:id", async (req, res) => {

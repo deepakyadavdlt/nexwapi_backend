@@ -58,7 +58,8 @@ const META_HINTS = {
   131047: "24-hour session closed. Send an approved template, not free text.",
   132000: "Template variables do not match Meta ({{1}}, {{2}}, header/buttons). Fill every variable, then send again.",
   131008: "Required template parameter is missing.",
-  133010: "Phone number is not registered on Cloud API. Reconnect WhatsApp.",
+  132012: "Template header media is missing or wrong type. Set a public HTTPS image URL on Dashboard → Templates.",
+  131053: "WhatsApp could not download the header image (403 Forbidden). Upload the image in Templates or use a public HTTPS URL Meta can access.",
 };
 
 function throwWaError(data, status) {

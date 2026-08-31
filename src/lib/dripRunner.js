@@ -65,6 +65,7 @@ export async function runDueDrips() {
         language: tpl?.language || undefined,
         body: tpl?.body,
         creds,
+        headerImageUrl: tpl?.headerImageUrl || undefined,
       });
       let text = tpl?.body || `[Template: ${step.template}]`;
       params.forEach((p, i) => { text = text.replace(`{{${i + 1}}}`, p); });

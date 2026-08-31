@@ -1,6 +1,7 @@
 // lib/campaignRunner.js — runs a broadcast campaign (used by the API route and the scheduler).
 import { prisma } from "./prisma.js";
 import { sendResolvedTemplate, getEffectiveCreds, assertTenantOutbound } from "./whatsappService.js";
+import { getTemplateHeaderMedia } from "./templateHeader.js";
 import { buildSegmentContactWhere } from "./segmentFilters.js";
 
 // Build the contact filter for a campaign audience: "All contacts", "Tag: x", or "Segment: name".
@@ -98,12 +99,13 @@ export async function runCampaign(id) {
         if (charge.charged) debited = true;
       }
       const params = Array.from({ length: varCount }, () => c.name || "Customer");
+      const header = await getTemplateHeaderMedia(companyId, campaign.template);
       const r = await sendResolvedTemplate(c.phone, campaign.template, {
         params,
         language: lang,
         body: tpl.body,
         creds,
-        headerImageUrl: tpl.headerImageUrl || undefined,
+        headerImageUrl: header.headerImageUrl || undefined,
       });
       sent++;
       let text = tpl?.body || `[Template: ${campaign.template}]`;

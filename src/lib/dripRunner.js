@@ -1,6 +1,7 @@
 // lib/dripRunner.js — sends drip campaign steps on schedule.
 import { prisma } from "./prisma.js";
 import { sendResolvedTemplate, getCompanyCreds, getEffectiveCreds, assertTenantOutbound } from "./whatsappService.js";
+import { getTemplateHeaderMedia } from "./templateHeader.js";
 import { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } from "./wallet.js";
 
 const HOUR = 60 * 60 * 1000;
@@ -60,12 +61,13 @@ export async function runDueDrips() {
       const tpl = await prisma.template.findFirst({ where: { name: step.template, companyId } });
       const varCount = tpl ? (tpl.body.match(/\{\{\d+\}\}/g) || []).length : 0;
       const params = Array.from({ length: varCount }, () => contact.name || "Customer");
+      const header = await getTemplateHeaderMedia(companyId, step.template);
       const r = await sendResolvedTemplate(contact.phone, step.template, {
         params,
         language: tpl?.language || undefined,
         body: tpl?.body,
         creds,
-        headerImageUrl: tpl?.headerImageUrl || undefined,
+        headerImageUrl: header.headerImageUrl || undefined,
       });
       let text = tpl?.body || `[Template: ${step.template}]`;
       params.forEach((p, i) => { text = text.replace(`{{${i + 1}}}`, p); });

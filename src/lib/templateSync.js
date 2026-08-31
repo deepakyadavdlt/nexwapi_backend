@@ -2,6 +2,7 @@
  * Keep local template rows in sync with Meta so campaigns can send
  * as soon as WhatsApp approves — no manual "Sync from Meta" required.
  */
+import { patchTemplateHeaderMedia } from "./templateHeader.js";
 import { prisma } from "./prisma.js";
 import { listTemplates, getEffectiveCreds, wabaIdForSending, resolveTemplateHeaderMediaUrl } from "./whatsappService.js";
 
@@ -151,16 +152,18 @@ export async function syncCompanyTemplates(companyId) {
           category: cap(mt.category) || existing.category,
           language: mt.language || existing.language,
           body,
-          ...headerFields,
         },
       });
+      if (Object.keys(headerFields).length) {
+        await patchTemplateHeaderMedia(existing.id, headerFields);
+      }
       if (prev !== status && /approv|reject/i.test(status)) {
         notifyOwner(companyId, mt.name, status).catch(() => {});
       }
     } else {
       const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
       const headerFields = headerFieldsFromMeta(mt);
-      await prisma.template.create({
+      const created = await prisma.template.create({
         data: {
           companyId,
           name: mt.name,
@@ -168,9 +171,11 @@ export async function syncCompanyTemplates(companyId) {
           category: cap(mt.category) || "Utility",
           language: mt.language || "en",
           body: bodyComp?.text || "(synced from Meta)",
-          ...headerFields,
         },
       });
+      if (Object.keys(headerFields).length) {
+        await patchTemplateHeaderMedia(created.id, headerFields);
+      }
     }
   }
 

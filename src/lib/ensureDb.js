@@ -68,6 +68,8 @@ async function applyCriticalPatches() {
     `ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "sentCount" INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE "Flow" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
     `ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "deletedAt" TIMESTAMP(3)`,
+    `ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "headerFormat" TEXT`,
+    `ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "headerImageUrl" TEXT`,
 
     // Contact
     `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "email" TEXT`,
@@ -431,11 +433,28 @@ async function applyCriticalPatches() {
     throw e;
   }
   try {
-    await prisma.$queryRawUnsafe(`SELECT "catalogId", "sandboxMode" FROM "CommerceSetting" LIMIT 0`);
-    console.log("  CommerceSetting table verified");
+    await prisma.$queryRawUnsafe(`SELECT "headerFormat", "headerImageUrl" FROM "Template" LIMIT 0`);
+    console.log("  Template header columns verified (headerFormat, headerImageUrl)");
   } catch (e) {
-    console.error("  CommerceSetting table STILL missing after patch:", e?.message || e);
+    console.error("  Template header columns STILL missing after patch:", e?.message || e);
     throw e;
+  }
+}
+
+function runPrismaGenerate() {
+  try {
+    execSync("npx prisma generate", {
+      cwd: backendRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
+    console.log("  Prisma client regenerated");
+    return true;
+  } catch (e) {
+    const err = e.stderr?.toString()?.trim() || e.stdout?.toString()?.trim() || e.message;
+    console.warn("[db] prisma generate:", err.split("\n")[0]);
+    return false;
   }
 }
 
@@ -465,4 +484,5 @@ export async function ensureDatabaseReady() {
     throw e;
   }
   runMigrateDeploy();
+  runPrismaGenerate();
 }

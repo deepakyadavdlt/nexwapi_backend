@@ -6,7 +6,7 @@ import multer from "multer";
 import fs from "fs";
 import path from "path";
 import { prisma, toMessage, pickColor } from "../lib/prisma.js";
-import { syncCompanyTemplates } from "../lib/templateSync.js";
+import { getTemplateHeaderMedia, patchTemplateHeaderMedia, enrichTemplatesWithHeaders } from "../lib/templateHeader.js";
 import {
   sendText, sendTemplate, sendTemplateWithParams, sendResolvedTemplate, createTemplate, listTemplates,
   uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getEffectiveCreds, assertLiveCreds, assertTenantOutbound,
@@ -38,11 +38,12 @@ function publicUploadUrl(req, storedName) {
 async function templateSendOptions(companyId, templateName) {
   if (!companyId || !templateName) return {};
   const tpl = await prisma.template.findFirst({ where: { companyId, name: templateName, deletedAt: null } });
-  if (!tpl) return {};
+  const header = await getTemplateHeaderMedia(companyId, templateName);
+  if (!tpl && !header.headerImageUrl) return {};
   return {
-    body: tpl.body,
-    language: tpl.language || undefined,
-    headerImageUrl: tpl.headerImageUrl || undefined,
+    body: tpl?.body,
+    language: tpl?.language || undefined,
+    headerImageUrl: header.headerImageUrl || undefined,
   };
 }
 import { WA_LIVE } from "../config/whatsapp.js";
@@ -2876,7 +2877,8 @@ router.get("/templates", async (req, res) => {
   // category filter
   if (req.query.category) whereClause.category = req.query.category;
   const templates = await prisma.template.findMany({ where: whereClause, orderBy: { createdAt: "desc" } });
-  res.json(templates.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
+  const enriched = await enrichTemplatesWithHeaders(templates);
+  res.json(enriched.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
 });
 
 router.post("/templates", async (req, res) => {
@@ -2953,22 +2955,15 @@ router.post("/templates/:id/header-image", requireNotSuspended, upload.single("f
   fs.renameSync(req.file.path, path.join(UPLOAD_DIR, storedName));
   const headerImageUrl = publicUploadUrl(req, storedName);
 
-  try {
-    const tpl = await prisma.template.update({
-      where: { id: existing.id },
-      data: { headerImageUrl, headerFormat: "IMAGE" },
-    });
-    res.json({ ...tpl, headerImageUrl, createdAt: tpl.createdAt.getTime() });
-  } catch (e) {
-    const msg = String(e?.message || "");
-    if (msg.includes("headerImageUrl") || msg.includes("headerFormat")) {
-      return res.status(503).json({
-        error: "Server database is missing template header columns. Run: npx prisma migrate deploy (then restart the API).",
-        code: "MIGRATION_REQUIRED",
-      });
-    }
-    throw e;
-  }
+  await patchTemplateHeaderMedia(existing.id, { headerImageUrl, headerFormat: "IMAGE" });
+  const header = await getTemplateHeaderMedia(companyIdOf(req), existing.name);
+  const tpl = await prisma.template.findFirst({ where: { id: existing.id } });
+  res.json({
+    ...tpl,
+    headerImageUrl: header.headerImageUrl || headerImageUrl,
+    headerFormat: header.headerFormat || "IMAGE",
+    createdAt: tpl.createdAt.getTime(),
+  });
 });
 
 router.patch("/templates/:id", async (req, res) => {
@@ -2980,22 +2975,27 @@ router.patch("/templates/:id", async (req, res) => {
   if (req.body?.language != null) data.language = String(req.body.language);
   if (req.body?.format != null) data.format = String(req.body.format);
   if (req.body?.cards !== undefined) data.cards = req.body.cards;
-  if (req.body?.headerImageUrl !== undefined) data.headerImageUrl = String(req.body.headerImageUrl || "").trim() || null;
-  if (req.body?.headerFormat !== undefined) data.headerFormat = String(req.body.headerFormat || "").trim() || null;
   if (req.body?.name) data.name = String(req.body.name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
-  try {
-    const tpl = await prisma.template.update({ where: { id: existing.id }, data });
-    res.json({ ...tpl, createdAt: tpl.createdAt.getTime() });
-  } catch (e) {
-    const msg = String(e?.message || "");
-    if (msg.includes("headerImageUrl") || msg.includes("headerFormat") || msg.includes("Unknown argument")) {
-      return res.status(503).json({
-        error: "Server database is missing template header columns. Run: npx prisma migrate deploy (then restart the API).",
-        code: "MIGRATION_REQUIRED",
-      });
-    }
-    throw e;
+  const headerPatch = {};
+  if (req.body?.headerImageUrl !== undefined) {
+    headerPatch.headerImageUrl = String(req.body.headerImageUrl || "").trim() || null;
   }
+  if (req.body?.headerFormat !== undefined) {
+    headerPatch.headerFormat = String(req.body.headerFormat || "").trim() || null;
+  }
+  const tpl = Object.keys(data).length
+    ? await prisma.template.update({ where: { id: existing.id }, data })
+    : existing;
+  if (Object.keys(headerPatch).length) {
+    await patchTemplateHeaderMedia(existing.id, headerPatch);
+  }
+  const header = await getTemplateHeaderMedia(companyIdOf(req), tpl.name);
+  res.json({
+    ...tpl,
+    headerImageUrl: header.headerImageUrl,
+    headerFormat: header.headerFormat,
+    createdAt: tpl.createdAt.getTime(),
+  });
 });
 
 router.delete("/templates/:id", async (req, res) => {
@@ -3023,7 +3023,8 @@ router.post("/templates/sync", async (req, res) => {
       });
     }
     const all = await syncCompanyTemplates(companyId);
-    res.json(all.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
+    const enriched = await enrichTemplatesWithHeaders(all);
+    res.json(enriched.map((t) => ({ ...t, createdAt: t.createdAt.getTime() })));
   } catch (e) {
     res.status(502).json({ error: e.message });
   }

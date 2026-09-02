@@ -1,8 +1,12 @@
 // lib/whatsappService.js
 // Tenant-aware WhatsApp Cloud API helpers.
 // Pass `creds` { phoneNumberId, accessToken } for per-client sends; else fall back to env.
+import fs from "fs";
+import path from "path";
 import { WA, WA_LIVE } from "../config/whatsapp.js";
 import { nanoid } from "nanoid";
+
+const UPLOAD_DIR = path.resolve("uploads");
 
 function simulate(payload) {
   const id = "wamid.DEMO" + nanoid(18);
@@ -106,37 +110,76 @@ function templateVarCount(text) {
 
 /** Public HTTPS URL from Meta template header example or override. */
 export function resolveTemplateHeaderMediaUrl(headerComp, overrideUrl) {
-  const direct = String(overrideUrl || "").trim();
-  if (/^https:\/\//i.test(direct)) return direct;
-  const ex = headerComp?.example || {};
-  const pool = [
-    ...(Array.isArray(ex.header_url) ? ex.header_url : []),
-    ...(Array.isArray(ex.header_handle) ? ex.header_handle : []),
-  ];
-  return pool.find((u) => typeof u === "string" && /^https:\/\//i.test(u)) || null;
+  return collectHeaderMediaUrls(headerComp, overrideUrl)[0] || null;
 }
 
-function headerComponentFromMeta(headerComp, opts = {}) {
-  const format = String(headerComp?.format || "").toUpperCase();
-  if (!format) return null;
-  const textVars = format === "TEXT" ? templateVarCount(headerComp?.text || "") : 0;
-  if (textVars) return null;
-  const mediaTypes = new Set(["IMAGE", "VIDEO", "DOCUMENT"]);
-  if (!mediaTypes.has(format)) return null;
-  const url = resolveTemplateHeaderMediaUrl(headerComp, opts.headerImageUrl);
-  if (!url) {
-    const err = new Error(
-      `132012: Template header requires ${format}. Add a public HTTPS ${format.toLowerCase()} URL on Dashboard → Templates, or use a text-only template.`
-    );
-    err.metaCode = 132012;
-    err.status = 400;
-    throw err;
-  }
-  const key = format.toLowerCase();
-  return {
-    type: "header",
-    parameters: [{ type: key, [key]: { link: url } }],
+/** All candidate header media URLs — DB override first, then Meta example URLs. */
+export function collectHeaderMediaUrls(headerComp, overrideUrl) {
+  const candidates = [];
+  const push = (u) => {
+    const s = String(u || "").trim();
+    if (/^https:\/\//i.test(s) && !candidates.includes(s)) candidates.push(s);
   };
+  push(overrideUrl);
+  const ex = headerComp?.example || {};
+  for (const u of [...(ex.header_url || []), ...(ex.header_handle || [])]) {
+    push(u);
+  }
+  return candidates;
+}
+
+function localPathFromUploadUrl(url) {
+  try {
+    const u = new URL(url);
+    const m = u.pathname.match(/\/uploads\/([^/?#]+)/i);
+    if (!m) return null;
+    const file = path.basename(m[1]);
+    const full = path.join(UPLOAD_DIR, file);
+    if (!full.startsWith(UPLOAD_DIR)) return null;
+    return fs.existsSync(full) ? full : null;
+  } catch {
+    return null;
+  }
+}
+
+function mimeFromName(name, fallback = "image/jpeg") {
+  const ext = path.extname(String(name || "")).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".mp4") return "video/mp4";
+  if (ext === ".pdf") return "application/pdf";
+  return fallback;
+}
+
+/** Upload header bytes to Meta so sends use media id instead of a public link (avoids 131053). */
+async function headerMediaPayload(format, url, creds) {
+  const key = format.toLowerCase();
+  const filename = path.basename(new URL(url).pathname) || `header.${key === "image" ? "jpg" : "bin"}`;
+
+  const local = localPathFromUploadUrl(url);
+  if (local) {
+    try {
+      const id = await uploadMedia(fs.readFileSync(local), mimeFromName(local), path.basename(local), creds);
+      if (id) return { type: key, [key]: { id } };
+    } catch (e) {
+      console.warn("[wa] header local upload failed:", e.message);
+    }
+  }
+
+  try {
+    const res = await fetch(url, { redirect: "follow" });
+    if (res.ok) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ct = res.headers.get("content-type") || mimeFromName(filename);
+      const id = await uploadMedia(buf, ct.split(";")[0].trim(), filename, creds);
+      if (id) return { type: key, [key]: { id } };
+    }
+  } catch (e) {
+    console.warn("[wa] header fetch/upload failed:", url, e.message);
+  }
+
+  return { type: key, [key]: { link: url } };
 }
 
 function sendLanguageTries(metaLanguage, requested) {
@@ -237,56 +280,75 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
     return String(v == null || v === "" ? (params[0] || "Customer") : v).slice(0, 1024);
   });
 
-  const components = [];
-  const mediaHeader = headerComponentFromMeta(headerComp, { headerImageUrl });
-  if (mediaHeader) components.push(mediaHeader);
-  if (headerTextVars) {
-    components.push({
-      type: "header",
-      parameters: Array.from({ length: headerTextVars }, (_, i) => ({
-        type: "text",
-        text: filled[i] || "Customer",
-      })),
-    });
-  }
-  if (bodyVars) {
-    components.push({
-      type: "body",
-      parameters: Array.from({ length: bodyVars }, (_, i) => ({
-        type: "text",
-        text: filled[i] || "Customer",
-      })),
-    });
-  }
   const buttons = comps.find((c) => String(c.type).toUpperCase() === "BUTTONS")?.buttons || [];
-  buttons.forEach((b, idx) => {
-    const urlVars = templateVarCount(b.url || "");
-    if (String(b.type).toUpperCase() === "URL" && urlVars) {
-      components.push({
-        type: "button",
-        sub_type: "url",
-        index: String(idx),
-        parameters: Array.from({ length: urlVars }, () => ({ type: "text", text: "https://nexwapi.com" })),
-      });
-    }
-  });
-
   const langs = sendLanguageTries(meta?.language, language);
+  const headerUrls = headerComp ? collectHeaderMediaUrls(headerComp, headerImageUrl) : [];
 
   for (const lang of langs) {
-    try {
-      console.log("[wa] send template", tplName, lang, "to", waTo(to));
-      return await send({
-        to: waTo(to),
-        type: "template",
-        template: {
-          name: tplName,
-          language: { code: lang },
-          ...(components.length ? { components } : {}),
-        },
-      }, sendCreds);
-    } catch (e) {
-      if (e.metaCode !== 132001) throw e;
+    const attempts = headerUrls.length > 1 ? headerUrls.length : 1;
+    for (let urlIdx = 0; urlIdx < attempts; urlIdx++) {
+      const tryComponents = [];
+      if (headerComp) {
+        const fmt = String(headerComp.format || "").toUpperCase();
+        const mediaTypes = new Set(["IMAGE", "VIDEO", "DOCUMENT"]);
+        if (mediaTypes.has(fmt)) {
+          const url = headerUrls[urlIdx] || headerUrls[0];
+          if (!url) {
+            const err = new Error("132012: Template header media URL missing.");
+            err.metaCode = 132012;
+            err.status = 400;
+            throw err;
+          }
+          const param = await headerMediaPayload(fmt, url, sendCreds);
+          tryComponents.push({ type: "header", parameters: [param] });
+        }
+      }
+      if (headerTextVars) {
+        tryComponents.push({
+          type: "header",
+          parameters: Array.from({ length: headerTextVars }, (_, i) => ({
+            type: "text",
+            text: filled[i] || "Customer",
+          })),
+        });
+      }
+      if (bodyVars) {
+        tryComponents.push({
+          type: "body",
+          parameters: Array.from({ length: bodyVars }, (_, i) => ({
+            type: "text",
+            text: filled[i] || "Customer",
+          })),
+        });
+      }
+      buttons.forEach((b, idx) => {
+        const urlVars = templateVarCount(b.url || "");
+        if (String(b.type).toUpperCase() === "URL" && urlVars) {
+          tryComponents.push({
+            type: "button",
+            sub_type: "url",
+            index: String(idx),
+            parameters: Array.from({ length: urlVars }, () => ({ type: "text", text: "https://nexwapi.com" })),
+          });
+        }
+      });
+
+      try {
+        console.log("[wa] send template", tplName, lang, "to", waTo(to));
+        return await send({
+          to: waTo(to),
+          type: "template",
+          template: {
+            name: tplName,
+            language: { code: lang },
+            ...(tryComponents.length ? { components: tryComponents } : {}),
+          },
+        }, sendCreds);
+      } catch (e) {
+        if (e.metaCode === 131053 && urlIdx < attempts - 1) continue;
+        if (e.metaCode !== 132001) throw e;
+        break;
+      }
     }
   }
 

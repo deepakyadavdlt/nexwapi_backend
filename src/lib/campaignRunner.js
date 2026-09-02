@@ -181,10 +181,48 @@ export async function runCampaign(id) {
 /** Reconcile campaign counters from stored outbound messages (webhook delivery updates). */
 export async function reconcileCampaignStats(campaignId) {
   if (!campaignId) return null;
-  const msgs = await prisma.message.findMany({
+  const campaign = await prisma.campaign.findUnique({ where: { id: campaignId } });
+  if (!campaign) return null;
+
+  let msgs = await prisma.message.findMany({
     where: { automationSource: `campaign:${campaignId}` },
-    select: { status: true },
+    select: { id: true, status: true },
   });
+
+  // Older sends may lack automationSource — match by send window + template body.
+  if (!msgs.length && campaign.liveAt) {
+    const since = new Date(campaign.liveAt.getTime() - 5 * 60 * 1000);
+    const until = new Date(campaign.liveAt.getTime() + 2 * 60 * 60 * 1000);
+    const tpl = await prisma.template.findFirst({
+      where: { companyId: campaign.companyId, name: campaign.template, deletedAt: null },
+    });
+    const bodyHint = String(tpl?.body || campaign.template).slice(0, 48);
+    const candidates = await prisma.message.findMany({
+      where: {
+        companyId: campaign.companyId,
+        direction: "out",
+        type: "template",
+        at: { gte: since, lte: until },
+        OR: [
+          { text: { contains: bodyHint } },
+          { text: { contains: `[Template: ${campaign.template}]` } },
+          { text: { contains: campaign.template } },
+        ],
+      },
+      select: { id: true, status: true },
+      orderBy: { at: "asc" },
+      take: Math.max(campaign.recipients, 1) + 30,
+    });
+    if (candidates.length) {
+      msgs = candidates.slice(0, Math.max(campaign.recipients, candidates.length));
+      const ids = msgs.map((m) => m.id);
+      await prisma.message.updateMany({
+        where: { id: { in: ids }, automationSource: null },
+        data: { automationSource: `campaign:${campaignId}` },
+      }).catch(() => {});
+    }
+  }
+
   if (!msgs.length) return null;
 
   let failed = 0;

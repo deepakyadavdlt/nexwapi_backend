@@ -594,7 +594,7 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             ? `${err0.code || ""}: ${err0.error_data?.details || err0.title || err0.message || "failed"}`.replace(/^: /, "").trim()
             : null;
           const prev = await prisma.message.findFirst({ where: { waId: s.id } });
-          const updated = await prisma.message.updateMany({
+          let updated = await prisma.message.updateMany({
             where: { waId: s.id },
             data: {
               status: next,
@@ -602,12 +602,42 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
               ...(["delivered", "read"].includes(next) ? { error: null } : {}),
             },
           });
+          let msg = prev;
+          if (updated.count === 0 && companyId && s.recipient_id) {
+            const phone = digitsOnly(s.recipient_id);
+            const contact = await findCompanyContactByPhone(prisma, companyId, phone);
+            if (contact) {
+              const recent = await prisma.message.findFirst({
+                where: {
+                  companyId,
+                  contactId: contact.id,
+                  direction: "out",
+                  at: { gte: new Date(Date.now() - 72 * 3600 * 1000) },
+                  OR: [{ waId: s.id }, { waId: null }, { status: { in: ["sent", "delivered"] } }],
+                },
+                orderBy: { at: "desc" },
+              });
+              if (recent) {
+                await prisma.message.update({
+                  where: { id: recent.id },
+                  data: {
+                    waId: s.id,
+                    status: next,
+                    ...(errorText && next === "failed" ? { error: errorText } : {}),
+                    ...(["delivered", "read"].includes(next) ? { error: null } : {}),
+                  },
+                });
+                msg = recent;
+                updated = { count: 1 };
+              }
+            }
+          }
           if (updated.count === 0) {
             console.log("[wa] status unmatched", s.id, next);
             continue;
           }
           console.log("[wa] status", s.id, "->", next, errorText || "");
-          const msg = prev || (await prisma.message.findFirst({ where: { waId: s.id } }));
+          msg = msg || (await prisma.message.findFirst({ where: { waId: s.id } }));
           const statusCompanyId = companyId || msg?.companyId;
           if (statusCompanyId) {
             fireEvent(statusCompanyId, "message.status", {
@@ -618,7 +648,7 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
               error: errorText,
             }).catch(() => {});
           }
-          if (msg?.type === "template" && msg.companyId) {
+          if (msg?.companyId) {
             const campTag = String(msg.automationSource || "");
             if (campTag.startsWith("campaign:")) {
               const campId = campTag.slice("campaign:".length);
@@ -626,6 +656,9 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
                 const { reconcileCampaignStats } = await import("../lib/campaignRunner.js");
                 await reconcileCampaignStats(campId).catch(() => {});
               }
+            } else if (msg.type === "template") {
+              const { reconcileCompanyCampaigns } = await import("../lib/campaignRunner.js");
+              await reconcileCompanyCampaigns(msg.companyId).catch(() => {});
             }
           }
         }

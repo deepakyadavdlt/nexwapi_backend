@@ -2683,13 +2683,13 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
       companyId,
       contactId: contact.id,
       type: "template",
-      createdAt: { gte: new Date(Date.now() - 12000) },
+      at: { gte: new Date(Date.now() - 12000) },
       OR: [
         { text: { contains: template } },
         { error: { contains: template } },
       ],
     },
-    orderBy: { createdAt: "desc" },
+    orderBy: { at: "desc" },
   });
   if (dup) {
     if (dup.status === "failed" && dup.error) {

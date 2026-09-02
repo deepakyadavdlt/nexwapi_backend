@@ -15,7 +15,7 @@ import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatfor
 import {
   metaSignupConfig, exchangeEmbeddedSignupCode, exchangeForLongLivedToken,
   fetchPhoneNumbers, subscribeWabaWebhooks, fetchPhoneDetails, fetchSharedWabas,
-  registerCloudApiPhone,
+  ensureCloudApiPhoneRegistered,
 } from "../lib/metaOAuth.js";
 import { applyPartnerBillingToAccount, fetchWabaBilling, partnerBillingReady } from "../lib/partnerBilling.js";
 
@@ -4126,17 +4126,14 @@ router.post("/whatsapp/refresh", async (req, res) => {
     const longLived = await exchangeForLongLivedToken(wa.accessToken);
     const token = longLived.access_token || wa.accessToken;
     let phoneMeta = null;
+    let registration = { ok: true };
     if (wa.phoneNumberId) {
       phoneMeta = await fetchPhoneDetails(wa.phoneNumberId, token).catch(() => null);
-      try {
-        await registerCloudApiPhone(
-          wa.phoneNumberId,
-          token,
-          process.env.WHATSAPP_REGISTER_PIN || "123456"
-        );
-      } catch (e) {
-        console.warn("[wa] phone register on refresh:", e.message);
-      }
+      registration = await ensureCloudApiPhoneRegistered(
+        wa.phoneNumberId,
+        token,
+        process.env.WHATSAPP_REGISTER_PIN || "123456"
+      );
     }
     const updated = await prisma.whatsAppAccount.update({
       where: { id: wa.id },
@@ -4150,9 +4147,9 @@ router.post("/whatsapp/refresh", async (req, res) => {
         verifiedName: phoneMeta?.verified_name || wa.verifiedName,
         displayPhoneNumber: phoneMeta?.display_phone_number || wa.displayPhoneNumber,
         lastSyncAt: new Date(),
-        lastError: null,
+        lastError: registration.ok ? null : (registration.error || "Phone registration pending on Meta"),
         isConnected: true,
-        status: "connected",
+        status: registration.ok ? "connected" : "pending",
       },
     });
     const { templateSyncCreds, syncCompanyTemplates } = await import("../lib/templateSync.js");
@@ -4161,7 +4158,7 @@ router.post("/whatsapp/refresh", async (req, res) => {
     if (updated.wabaId) {
       applyPartnerBillingToAccount(updated).catch((e) => console.warn("[wa refresh] billing:", e?.message || e));
     }
-    res.json({ ok: true, account: updated });
+    res.json({ ok: true, account: updated, registration });
   } catch (e) {
     await prisma.whatsAppAccount.update({
       where: { id: wa.id },
@@ -4283,12 +4280,12 @@ router.get("/whatsapp/meta-config", (_req, res) => {
 
 router.post("/whatsapp/embedded-signup", async (req, res) => {
   const companyId = companyIdOf(req);
-  const { code, wabaId, phoneNumberId, businessId } = req.body || {};
+  const { code, wabaId, phoneNumberId, businessId, redirectUri } = req.body || {};
   if (!code) return res.status(400).json({ error: "OAuth code required from Facebook Login" });
 
   try {
-    // JS SDK Embedded Signup codes must be exchanged WITHOUT redirect_uri.
-    const tokenData = await exchangeEmbeddedSignupCode(code);
+    const pageRedirect = redirectUri ? String(redirectUri).trim() : null;
+    const tokenData = await exchangeEmbeddedSignupCode(code, pageRedirect || undefined);
     let accessToken = tokenData.access_token;
     if (!accessToken) return res.status(400).json({ error: "No access token from Meta" });
 
@@ -4340,15 +4337,11 @@ router.post("/whatsapp/embedded-signup", async (req, res) => {
       );
     }
 
-    try {
-      await registerCloudApiPhone(
-        finalPhoneId,
-        accessToken,
-        process.env.WHATSAPP_REGISTER_PIN || "123456"
-      );
-    } catch (e) {
-      console.warn("[wa] phone register:", e.message);
-    }
+    const registration = await ensureCloudApiPhoneRegistered(
+      finalPhoneId,
+      accessToken,
+      process.env.WHATSAPP_REGISTER_PIN || "123456"
+    );
 
     const existing = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
     const data = {
@@ -4369,7 +4362,7 @@ router.post("/whatsapp/embedded-signup", async (req, res) => {
       verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || `nex_${companyId.slice(-8)}`,
       connectedAt: new Date(),
       lastSyncAt: new Date(),
-      lastError: null,
+      lastError: registration.ok ? null : (registration.error || "Phone registration pending on Meta"),
       tokenExpiresAt: expiresIn
         ? new Date(Date.now() + Number(expiresIn) * 1000)
         : null,
@@ -4392,6 +4385,7 @@ router.post("/whatsapp/embedded-signup", async (req, res) => {
       live: true,
       account: wa,
       billing,
+      registration,
       webhook: {
         url: `${host}/api/whatsapp/webhook`,
         verifyToken: wa.verifyToken,

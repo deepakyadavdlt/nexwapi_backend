@@ -36,16 +36,19 @@ export async function exchangeCodeForToken(code, redirectUri) {
 }
 
 /**
- * FB.login JS SDK codes must usually be exchanged with NO redirect_uri.
- * If Meta still rejects, try the JS SDK success URL then the configured site URI.
- * A mismatch error typically does not consume the code, so retries are safe.
+ * FB.login / Embedded Signup codes must match the redirect_uri Meta used in the dialog.
+ * Try the page URL first (when provided), then SDK defaults — never burn the code on a wrong env URI.
  */
-export async function exchangeEmbeddedSignupCode(code) {
+export async function exchangeEmbeddedSignupCode(code, pageRedirectUri) {
+  const envUri = process.env.WHATSAPP_REDIRECT_URI || undefined;
   const candidates = [
+    pageRedirectUri || undefined,
     undefined,
     "https://www.facebook.com/connect/login_success.html",
-    process.env.WHATSAPP_REDIRECT_URI || undefined,
-  ].filter((v, i, arr) => arr.findIndex((x) => x === v) === i);
+    envUri,
+    "https://app.nexwapi.com/dashboard/whatsapp",
+    "https://nexwapi.com/dashboard/whatsapp",
+  ].filter((v, i, arr) => arr.indexOf(v) === i);
 
   let lastErr;
   for (const uri of candidates) {
@@ -53,10 +56,43 @@ export async function exchangeEmbeddedSignupCode(code) {
       return await exchangeCodeForToken(code, uri);
     } catch (e) {
       lastErr = e;
-      if (!/redirect_uri|verification code/i.test(e.message || "")) throw e;
+      const msg = String(e.message || "");
+      if (!/redirect_uri|verification code/i.test(msg)) throw e;
     }
   }
   throw lastErr || new Error("Token exchange failed");
+}
+
+function isAlreadyRegisteredError(err) {
+  const msg = String(err?.message || "").toLowerCase();
+  const code = err?.meta?.code;
+  return (
+    /already registered/i.test(msg)
+    || /account has been registered/i.test(msg)
+    || /already exists/i.test(msg)
+    || code === 133016
+  );
+}
+
+/**
+ * Register phone on Cloud API. Meta shows "Pending" until this succeeds.
+ * Returns { ok, alreadyRegistered?, error? } — does not throw for benign cases.
+ */
+export async function ensureCloudApiPhoneRegistered(phoneNumberId, accessToken, pin) {
+  if (!phoneNumberId || !accessToken) {
+    return { ok: false, error: "phoneNumberId and accessToken required" };
+  }
+  const usePin = pin || process.env.WHATSAPP_REGISTER_PIN || "123456";
+  try {
+    await registerCloudApiPhone(phoneNumberId, accessToken, usePin);
+    return { ok: true, registered: true };
+  } catch (e) {
+    if (isAlreadyRegisteredError(e)) {
+      return { ok: true, registered: true, alreadyRegistered: true };
+    }
+    console.warn("[wa] phone register:", e.message);
+    return { ok: false, registered: false, error: e.message };
+  }
 }
 
 /**
@@ -144,7 +180,7 @@ export async function subscribeWabaWebhooks(wabaId, accessToken) {
 
 export async function fetchPhoneDetails(phoneNumberId, accessToken) {
   const res = await fetch(
-    `https://graph.facebook.com/${VERSION}/${phoneNumberId}?fields=display_phone_number,verified_name,quality_rating,messaging_limit_tier`,
+    `https://graph.facebook.com/${VERSION}/${phoneNumberId}?fields=display_phone_number,verified_name,quality_rating,messaging_limit_tier,status`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const data = await res.json();

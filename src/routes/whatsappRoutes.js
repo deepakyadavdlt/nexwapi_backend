@@ -17,7 +17,7 @@ import { maybeWelcome, maybeAway } from "../lib/inboxAutomations.js";
 import { buildTriggerCatalog, matchIntent } from "../lib/intentMatcher.js";
 import { maybeAiAgentReply } from "../lib/aiAgent.js";
 import { applyTemplateStatusUpdate, syncCompanyTemplates } from "../lib/templateSync.js";
-import { getPlatformCompanyId } from "../lib/platformInbox.js";
+import { getPlatformCompanyId, isPlatformPhoneNumberId } from "../lib/platformInbox.js";
 import { handleCallingWebhook } from "../lib/waCalling.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
@@ -52,6 +52,13 @@ async function saveInboundMedia(mediaId, hostUrl, companyId) {
 /** Resolve tenant companyId from phone_number_id, then WABA id (template webhooks have no phone id). */
 async function resolveCompanyId(value, wabaId) {
   const phoneNumberId = value?.metadata?.phone_number_id || null;
+
+  // Platform support number (+91 76311 00654) must always land in Super Admin inbox.
+  if (isPlatformPhoneNumberId(phoneNumberId)) {
+    const platformId = await getPlatformCompanyId();
+    if (platformId) return platformId;
+  }
+
   if (phoneNumberId) {
     const acct = await prisma.whatsAppAccount.findFirst({
       where: { phoneNumberId: String(phoneNumberId) },
@@ -63,10 +70,6 @@ async function resolveCompanyId(value, wabaId) {
       where: { wabaId: String(wabaId) },
     });
     if (byWaba?.companyId) return byWaba.companyId;
-  }
-  if (phoneNumberId && WA.phoneNumberId && String(phoneNumberId) === String(WA.phoneNumberId)) {
-    const platformId = await getPlatformCompanyId();
-    if (platformId) return platformId;
   }
   if (phoneNumberId || wabaId) {
     console.warn("[webhook] unmatched account", { phoneNumberId, wabaId });

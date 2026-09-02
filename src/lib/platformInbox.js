@@ -23,13 +23,41 @@ export function platformPhoneDisplay() {
   return d ? `+${d}` : "";
 }
 
+export function platformPhoneNumberId() {
+  return WA.phoneNumberId ? String(WA.phoneNumberId) : null;
+}
+
+/** Ensure platform number always routes to the platform company inbox. */
+export async function reclaimPlatformWhatsAppAccount(platformCompanyId) {
+  const phoneNumberId = platformPhoneNumberId();
+  if (!phoneNumberId || !platformCompanyId) return;
+
+  const misrouted = await prisma.whatsAppAccount.findMany({
+    where: { phoneNumberId, companyId: { not: platformCompanyId } },
+    select: { id: true, companyId: true },
+  });
+
+  if (misrouted.length) {
+    console.warn(
+      "[platformInbox] reclaiming platform phone_number_id from",
+      misrouted.map((a) => a.companyId).join(", ")
+    );
+    await prisma.whatsAppAccount.updateMany({
+      where: { phoneNumberId },
+      data: { companyId: platformCompanyId, isDefault: true, isConnected: true },
+    });
+  }
+
+  await linkPlatformWhatsApp(platformCompanyId);
+}
+
 /** Ensure a dedicated company owns the platform WhatsApp number inbox. */
 export async function ensurePlatformCompany() {
   const explicit = String(process.env.PLATFORM_COMPANY_ID || "").trim();
   if (explicit) {
     const co = await prisma.company.findUnique({ where: { id: explicit } });
     if (co) {
-      await linkPlatformWhatsApp(co.id);
+      await reclaimPlatformWhatsAppAccount(co.id);
       return co.id;
     }
   }
@@ -49,15 +77,16 @@ export async function ensurePlatformCompany() {
     });
   }
 
-  await linkPlatformWhatsApp(co.id);
+  await reclaimPlatformWhatsAppAccount(co.id);
   return co.id;
 }
 
 async function linkPlatformWhatsApp(companyId) {
   if (!WA.phoneNumberId || !WA.accessToken) return;
   const phoneNumberId = String(WA.phoneNumberId);
+  const digits = platformPhoneDigits();
   const existing = await prisma.whatsAppAccount.findFirst({
-    where: { OR: [{ companyId }, { phoneNumberId }] },
+    where: { phoneNumberId },
     orderBy: { isDefault: "desc" },
   });
   const data = {
@@ -67,8 +96,13 @@ async function linkPlatformWhatsApp(companyId) {
     wabaId: WA.wabaId || null,
     isConnected: true,
     isDefault: true,
-    displayPhone: platformPhoneDigits(),
+    status: "connected",
+    phoneNumber: digits,
+    displayPhoneNumber: platformPhoneDisplay(),
+    businessName: "Nexwapi",
+    verifiedName: "Nexwapi",
     lastSyncAt: new Date(),
+    webhookStatus: "connected",
   };
   if (existing) {
     await prisma.whatsAppAccount.update({ where: { id: existing.id }, data });
@@ -94,6 +128,12 @@ export async function getPlatformCompanyId() {
   }
 }
 
+/** True when this webhook event is for the platform support number (+91 76311 00654). */
+export function isPlatformPhoneNumberId(phoneNumberId) {
+  const pid = platformPhoneNumberId();
+  return Boolean(pid && phoneNumberId && String(phoneNumberId) === pid);
+}
+
 export async function buildPlatformConversations(companyId) {
   const contacts = await prisma.contact.findMany({
     where: { companyId },
@@ -112,7 +152,6 @@ export async function buildPlatformConversations(companyId) {
   return contacts
     .map((c) => {
       const last = c.messages[0];
-      const lastIn = c.messages.find((m) => m.direction === "in");
       const unread = c.messages.filter((m) => m.direction === "in" && m.status !== "read").length;
       const matched = clientByPhone.get(c.phone);
       return {

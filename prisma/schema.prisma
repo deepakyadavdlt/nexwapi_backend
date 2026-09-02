@@ -753,6 +753,8 @@ model Setting {
   voiceAiPlan           String  @default("business")
   voiceAiCredits        Int     @default(100)
   webhookUrl         String   @default("")
+  /** HMAC secret for verifying outgoing webhooks (whsec_…). */
+  webhookSecret      String   @default("")
   /** When true, public Message Send API returns error for opted-out contacts. */
   rejectOptedOutApi  Boolean  @default(true)
   /** Team controls — Interakt-style manage teams */
@@ -787,6 +789,7 @@ model ApiKey {
   companyId  String
   company    Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
   name       String
+  keyId      String?   @unique
   key        String
   createdAt  DateTime  @default(now())
   lastUsedAt DateTime?
@@ -794,6 +797,7 @@ model ApiKey {
   @@unique([companyId, key])
   @@index([companyId])
   @@index([key])
+  @@index([keyId])
 }
 
 model Flow {

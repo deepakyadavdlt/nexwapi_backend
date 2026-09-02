@@ -71,8 +71,8 @@ import { runCampaign, resolveAudience } from "../lib/campaignRunner.js";
 import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
 import { loginLimiter, signupLimiter, apiMessageLimiter } from "../lib/rateLimit.js";
-import { findApiKeyByRaw, hashApiKey, keyPrefix, publicApiKeyRow } from "../lib/apiKey.js";
-import { requireApiKey, digitsPhone, publicContact } from "../lib/publicApi.js";
+import { findApiKeyByRaw, hashApiKey, keyPrefix, publicApiKeyRow, generateKeyId, generateApiSecret, hashSecret, generateWebhookSecret, backfillApiKeyIds } from "../lib/apiKey.js";
+import { requireApiKey, digitsPhone, publicContact, apiBaseUrl, publicApiCatalog } from "../lib/publicApi.js";
 import { mailConfigured, emailDeliveryConfigured, sendWelcome, sendInvoiceEmail, sendCampaignStatus, sendCampaignReportEmail, sendSuspension, sendTemplateStatus, sendSupportTicketAlert } from "../lib/mailer.js";
 import {
   commerceOverview, connectCatalog, syncCatalog, getOrCreateCommerceSetting,
@@ -818,7 +818,12 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
   }
 });
 
-// Public send API (for Zapier / Shopify / custom integrations). Auth via x-api-key.
+// Public API catalog (no auth) — like Razorpay API root
+router.get("/v1", (_req, res) => {
+  res.json(publicApiCatalog());
+});
+
+// Public send API (for Zapier / Shopify / custom integrations). Auth via key_id + secret.
 router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
   const auth = await requireApiKey(req, res);
   if (!auth) return;
@@ -4478,6 +4483,15 @@ router.patch("/settings", async (req, res) => {
     const daySet = [...new Set(workingHoursSlots.map((s) => s.day).filter(Boolean))];
     if (daySet.length) data.days = daySet;
   }
+  if (webhookUrl !== undefined) {
+    const url = String(webhookUrl || "").trim();
+    if (url) {
+      const existing = await prisma.setting.findUnique({ where: { companyId } });
+      if (!String(existing?.webhookSecret || "").trim()) {
+        data.webhookSecret = generateWebhookSecret();
+      }
+    }
+  }
   const s = await prisma.setting.upsert({
     where: { companyId },
     update: data,
@@ -4506,15 +4520,17 @@ router.post("/api-keys", requireFeature("api"), async (req, res) => {
   if (gate.otpRequired) return res.json({ otpRequired: true });
   if (!gate.ok) return res.status(400).json({ error: gate.error || "Invalid OTP" });
   const { name = "Default key" } = req.body || {};
-  const rawKey = "nex_" + crypto.randomBytes(24).toString("hex");
-  const hashed = `sha256:${hashApiKey(rawKey)}`;
+  const keyId = generateKeyId();
+  const rawSecret = generateApiSecret();
   const k = await prisma.apiKey.create({
-    data: { companyId: companyIdOf(req), name, key: hashed },
+    data: { companyId: companyIdOf(req), name, keyId, key: hashSecret(rawSecret) },
   });
   res.status(201).json({
     ...publicApiKeyRow(k),
-    key: rawKey,
-    keyPrefix: keyPrefix(rawKey),
+    keyId,
+    secret: rawSecret,
+    key: rawSecret,
+    keyPrefix: keyPrefix(rawSecret),
     oneTimeVisible: true,
   });
 });
@@ -4535,6 +4551,7 @@ router.delete("/api-keys/:id", async (req, res) => {
 /* ------------------------- Developer settings -------------------------- */
 router.get("/developer-settings", async (req, res) => {
   const companyId = companyIdOf(req);
+  await backfillApiKeyIds().catch(() => {});
   const [s, keys, wa] = await Promise.all([
     prisma.setting.upsert({
       where: { companyId },
@@ -4545,26 +4562,54 @@ router.get("/developer-settings", async (req, res) => {
     prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } }),
   ]);
   const primary = keys[0] || null;
+  const base = apiBaseUrl();
+  const whsec = String(s.webhookSecret || "").trim();
   res.json({
     rejectOptedOutApi: s.rejectOptedOutApi !== false,
     webhookUrl: s.webhookUrl || "",
+    webhookSecretMasked: whsec ? `${whsec.slice(0, 10)}…${whsec.slice(-4)}` : null,
     whatsappConnected: Boolean(wa?.isConnected),
+    apiBaseUrl: base,
     keys: keys.map(publicApiKeyRow),
     primaryKey: primary
       ? {
           id: primary.id,
           name: primary.name,
-          masked: publicApiKeyRow(primary).key,
+          keyId: primary.keyId || publicApiKeyRow(primary).keyId,
+          masked: publicApiKeyRow(primary).secretMasked,
           createdAt: primary.createdAt.getTime(),
           lastUsedAt: primary.lastUsedAt?.getTime() || null,
         }
       : null,
+    authentication: {
+      recommended: "basic",
+      basicExample: `Authorization: Basic base64(key_id:key_secret)`,
+      headerExample: { "x-api-key-id": "nex_live_…", "x-api-key-secret": "nex_sk_live_…" },
+      legacyHeader: { "x-api-key": "nex_sk_live_…" },
+    },
     docs: {
       api: "https://nexwapi.com/docs/api",
       postman: "https://nexwapi.com/docs/postman",
       nodeSdk: "https://nexwapi.com/docs/node-sdk",
     },
-    sendEndpoint: "/api/v1/messages",
+    sendEndpoint: `${base}/v1/messages`,
+    catalogEndpoint: `${base}/v1`,
+  });
+});
+
+router.post("/developer-settings/regenerate-webhook-secret", async (req, res) => {
+  const companyId = companyIdOf(req);
+  const secret = generateWebhookSecret();
+  const s = await prisma.setting.upsert({
+    where: { companyId },
+    update: { webhookSecret: secret },
+    create: { companyId, businessName: req.company?.name || "Nexwapi", webhookSecret: secret },
+  });
+  res.json({
+    ok: true,
+    webhookSecret: secret,
+    webhookSecretMasked: `${secret.slice(0, 10)}…${secret.slice(-4)}`,
+    oneTimeVisible: true,
   });
 });
 

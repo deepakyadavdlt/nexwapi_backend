@@ -71,6 +71,11 @@ async function applyCriticalPatches() {
     `ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "headerFormat" TEXT`,
     `ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "headerImageUrl" TEXT`,
 
+    // ApiKey — Razorpay-style key_id + secret
+    `ALTER TABLE "ApiKey" ADD COLUMN IF NOT EXISTS "keyId" TEXT`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "ApiKey_keyId_key" ON "ApiKey"("keyId")`,
+    `ALTER TABLE "Setting" ADD COLUMN IF NOT EXISTS "webhookSecret" TEXT NOT NULL DEFAULT ''`,
+
     // WhatsAppAccount — partner billing (Nexwapi credit line)
     `ALTER TABLE "WhatsAppAccount" ADD COLUMN IF NOT EXISTS "billingCurrency" TEXT`,
     `ALTER TABLE "WhatsAppAccount" ADD COLUMN IF NOT EXISTS "partnerBillingAt" TIMESTAMP(3)`,

@@ -1,4 +1,5 @@
 // lib/events.js — outgoing webhooks + contact activity logging.
+import crypto from "crypto";
 import { prisma } from "./prisma.js";
 
 // Record an activity event on a contact's timeline (best-effort).
@@ -19,22 +20,31 @@ export async function fireEvent(companyId, event, data = {}) {
     const s = await prisma.setting.findUnique({ where: { companyId } });
     const url = String(s?.webhookUrl || "").trim();
     if (!url) return;
+    const body = JSON.stringify({
+      event,
+      data,
+      companyId,
+      at: new Date().toISOString(),
+    });
+    const headers = {
+      "Content-Type": "application/json",
+      "User-Agent": "Nexwapi-Webhook/1.0",
+      "X-Nexwapi-Event": String(event),
+    };
+    const whsec = String(s?.webhookSecret || "").trim();
+    if (whsec) {
+      headers["X-Nexwapi-Signature"] = crypto
+        .createHmac("sha256", whsec)
+        .update(body)
+        .digest("hex");
+    }
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), 8000);
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "Nexwapi-Webhook/1.0",
-          "X-Nexwapi-Event": String(event),
-        },
-        body: JSON.stringify({
-          event,
-          data,
-          companyId,
-          at: new Date().toISOString(),
-        }),
+        headers,
+        body,
         signal: controller.signal,
       });
       if (!res.ok) {

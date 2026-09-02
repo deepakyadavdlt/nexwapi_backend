@@ -3,7 +3,7 @@
 /** Build a Prisma WHERE clause for contacts from a segment's filters JSON */
 export function buildSegmentContactWhere(seg, companyId) {
   const base = { companyId };
-  if (seg.whatsappOnly !== false) base.optedIn = true;
+  if (seg.whatsappOnly !== false) base.optedIn = { not: false };
   const filters = seg.filters;
   if (!filters) {
     if (seg.tags && seg.tags.length > 0) {

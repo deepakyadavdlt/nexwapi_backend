@@ -9,7 +9,6 @@ import { razorpay, RAZORPAY_ENABLED } from "../lib/razorpay.js";
 import { PLAN_CATALOG, normalizePlan, isPaidPlan } from "../lib/plans.js";
 import { WA_LIVE } from "../config/whatsapp.js";
 import { creditWallet, debitWallet, getPlatformPricing } from "../lib/wallet.js";
-import { otpGate } from "../lib/otp.js";
 import { notify } from "../lib/notify.js";
 import { hasPermission, permissionForPath, normalizePermissions, PERMISSIONS } from "../lib/permissions.js";
 import { isExplicitTrue, normalizeHost, normalizeWebsiteUrl, assertUniqueCustomDomain, bumpPartnerCorsCache } from "../lib/partnerDomain.js";
@@ -18,6 +17,9 @@ import multer from "multer";
 import {
   fetchBusinessProfile, updateBusinessProfile, uploadProfilePicture, VERTICALS, platformWaCreds,
 } from "../lib/waBusinessProfile.js";
+import {
+  applyPartnerBillingToAccount, partnerBillingConfig, partnerBillingReady,
+} from "../lib/partnerBilling.js";
 
 import { patchAsyncRouter } from "../lib/asyncRouter.js";
 
@@ -562,7 +564,6 @@ router.patch("/clients/:id", async (req, res) => {
 });
 
 router.delete("/clients/:id", async (req, res) => {
-  if (!(await otpGate(req, res, "client_delete"))) return;
   const company = await prisma.company.findUnique({ where: { id: req.params.id } });
   if (!company) return res.status(404).json({ error: "not found" });
   await prisma.company.delete({ where: { id: company.id } });
@@ -1106,6 +1107,7 @@ router.get("/whatsapp-accounts", async (_req, res) => {
     orderBy: { createdAt: "desc" },
     include: { company: { select: { id: true, name: true, status: true, plan: true } } },
   });
+  const cfg = partnerBillingConfig();
   res.json(
     accounts.map((a) => ({
       id: a.id,
@@ -1113,6 +1115,8 @@ router.get("/whatsapp-accounts", async (_req, res) => {
       companyName: a.company?.name,
       businessName: a.businessName || a.verifiedName,
       phoneNumber: a.displayPhoneNumber || a.phoneNumber,
+      wabaId: a.wabaId,
+      businessId: a.businessId,
       qualityRating: a.qualityRating || "UNKNOWN",
       messagingLimit: a.messagingLimit || "—",
       verificationStatus: a.verificationStatus || "unverified",
@@ -1121,8 +1125,44 @@ router.get("/whatsapp-accounts", async (_req, res) => {
       isConnected: a.isConnected,
       status: a.status,
       lastError: a.lastError,
+      billingCurrency: a.billingCurrency || null,
+      partnerBillingAt: a.partnerBillingAt ? a.partnerBillingAt.getTime() : null,
+      billingReady: Boolean(a.billingCurrency),
+      billingUrl: a.businessId && a.wabaId
+        ? `https://business.facebook.com/billing_hub/accounts/details/?business_id=${encodeURIComponent(a.businessId)}&asset_id=${encodeURIComponent(a.wabaId)}&wizard_id=business-account`
+        : null,
     }))
   );
+});
+
+router.get("/whatsapp/partner-billing", (_req, res) => {
+  const cfg = partnerBillingConfig();
+  res.json({
+    ready: partnerBillingReady(),
+    currency: cfg.currency,
+    hasCreditLine: Boolean(cfg.creditLineId),
+    hasPartnerToken: Boolean(cfg.partnerToken),
+    hasPartnerBusiness: Boolean(cfg.partnerBusinessId),
+  });
+});
+
+router.post("/whatsapp-accounts/:id/attach-billing", async (req, res) => {
+  const wa = await prisma.whatsAppAccount.findUnique({ where: { id: req.params.id } });
+  if (!wa?.wabaId) return res.status(400).json({ error: "No WABA on this account" });
+  const result = await applyPartnerBillingToAccount(wa);
+  res.json(result);
+});
+
+router.post("/whatsapp-accounts/attach-billing-all", async (_req, res) => {
+  const accounts = await prisma.whatsAppAccount.findMany({
+    where: { isConnected: true, wabaId: { not: null } },
+  });
+  const results = [];
+  for (const wa of accounts) {
+    const r = await applyPartnerBillingToAccount(wa);
+    results.push({ companyId: wa.companyId, wabaId: wa.wabaId, ...r });
+  }
+  res.json({ ok: true, count: results.length, results });
 });
 
 router.post("/whatsapp-accounts/:id/disconnect", async (req, res) => {
@@ -1478,7 +1518,6 @@ router.patch("/coupons/:id", async (req, res) => {
 });
 
 router.delete("/coupons/:id", async (req, res) => {
-  if (!(await otpGate(req, res, "coupon_delete"))) return;
   await prisma.coupon.delete({ where: { id: req.params.id } });
   res.status(204).end();
 });
@@ -1528,15 +1567,34 @@ router.get("/analytics", async (_req, res) => {
 });
 
 /* ---------- System monitoring ---------- */
+function platformMessagingPhone() {
+  const raw = String(
+    process.env.PLATFORM_MESSAGING_PHONE ||
+    process.env.ADMIN_MESSAGING_PHONE ||
+    "917631100654"
+  ).replace(/\D/g, "");
+  if (!raw) return null;
+  if (raw.startsWith("91") && raw.length === 12) {
+    return `+91 ${raw.slice(2, 7)} ${raw.slice(7)}`;
+  }
+  return raw.startsWith("+") ? raw : `+${raw}`;
+}
+
 router.get("/system", async (_req, res) => {
   let dbOk = false;
   try {
     await prisma.$queryRaw`SELECT 1`;
     dbOk = true;
   } catch {}
+  const platformPhone = platformMessagingPhone();
   res.json({
     webhook: { ok: true, label: "Webhook endpoint" },
     meta: { ok: WA_LIVE, label: "Meta WhatsApp API", detail: WA_LIVE ? "live" : "demo / not configured" },
+    platformPhone: {
+      ok: Boolean(platformPhone),
+      label: "Platform messaging number",
+      detail: platformPhone || "Set PLATFORM_MESSAGING_PHONE in server .env",
+    },
     razorpay: { ok: RAZORPAY_ENABLED, label: "Razorpay", detail: RAZORPAY_ENABLED ? "configured" : "missing keys" },
     database: { ok: dbOk, label: "PostgreSQL" },
     redis: { ok: false, label: "Redis", detail: "optional — not configured" },
@@ -1727,6 +1785,23 @@ router.patch("/templates/:id", async (req, res) => {
   res.json({ ...template, createdAt: template.createdAt.getTime() });
 });
 
+router.delete("/templates/:id", async (req, res) => {
+  const existing = await prisma.template.findFirst({ where: { id: req.params.id } });
+  if (!existing) return res.sendStatus(404);
+  await prisma.template.delete({ where: { id: existing.id } });
+  await prisma.auditLog.create({
+    data: {
+      companyId: existing.companyId,
+      userId: req.user.id,
+      action: "template_delete",
+      entity: "Template",
+      entityId: existing.id,
+      meta: { name: existing.name },
+    },
+  }).catch(() => {});
+  res.json({ ok: true });
+});
+
 /* ---- Admin: Segments overview ---- */
 router.get("/segments", async (_req, res) => {
   const segments = await prisma.segment.findMany({
@@ -1780,7 +1855,6 @@ router.patch("/sales-leads/:id", async (req, res) => {
 });
 
 router.delete("/sales-leads/:id", async (req, res) => {
-  if (!(await otpGate(req, res, "sales_lead_delete"))) return;
   await prisma.salesLead.delete({ where: { id: req.params.id } });
   res.json({ ok: true });
 });
@@ -1799,11 +1873,16 @@ router.get("/platform-profile", async (_req, res) => {
   try {
     const creds = await requirePlatformWa();
     const profile = await fetchBusinessProfile(creds.phoneNumberId, creds.accessToken);
+    const wa = await prisma.whatsAppAccount.findFirst({
+      where: { wabaId: process.env.WHATSAPP_WABA_ID || undefined },
+      orderBy: { updatedAt: "desc" },
+    }).catch(() => null);
     res.json({
       ...profile,
       displayName: profile.about || "Nexwapi",
-      verifiedName: "",
-      phoneNumber: "",
+      verifiedName: wa?.verifiedName || "",
+      phoneNumber: wa?.displayPhoneNumber || platformMessagingPhone() || "",
+      platformMessagingPhone: platformMessagingPhone(),
       verticals: VERTICALS,
     });
   } catch (e) {
@@ -2001,7 +2080,6 @@ router.delete("/users/:id", async (req, res) => {
   if (req.user.role !== "SUPER_ADMIN") {
     return res.status(403).json({ error: "Only Super Admin can delete users" });
   }
-  if (!(await otpGate(req, res, "user_delete"))) return;
   if (req.params.id === req.user.id) return res.status(400).json({ error: "You cannot delete your own account" });
   const target = await prisma.user.findUnique({ where: { id: req.params.id } });
   if (!target) return res.status(404).json({ error: "User not found" });

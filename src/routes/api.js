@@ -17,6 +17,7 @@ import {
   fetchPhoneNumbers, subscribeWabaWebhooks, fetchPhoneDetails, fetchSharedWabas,
   registerCloudApiPhone,
 } from "../lib/metaOAuth.js";
+import { applyPartnerBillingToAccount, fetchWabaBilling, partnerBillingReady } from "../lib/partnerBilling.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
 const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 16 * 1024 * 1024 } }); // 16MB (WhatsApp limit)
@@ -2676,6 +2677,27 @@ router.post("/conversations/:id/send-template", requireNotSuspended, async (req,
   const { template, params = [], language } = req.body || {};
   if (!template) return res.status(400).json({ error: "template required" });
   const companyId = companyIdOf(req);
+
+  const dup = await prisma.message.findFirst({
+    where: {
+      companyId,
+      contactId: contact.id,
+      type: "template",
+      createdAt: { gte: new Date(Date.now() - 12000) },
+      OR: [
+        { text: { contains: template } },
+        { error: { contains: template } },
+      ],
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  if (dup) {
+    if (dup.status === "failed" && dup.error) {
+      return res.status(400).json({ error: dup.error });
+    }
+    return res.status(201).json(toMessage(dup));
+  }
+
   let charge = { charged: false, creditsNeeded: 0 };
   try {
     charge = await templateChargeCredits(companyId, template, { to: contact.phone });
@@ -3924,54 +3946,48 @@ router.get("/whatsapp/account", async (req, res) => {
   });
 });
 
-/** Meta conversation billing (currency + card) — not Nexwapi subscription. */
+/** Meta conversation billing — Nexwapi partner model (clients never open Meta billing). */
 router.get("/whatsapp/billing-status", async (req, res) => {
   const companyId = companyIdOf(req);
   const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
-  if (!wa?.isConnected || !wa.wabaId || !wa.accessToken) {
+  if (!wa?.isConnected || !wa.wabaId) {
     return res.json({
       connected: false,
-      currencySet: false,
-      timezoneSet: false,
       ready: false,
-      billingUrl: null,
-      hint: "Connect WhatsApp first, then complete Meta conversation billing from this page.",
+      managedByNexwapi: true,
+      hint: "Connect WhatsApp with Facebook first.",
     });
   }
-  const version = process.env.WHATSAPP_API_VERSION || "v22.0";
-  let currency = null;
+
+  let currency = wa.billingCurrency || null;
   let timezone = null;
+  const token = wa.accessToken || process.env.WHATSAPP_ACCESS_TOKEN;
   try {
-    const r = await fetch(
-      `https://graph.facebook.com/${version}/${wa.wabaId}?fields=id,name,currency,timezone_id`,
-      { headers: { Authorization: `Bearer ${wa.accessToken}` } }
-    );
-    const j = await r.json();
-    if (r.ok) {
-      currency = j.currency || null;
-      timezone = j.timezone_id || null;
-    }
+    const info = await fetchWabaBilling(wa.wabaId, token);
+    currency = info.currency || currency;
+    timezone = info.timezone || null;
   } catch (e) {
     console.warn("[wa billing-status]", e.message);
   }
-  const businessId = wa.businessId;
-  const billingUrl = businessId
-    ? `https://business.facebook.com/billing_hub/accounts/details/?business_id=${encodeURIComponent(businessId)}&asset_id=${encodeURIComponent(wa.wabaId)}&wizard_id=business-account`
-    : `https://business.facebook.com/latest/whatsapp_manager/overview?waba_id=${encodeURIComponent(wa.wabaId)}`;
-  const currencySet = Boolean(currency);
+
+  const ready = Boolean(currency);
+  if (!ready && wa.wabaId) {
+    applyPartnerBillingToAccount(wa).catch((e) =>
+      console.warn("[wa billing-status] attach:", e?.message || e)
+    );
+  }
+
   res.json({
     connected: true,
     wabaId: wa.wabaId,
-    businessId: businessId || null,
     currency,
     timezone,
-    currencySet,
-    timezoneSet: Boolean(timezone),
-    ready: currencySet,
-    billingUrl,
-    hint: currencySet
-      ? "WhatsApp conversation billing is already set on this account."
-      : "Conversation billing (currency and card) is handled by Nexwapi. Clients only create templates and send campaigns.",
+    ready,
+    managedByNexwapi: true,
+    partnerBillingConfigured: partnerBillingReady(),
+    hint: ready
+      ? "WhatsApp messaging is active. Conversation fees are billed to Nexwapi — recharge your Nexwapi wallet to send campaigns."
+      : "Nexwapi is activating billing for your WhatsApp account. This usually takes a minute. You do not need to add a card on Meta.",
   });
 });
 
@@ -4049,6 +4065,10 @@ router.post("/whatsapp/connect", async (req, res) => {
     ? await prisma.whatsAppAccount.update({ where: { id: existing.id }, data })
     : await prisma.whatsAppAccount.create({ data: { ...data, companyId, isDefault: true } });
 
+  if (wa.wabaId) {
+    applyPartnerBillingToAccount(wa).catch((e) => console.warn("[wa connect] billing:", e?.message || e));
+  }
+
   const host = process.env.PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`;
   res.json({
     ok: true,
@@ -4116,6 +4136,9 @@ router.post("/whatsapp/refresh", async (req, res) => {
     const { templateSyncCreds, syncCompanyTemplates } = await import("../lib/templateSync.js");
     await templateSyncCreds(companyId).catch(() => {});
     syncCompanyTemplates(companyId).catch((e) => console.warn("[wa] template sync on refresh", e?.message || e));
+    if (updated.wabaId) {
+      applyPartnerBillingToAccount(updated).catch((e) => console.warn("[wa refresh] billing:", e?.message || e));
+    }
     res.json({ ok: true, account: updated });
   } catch (e) {
     await prisma.whatsAppAccount.update({
@@ -4336,11 +4359,17 @@ router.post("/whatsapp/embedded-signup", async (req, res) => {
 
     ensureStarterMessaging(companyId).catch((e) => console.warn("[starter]", e.message));
 
+    const billing = await applyPartnerBillingToAccount(wa).catch((e) => ({
+      ok: false,
+      error: e?.message || "billing attach failed",
+    }));
+
     const host = process.env.PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`;
     res.json({
       ok: true,
       live: true,
       account: wa,
+      billing,
       webhook: {
         url: `${host}/api/whatsapp/webhook`,
         verifyToken: wa.verifyToken,

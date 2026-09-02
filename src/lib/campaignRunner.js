@@ -6,7 +6,7 @@ import { buildSegmentContactWhere } from "./segmentFilters.js";
 
 // Build the contact filter for a campaign audience: "All contacts", "Tag: x", or "Segment: name".
 export async function resolveAudience(audience, companyId) {
-  const where = { optedIn: true };
+  const where = {};
   if (companyId) where.companyId = companyId;
   if (!audience || /^all/i.test(audience)) return where;
   if (/^segment:/i.test(audience)) {
@@ -27,14 +27,14 @@ export async function resolveAudience(audience, companyId) {
 export async function resolveAudienceContacts(audience, companyId) {
   if (/^engaged:notreplied/i.test(audience)) {
     const cs = await prisma.contact.findMany({
-      where: { optedIn: true, ...(companyId ? { companyId } : {}) },
+      where: { ...(companyId ? { companyId } : {}) },
       include: { messages: true },
     });
     return cs.filter((c) => c.messages.some((m) => m.direction === "out") && !c.messages.some((m) => m.direction === "in"));
   }
   if (/^engaged:notread/i.test(audience)) {
     const cs = await prisma.contact.findMany({
-      where: { optedIn: true, ...(companyId ? { companyId } : {}) },
+      where: { ...(companyId ? { companyId } : {}) },
       include: { messages: true },
     });
     return cs.filter((c) => c.messages.some((m) => m.direction === "out" && m.status !== "read"));
@@ -63,6 +63,16 @@ export async function runCampaign(id) {
   const { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } = await import("./wallet.js");
   const creds = await getEffectiveCreds(companyId);
   assertTenantOutbound(creds);
+
+  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+  if (wa?.wabaId) {
+    const { applyPartnerBillingToAccount } = await import("./partnerBilling.js");
+    const billing = await applyPartnerBillingToAccount(wa).catch(() => ({ ready: false }));
+    if (!billing.ready && !billing.skipped) {
+      console.warn(`[campaign] partner billing not ready for ${companyId}:`, billing.error || billing.reason);
+    }
+  }
+
   const pricing = await getPlatformPricing();
   const creditsNeeded = pricing.creditPerOutbound || 1;
 
@@ -78,7 +88,7 @@ export async function runCampaign(id) {
   const varCount = tpl ? (tpl.body.match(/\{\{\d+\}\}/g) || []).length : 0;
   const lang = tpl?.language || undefined;
   const contacts = await resolveAudienceContacts(campaign.audience, companyId);
-  if (!contacts.length) throw new Error("No opted-in contacts in this audience");
+  if (!contacts.length) throw new Error("No contacts in this audience");
 
   await prisma.campaign.update({
     where: { id },

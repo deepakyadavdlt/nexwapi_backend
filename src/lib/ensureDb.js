@@ -71,6 +71,10 @@ async function applyCriticalPatches() {
     `ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "headerFormat" TEXT`,
     `ALTER TABLE "Template" ADD COLUMN IF NOT EXISTS "headerImageUrl" TEXT`,
 
+    // WhatsAppAccount — partner billing (Nexwapi credit line)
+    `ALTER TABLE "WhatsAppAccount" ADD COLUMN IF NOT EXISTS "billingCurrency" TEXT`,
+    `ALTER TABLE "WhatsAppAccount" ADD COLUMN IF NOT EXISTS "partnerBillingAt" TIMESTAMP(3)`,
+
     // Contact
     `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "email" TEXT`,
     `ALTER TABLE "Contact" ADD COLUMN IF NOT EXISTS "userId" TEXT`,

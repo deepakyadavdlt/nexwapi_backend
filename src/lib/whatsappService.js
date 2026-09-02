@@ -50,7 +50,7 @@ async function send(payload, creds) {
 }
 
 const META_HINTS = {
-  131042: "WhatsApp conversation billing is incomplete on the connected account. Nexwapi handles currency and card billing — contact support if this continues.",
+  131042: "WhatsApp conversation billing is not active yet. Contact Nexwapi on WhatsApp +91 76311 00654 — we activate billing for you. Do not add a card in Meta.",
   131049: "Meta blocked this marketing template (quality / recipient preference). Use a Utility template, or send only after the customer messages you first.",
   131026: "This number is not on WhatsApp or cannot receive the message. Use country code (e.g. 91…).",
   132001: "Template name/language was not found on this WhatsApp account. Wait a moment after Meta approval, then try again.",

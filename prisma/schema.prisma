@@ -219,6 +219,8 @@ model WhatsAppAccount {
   lastWebhookAt      DateTime?
   lastSyncAt         DateTime?
   lastError          String?
+  billingCurrency    String?
+  partnerBillingAt   DateTime?
   connectedAt        DateTime?
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt

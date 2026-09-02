@@ -4123,8 +4123,21 @@ router.post("/whatsapp/refresh", async (req, res) => {
   if (!wa.accessToken) return res.status(400).json({ error: "No access token stored — reconnect via Facebook" });
 
   try {
-    const longLived = await exchangeForLongLivedToken(wa.accessToken);
-    const token = longLived.access_token || wa.accessToken;
+    let token = wa.accessToken;
+    let tokenExpiresAt = wa.tokenExpiresAt;
+    if (wa.tokenExpiresAt && wa.tokenExpiresAt.getTime() - Date.now() < 86400 * 7 * 1000) {
+      try {
+        const longLived = await exchangeForLongLivedToken(wa.accessToken);
+        if (longLived.access_token) {
+          token = longLived.access_token;
+          tokenExpiresAt = longLived.expires_in
+            ? new Date(Date.now() + Number(longLived.expires_in) * 1000)
+            : wa.tokenExpiresAt;
+        }
+      } catch (e) {
+        console.warn("[wa refresh] long-lived exchange skipped:", e.message);
+      }
+    }
     let phoneMeta = null;
     let registration = { ok: true };
     if (wa.phoneNumberId) {
@@ -4280,25 +4293,26 @@ router.get("/whatsapp/meta-config", (_req, res) => {
 
 router.post("/whatsapp/embedded-signup", async (req, res) => {
   const companyId = companyIdOf(req);
-  const { code, wabaId, phoneNumberId, businessId, redirectUri } = req.body || {};
+  const { code, wabaId, phoneNumberId, businessId } = req.body || {};
   if (!code) return res.status(400).json({ error: "OAuth code required from Facebook Login" });
 
   try {
-    const pageRedirect = redirectUri ? String(redirectUri).trim() : null;
-    const tokenData = await exchangeEmbeddedSignupCode(code, pageRedirect || undefined);
+    const tokenData = await exchangeEmbeddedSignupCode(code);
     let accessToken = tokenData.access_token;
     if (!accessToken) return res.status(400).json({ error: "No access token from Meta" });
 
-    // Upgrade to long-lived token (~60 days) for production reliability
+    // BISU tokens from Embedded Signup v4 usually don't expire — only upgrade short-lived user tokens.
     let expiresIn = tokenData.expires_in;
-    try {
-      const longLived = await exchangeForLongLivedToken(accessToken);
-      if (longLived.access_token) {
-        accessToken = longLived.access_token;
-        expiresIn = longLived.expires_in || expiresIn;
+    if (expiresIn && Number(expiresIn) > 0 && Number(expiresIn) < 86400 * 7) {
+      try {
+        const longLived = await exchangeForLongLivedToken(accessToken);
+        if (longLived.access_token) {
+          accessToken = longLived.access_token;
+          expiresIn = longLived.expires_in || expiresIn;
+        }
+      } catch (e) {
+        console.warn("[embedded-signup] long-lived exchange skipped:", e.message);
       }
-    } catch (e) {
-      console.warn("[embedded-signup] long-lived exchange skipped:", e.message);
     }
 
     let finalWaba = wabaId;
@@ -4355,10 +4369,10 @@ router.post("/whatsapp/embedded-signup", async (req, res) => {
       verifiedName: phoneMeta?.verified_name || null,
       qualityRating: phoneMeta?.quality_rating || "UNKNOWN",
       messagingLimit: phoneMeta?.messaging_limit_tier || "—",
-      verificationStatus: "verified",
+      verificationStatus: registration.ok ? "verified" : "pending",
       webhookStatus: finalWaba ? "connected" : "pending",
       isConnected: true,
-      status: "connected",
+      status: registration.ok ? "connected" : "pending",
       verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || `nex_${companyId.slice(-8)}`,
       connectedAt: new Date(),
       lastSyncAt: new Date(),

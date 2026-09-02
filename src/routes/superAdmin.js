@@ -20,6 +20,13 @@ import {
 import {
   applyPartnerBillingToAccount, partnerBillingConfig, partnerBillingReady,
 } from "../lib/partnerBilling.js";
+import {
+  getPlatformCompanyId,
+  buildPlatformConversations,
+  platformPhoneDisplay,
+} from "../lib/platformInbox.js";
+import { sendText } from "../lib/whatsappService.js";
+import { toMessage } from "../lib/prisma.js";
 
 import { patchAsyncRouter } from "../lib/asyncRouter.js";
 
@@ -1604,6 +1611,92 @@ router.get("/system", async (_req, res) => {
     memory: { ok: true, label: "Memory", detail: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)} MB heap` },
     cpu: { ok: true, label: "CPU", detail: `${(process.uptime() / 3600).toFixed(1)}h uptime` },
   });
+});
+
+/* ---------- Platform WhatsApp inbox (76311 00654) ---------- */
+router.get("/inbox/unread", async (_req, res) => {
+  const companyId = await getPlatformCompanyId();
+  if (!companyId) return res.json({ unread: 0 });
+  const unread = await prisma.message.count({
+    where: { companyId, direction: "in", status: { not: "read" } },
+  });
+  res.json({ unread });
+});
+
+router.get("/inbox/conversations", async (_req, res) => {
+  const companyId = await getPlatformCompanyId();
+  if (!companyId) {
+    return res.json({ conversations: [], platformPhone: platformPhoneDisplay() });
+  }
+  const conversations = await buildPlatformConversations(companyId);
+  res.json({ conversations, platformPhone: platformPhoneDisplay() });
+});
+
+router.get("/inbox/conversations/:contactId/messages", async (req, res) => {
+  const companyId = await getPlatformCompanyId();
+  if (!companyId) return res.sendStatus(404);
+  const contact = await prisma.contact.findFirst({
+    where: { id: req.params.contactId, companyId },
+  });
+  if (!contact) return res.sendStatus(404);
+  await prisma.message.updateMany({
+    where: { contactId: contact.id, direction: "in", status: { not: "read" } },
+    data: { status: "read" },
+  });
+  const messages = await prisma.message.findMany({
+    where: { contactId: contact.id },
+    orderBy: { at: "asc" },
+  });
+  const clientContact = await prisma.contact.findFirst({
+    where: { phone: contact.phone, companyId: { not: companyId } },
+    include: { company: { select: { id: true, name: true, plan: true, email: true } } },
+  });
+  res.json({
+    contact: {
+      ...contact,
+      createdAt: contact.createdAt.getTime(),
+      clientCompany: clientContact?.company?.name || null,
+      clientPlan: clientContact?.company?.plan || null,
+      clientEmail: clientContact?.company?.email || null,
+    },
+    messages: messages.map(toMessage),
+    platformPhone: platformPhoneDisplay(),
+  });
+});
+
+router.post("/inbox/conversations/:contactId/messages", async (req, res) => {
+  const companyId = await getPlatformCompanyId();
+  if (!companyId) return res.status(503).json({ error: "Platform inbox not configured" });
+  const contact = await prisma.contact.findFirst({
+    where: { id: req.params.contactId, companyId },
+  });
+  if (!contact) return res.sendStatus(404);
+  const { text } = req.body || {};
+  if (!text) return res.status(400).json({ error: "text required" });
+  const creds = platformWaCreds();
+  if (!creds?.phoneNumberId || !creds?.accessToken) {
+    return res.status(503).json({ error: "Platform WhatsApp not configured in server .env" });
+  }
+  let waId = null;
+  try {
+    const result = await sendText(contact.phone, String(text), creds);
+    waId = result.messages?.[0]?.id || null;
+  } catch (e) {
+    return res.status(502).json({ error: e.message || "Send failed" });
+  }
+  const msg = await prisma.message.create({
+    data: {
+      companyId,
+      contactId: contact.id,
+      waId,
+      direction: "out",
+      type: "text",
+      text: String(text),
+      status: "sent",
+      senderName: req.user?.name || "Nexwapi",
+    },
+  });
+  res.status(201).json(toMessage(msg));
 });
 
 /* ---------- Tickets / logs ---------- */

@@ -17,6 +17,7 @@ import { maybeWelcome, maybeAway } from "../lib/inboxAutomations.js";
 import { buildTriggerCatalog, matchIntent } from "../lib/intentMatcher.js";
 import { maybeAiAgentReply } from "../lib/aiAgent.js";
 import { applyTemplateStatusUpdate, syncCompanyTemplates } from "../lib/templateSync.js";
+import { getPlatformCompanyId } from "../lib/platformInbox.js";
 import { handleCallingWebhook } from "../lib/waCalling.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
@@ -64,11 +65,8 @@ async function resolveCompanyId(value, wabaId) {
     if (byWaba?.companyId) return byWaba.companyId;
   }
   if (phoneNumberId && WA.phoneNumberId && String(phoneNumberId) === String(WA.phoneNumberId)) {
-    const co = await prisma.company.findFirst({
-      where: { status: { in: ["TRIAL", "ACTIVE"] } },
-      orderBy: { createdAt: "asc" },
-    });
-    return co?.id || null;
+    const platformId = await getPlatformCompanyId();
+    if (platformId) return platformId;
   }
   if (phoneNumberId || wabaId) {
     console.warn("[webhook] unmatched account", { phoneNumberId, wabaId });
@@ -410,13 +408,23 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
           }
           console.log("[wa] incoming from", m.from, ":", bodyText);
           fireEvent(companyId, "message.received", { from: m.from, name: contact.name, text: bodyText, type: m.type }).catch(() => {});
-          notify({
-            audience: "client",
-            companyId,
-            title: `New message from ${contact.name}`,
-            body: String(bodyText || m.type || "Incoming WhatsApp").slice(0, 180),
-            href: "/dashboard/inbox",
-          }).catch(() => {});
+          const platformId = await getPlatformCompanyId().catch(() => null);
+          if (platformId && companyId === platformId) {
+            notify({
+              audience: "admin",
+              title: `WhatsApp: ${contact.name}`,
+              body: String(bodyText || m.type || "New message").slice(0, 180),
+              href: "/admin/inbox",
+            }).catch(() => {});
+          } else {
+            notify({
+              audience: "client",
+              companyId,
+              title: `New message from ${contact.name}`,
+              body: String(bodyText || m.type || "Incoming WhatsApp").slice(0, 180),
+              href: "/dashboard/inbox",
+            }).catch(() => {});
+          }
           const force = contact.chatStatus === "resolved" || !contact.assignedAgentId;
           const assignedId = await autoAssignIfNeeded(contact, companyId, { force }).catch(() => null);
           if (assignedId) {

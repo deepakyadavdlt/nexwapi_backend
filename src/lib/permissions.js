@@ -53,6 +53,7 @@ const PATH_PERM = [
   [/^\/revenue/, "revenue"],
   [/^\/coupons/, "coupons"],
   [/^\/tickets/, "tickets"],
+  [/^\/inbox/, "tickets"],
   [/^\/sales-leads/, "sales"],
   [/^\/templates/, "templates"],
   [/^\/campaigns/, "campaigns"],

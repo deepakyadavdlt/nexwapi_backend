@@ -94,8 +94,10 @@ ensureDatabaseReady()
       console.log(`  Environment: ${isProduction() ? "production" : "development"} (NODE_ENV=${process.env.NODE_ENV || "unset"})`);
       console.log(`  WhatsApp mode: ${WA_LIVE ? "LIVE (Meta)" : "DEMO (simulated sends)"}`);
       logEmailConfig();
-      await ensureAdmin();
-      console.log("");
+    await ensureAdmin();
+    const { ensurePlatformCompany } = await import("./lib/platformInbox.js");
+    await ensurePlatformCompany().catch((e) => console.warn("[platformInbox boot]", e?.message || e));
+    console.log("");
     });
   })
   .catch((e) => {

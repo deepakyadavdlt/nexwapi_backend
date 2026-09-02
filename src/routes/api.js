@@ -3069,22 +3069,34 @@ router.post("/templates/sync", async (req, res) => {
   try {
     const companyId = companyIdOf(req);
     if (!companyId) return res.status(400).json({ error: "No workspace selected" });
-    const { templateSyncCreds } = await import("../lib/templateSync.js");
+    const { templateSyncCreds, syncCompanyTemplates } = await import("../lib/templateSync.js");
     const creds = await templateSyncCreds(companyId);
+    let all;
+    let syncWarning = null;
     if (!creds) {
-      const local = await prisma.template.findMany({
+      syncWarning = "Connect WhatsApp first (Dashboard → WhatsApp), then sync.";
+      all = await prisma.template.findMany({
         where: { companyId, deletedAt: null },
         orderBy: { createdAt: "desc" },
       });
-      const enriched = await enrichTemplatesWithHeaders(local);
-      return res.json(enriched.map(serializeTemplateRow));
+    } else {
+      try {
+        all = await syncCompanyTemplates(companyId);
+      } catch (e) {
+        console.error("[templates] sync failed:", e?.message || e);
+        syncWarning = e?.message || "Meta sync failed";
+        all = await prisma.template.findMany({
+          where: { companyId, deletedAt: null },
+          orderBy: { createdAt: "desc" },
+        });
+      }
     }
-    const all = await syncCompanyTemplates(companyId);
     const enriched = await enrichTemplatesWithHeaders(all);
+    if (syncWarning) res.setHeader("X-Sync-Warning", syncWarning.slice(0, 240));
     res.json(enriched.map(serializeTemplateRow));
   } catch (e) {
     console.error("[templates] sync failed:", e?.message || e);
-    res.status(502).json({ error: e.message });
+    res.status(502).json({ error: e.message || "Sync failed" });
   }
 });
 
@@ -3099,6 +3111,11 @@ function serializeCampaign(c) {
 }
 
 router.get("/campaigns", async (req, res) => {
+  const companyId = companyIdOf(req);
+  if (companyId) {
+    const { reconcileCompanyCampaigns } = await import("../lib/campaignRunner.js");
+    await reconcileCompanyCampaigns(companyId).catch(() => {});
+  }
   const campaigns = await prisma.campaign.findMany({ where: tenantWhere(req), orderBy: { createdAt: "desc" } });
   res.json(campaigns.map(serializeCampaign));
 });

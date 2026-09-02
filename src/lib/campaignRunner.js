@@ -178,6 +178,45 @@ export async function runCampaign(id) {
   return { sent, failed, recipients: contacts.length, error: lastError || undefined };
 }
 
+/** Reconcile campaign counters from stored outbound messages (webhook delivery updates). */
+export async function reconcileCampaignStats(campaignId) {
+  if (!campaignId) return null;
+  const msgs = await prisma.message.findMany({
+    where: { automationSource: `campaign:${campaignId}` },
+    select: { status: true },
+  });
+  if (!msgs.length) return null;
+
+  let failed = 0;
+  let delivered = 0;
+  let read = 0;
+  for (const m of msgs) {
+    const s = String(m.status || "").toLowerCase();
+    if (s === "failed" || s === "undelivered") failed += 1;
+    if (s === "delivered" || s === "read") delivered += 1;
+    if (s === "read") read += 1;
+  }
+  const sent = msgs.length - failed;
+  await prisma.campaign.update({
+    where: { id: campaignId },
+    data: { sent: Math.max(sent, 0), delivered, read, failed },
+  });
+  return { sent, delivered, read, failed };
+}
+
+export async function reconcileCompanyCampaigns(companyId) {
+  if (!companyId) return;
+  const campaigns = await prisma.campaign.findMany({
+    where: { companyId, status: { in: ["running", "completed"] } },
+    select: { id: true },
+    take: 50,
+    orderBy: { updatedAt: "desc" },
+  });
+  for (const c of campaigns) {
+    await reconcileCampaignStats(c.id).catch(() => {});
+  }
+}
+
 export async function runDueCampaigns() {
   const due = await prisma.campaign.findMany({
     where: { status: "scheduled", scheduledAt: { not: null, lte: new Date() } },

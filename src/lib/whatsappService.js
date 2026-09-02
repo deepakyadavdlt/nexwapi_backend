@@ -113,18 +113,18 @@ export function resolveTemplateHeaderMediaUrl(headerComp, overrideUrl) {
   return collectHeaderMediaUrls(headerComp, overrideUrl)[0] || null;
 }
 
-/** All candidate header media URLs — Meta example first, then DB override. */
+/** All candidate header media URLs — DB override first (reliable), then Meta examples. */
 export function collectHeaderMediaUrls(headerComp, overrideUrl) {
   const candidates = [];
   const push = (u) => {
     const s = String(u || "").trim();
     if (/^https:\/\//i.test(s) && !candidates.includes(s)) candidates.push(s);
   };
+  push(overrideUrl);
   const ex = headerComp?.example || {};
   for (const u of [...(ex.header_url || []), ...(ex.header_handle || [])]) {
     push(u);
   }
-  push(overrideUrl);
   return candidates;
 }
 
@@ -179,7 +179,8 @@ async function headerMediaPayload(format, url, creds, { allowLink = false } = {}
     console.warn("[wa] header fetch/upload failed:", url, e.message);
   }
 
-  if (allowLink) return { type: key, [key]: { link: url } };
+  // Never fall back to link — Meta often returns 131053 (403) on non-public URLs.
+  if (allowLink && key !== "image") return { type: key, [key]: { link: url } };
 
   const err = new Error(
     `132012: Could not prepare template header ${format}. Open Dashboard → Templates, re-upload the header image, then retry.`
@@ -307,8 +308,7 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
             err.status = 400;
             throw err;
           }
-          const isLastUrl = urlIdx === urlAttempts - 1;
-          const param = await headerMediaPayload(fmt, url, sendCreds, { allowLink: isLastUrl });
+          const param = await headerMediaPayload(fmt, url, sendCreds, { allowLink: false });
           tryComponents.push({ type: "header", parameters: [param] });
         }
       }
@@ -582,20 +582,41 @@ export async function createTemplate(payload, creds) {
   return { ...data, language: body.language };
 }
 
+async function graphFetch(url, accessToken, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: controller.signal,
+    });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function listTemplates(creds) {
   if (creds?.incomplete) return [];
   const accessToken = creds?.accessToken;
   const wabaId = await wabaIdForSending(creds);
   if (!wabaId || !accessToken) return [];
   const version = WA.version || "v22.0";
-  const res = await fetch(
-    `https://graph.facebook.com/${version}/${wabaId}/message_templates?limit=250&fields=name,status,language,category,components`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
-  );
+  let res;
+  try {
+    res = await graphFetch(
+      `https://graph.facebook.com/${version}/${wabaId}/message_templates?limit=250&fields=name,status,language,category,components`,
+      accessToken
+    );
+  } catch (e) {
+    const msg = e?.name === "AbortError" ? "Meta API timed out" : (e?.message || "Meta API unreachable");
+    throw new Error(msg);
+  }
   const data = await res.json();
   if (!res.ok) {
-    console.warn("[wa] listTemplates failed:", data?.error?.message || JSON.stringify(data));
-    return [];
+    const msg = data?.error?.message || JSON.stringify(data);
+    console.warn("[wa] listTemplates failed:", msg);
+    throw new Error(msg);
   }
   return data.data || [];
 }

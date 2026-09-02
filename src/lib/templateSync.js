@@ -124,10 +124,7 @@ export async function syncCompanyTemplates(companyId) {
     metaTemplates = await listTemplates(creds);
   } catch (e) {
     console.warn("[templateSync] listTemplates", companyId, e?.message || e);
-    return prisma.template.findMany({
-      where: { companyId, deletedAt: null },
-      orderBy: { createdAt: "desc" },
-    });
+    throw e;
   }
 
   const localRows = await prisma.template.findMany({

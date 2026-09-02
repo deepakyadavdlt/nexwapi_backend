@@ -615,15 +615,30 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             }).catch(() => {});
           }
           if (msg?.type === "template" && msg.companyId) {
-            const camp = await prisma.campaign.findFirst({
-              where: { companyId: msg.companyId, status: { in: ["running", "completed"] } },
-              orderBy: { updatedAt: "desc" },
-            });
+            let camp = null;
+            const campTag = String(msg.automationSource || "");
+            if (campTag.startsWith("campaign:")) {
+              const campId = campTag.slice("campaign:".length);
+              camp = campId
+                ? await prisma.campaign.findFirst({ where: { id: campId, companyId: msg.companyId } })
+                : null;
+            }
+            if (!camp) {
+              camp = await prisma.campaign.findFirst({
+                where: { companyId: msg.companyId, status: { in: ["running", "completed"] } },
+                orderBy: { updatedAt: "desc" },
+              });
+            }
             if (camp) {
               const data = {};
               if (next === "read") data.read = { increment: 1 };
               else if (next === "delivered") data.delivered = { increment: 1 };
-              else if (next === "failed" && prev?.status !== "failed") data.failed = { increment: 1 };
+              else if (next === "failed" && prev?.status !== "failed") {
+                data.failed = { increment: 1 };
+                if (prev?.status === "sent" || prev?.status === "delivered") {
+                  data.sent = { decrement: 1 };
+                }
+              }
               if (Object.keys(data).length) {
                 await prisma.campaign.update({ where: { id: camp.id }, data }).catch(() => {});
               }

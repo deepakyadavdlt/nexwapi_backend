@@ -129,6 +129,7 @@ export async function runCampaign(id) {
           type: "template",
           text,
           status: "sent",
+          automationSource: `campaign:${id}`,
         },
       });
       await prisma.campaign.update({ where: { id }, data: { sent } });
@@ -145,6 +146,7 @@ export async function runCampaign(id) {
           text: tpl?.body || `[Template: ${campaign.template}]`,
           status: "failed",
           error: String(e.message || "Send failed").slice(0, 500),
+          automationSource: `campaign:${id}`,
         },
       }).catch(() => {});
       await prisma.campaign.update({ where: { id }, data: { failed } }).catch(() => {});

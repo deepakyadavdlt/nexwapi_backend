@@ -113,18 +113,18 @@ export function resolveTemplateHeaderMediaUrl(headerComp, overrideUrl) {
   return collectHeaderMediaUrls(headerComp, overrideUrl)[0] || null;
 }
 
-/** All candidate header media URLs — DB override first, then Meta example URLs. */
+/** All candidate header media URLs — Meta example first, then DB override. */
 export function collectHeaderMediaUrls(headerComp, overrideUrl) {
   const candidates = [];
   const push = (u) => {
     const s = String(u || "").trim();
     if (/^https:\/\//i.test(s) && !candidates.includes(s)) candidates.push(s);
   };
-  push(overrideUrl);
   const ex = headerComp?.example || {};
   for (const u of [...(ex.header_url || []), ...(ex.header_handle || [])]) {
     push(u);
   }
+  push(overrideUrl);
   return candidates;
 }
 
@@ -153,7 +153,7 @@ function mimeFromName(name, fallback = "image/jpeg") {
 }
 
 /** Upload header bytes to Meta so sends use media id instead of a public link (avoids 131053). */
-async function headerMediaPayload(format, url, creds) {
+async function headerMediaPayload(format, url, creds, { allowLink = false } = {}) {
   const key = format.toLowerCase();
   const filename = path.basename(new URL(url).pathname) || `header.${key === "image" ? "jpg" : "bin"}`;
 
@@ -179,7 +179,14 @@ async function headerMediaPayload(format, url, creds) {
     console.warn("[wa] header fetch/upload failed:", url, e.message);
   }
 
-  return { type: key, [key]: { link: url } };
+  if (allowLink) return { type: key, [key]: { link: url } };
+
+  const err = new Error(
+    `132012: Could not prepare template header ${format}. Open Dashboard → Templates, re-upload the header image, then retry.`
+  );
+  err.metaCode = 132012;
+  err.status = 400;
+  throw err;
 }
 
 function sendLanguageTries(metaLanguage, requested) {
@@ -285,21 +292,23 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
   const headerUrls = headerComp ? collectHeaderMediaUrls(headerComp, headerImageUrl) : [];
 
   for (const lang of langs) {
-    const attempts = headerUrls.length > 1 ? headerUrls.length : 1;
-    for (let urlIdx = 0; urlIdx < attempts; urlIdx++) {
+    const urlAttempts = headerUrls.length || 0;
+    const loops = headerUrls.length ? headerUrls.length : 1;
+    for (let urlIdx = 0; urlIdx < loops; urlIdx++) {
       const tryComponents = [];
       if (headerComp) {
         const fmt = String(headerComp.format || "").toUpperCase();
         const mediaTypes = new Set(["IMAGE", "VIDEO", "DOCUMENT"]);
         if (mediaTypes.has(fmt)) {
-          const url = headerUrls[urlIdx] || headerUrls[0];
+          const url = headerUrls[urlIdx];
           if (!url) {
             const err = new Error("132012: Template header media URL missing.");
             err.metaCode = 132012;
             err.status = 400;
             throw err;
           }
-          const param = await headerMediaPayload(fmt, url, sendCreds);
+          const isLastUrl = urlIdx === urlAttempts - 1;
+          const param = await headerMediaPayload(fmt, url, sendCreds, { allowLink: isLastUrl });
           tryComponents.push({ type: "header", parameters: [param] });
         }
       }
@@ -345,7 +354,8 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
           },
         }, sendCreds);
       } catch (e) {
-        if (e.metaCode === 131053 && urlIdx < attempts - 1) continue;
+        if (e.metaCode === 131053 && urlIdx < loops - 1) continue;
+        if (e.metaCode === 132012 && urlIdx < loops - 1) continue;
         if (e.metaCode !== 132001) throw e;
         break;
       }

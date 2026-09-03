@@ -14,6 +14,8 @@ import { hasPermission, permissionForPath, normalizePermissions, PERMISSIONS } f
 import { isExplicitTrue, normalizeHost, normalizeWebsiteUrl, assertUniqueCustomDomain, bumpPartnerCorsCache } from "../lib/partnerDomain.js";
 import { sendPartnerActivated } from "../lib/mailer.js";
 import multer from "multer";
+import fs from "fs";
+import path from "path";
 import {
   fetchBusinessProfile, updateBusinessProfile, uploadProfilePicture, VERTICALS, platformWaCreds,
 } from "../lib/waBusinessProfile.js";
@@ -25,7 +27,7 @@ import {
   buildPlatformConversations,
   platformPhoneDisplay,
 } from "../lib/platformInbox.js";
-import { sendText } from "../lib/whatsappService.js";
+import { sendText, uploadMedia, sendMediaById } from "../lib/whatsappService.js";
 import { toMessage } from "../lib/prisma.js";
 
 import { patchAsyncRouter } from "../lib/asyncRouter.js";
@@ -53,6 +55,55 @@ router.use(async (req, res, next) => {
   }
 });
 const profileUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+const UPLOAD_DIR = path.resolve("uploads");
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const inboxUpload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 16 * 1024 * 1024 } });
+
+function waMediaType(mime) {
+  if (mime?.startsWith("image/")) return "image";
+  if (mime?.startsWith("video/")) return "video";
+  if (mime?.startsWith("audio/")) return "audio";
+  return "document";
+}
+
+async function platformContactOr404(contactId, res) {
+  const companyId = await getPlatformCompanyId();
+  if (!companyId) {
+    res.status(503).json({ error: "Platform inbox not configured" });
+    return { companyId: null, contact: null };
+  }
+  const contact = await prisma.contact.findFirst({
+    where: { id: contactId, companyId },
+    include: { assignedAgent: true },
+  });
+  if (!contact) {
+    res.sendStatus(404);
+    return { companyId, contact: null };
+  }
+  return { companyId, contact };
+}
+
+async function listPlatformAgents(companyId) {
+  const users = await prisma.user.findMany({
+    where: {
+      isActive: true,
+      OR: [
+        { role: "SUPER_ADMIN" },
+        { role: "ADMIN", companyId: null },
+      ],
+    },
+    select: { name: true, email: true },
+  });
+  for (const u of users) {
+    if (!u.email) continue;
+    await ensureOwnerAgent(companyId, { name: u.name || u.email, email: u.email }).catch(() => {});
+  }
+  return prisma.agent.findMany({
+    where: { companyId },
+    orderBy: { name: "asc" },
+    select: { id: true, name: true, email: true, color: true, availability: true },
+  });
+}
 
 const DAY_MS = 86400000;
 
@@ -1637,6 +1688,7 @@ router.get("/inbox/conversations/:contactId/messages", async (req, res) => {
   if (!companyId) return res.sendStatus(404);
   const contact = await prisma.contact.findFirst({
     where: { id: req.params.contactId, companyId },
+    include: { assignedAgent: true },
   });
   if (!contact) return res.sendStatus(404);
   await prisma.message.updateMany({
@@ -1651,10 +1703,16 @@ router.get("/inbox/conversations/:contactId/messages", async (req, res) => {
     where: { phone: contact.phone, companyId: { not: companyId } },
     include: { company: { select: { id: true, name: true, plan: true, email: true } } },
   });
+  const lastInbound = [...messages].reverse().find((m) => m.direction === "in");
   res.json({
     contact: {
       ...contact,
       createdAt: contact.createdAt.getTime(),
+      lastInboundAt: lastInbound ? lastInbound.at.getTime() : null,
+      sessionOpen: lastInbound ? Date.now() - lastInbound.at.getTime() < 24 * 60 * 60 * 1000 : false,
+      assignedAgent: contact.assignedAgent
+        ? { id: contact.assignedAgent.id, name: contact.assignedAgent.name, color: contact.assignedAgent.color }
+        : null,
       clientCompany: clientContact?.company?.name || null,
       clientPlan: clientContact?.company?.plan || null,
       clientEmail: clientContact?.company?.email || null,
@@ -1694,9 +1752,130 @@ router.post("/inbox/conversations/:contactId/messages", async (req, res) => {
       text: String(text),
       status: "sent",
       senderName: req.user?.name || "Nexwapi",
+      senderUserId: req.user?.id || null,
     },
   });
   res.status(201).json(toMessage(msg));
+});
+
+router.get("/inbox/agents", async (_req, res) => {
+  const companyId = await getPlatformCompanyId();
+  if (!companyId) return res.json([]);
+  const agents = await listPlatformAgents(companyId);
+  res.json(agents);
+});
+
+router.patch("/inbox/conversations/:contactId/status", async (req, res) => {
+  const { status } = req.body || {};
+  if (!["open", "pending", "resolved"].includes(status)) {
+    return res.status(400).json({ error: "invalid status" });
+  }
+  const { contact } = await platformContactOr404(req.params.contactId, res);
+  if (!contact) return;
+  const updated = await prisma.contact.update({
+    where: { id: contact.id },
+    data: { chatStatus: status },
+  });
+  res.json({ chatStatus: updated.chatStatus });
+});
+
+router.patch("/inbox/conversations/:contactId/assign", async (req, res) => {
+  const { agentId } = req.body || {};
+  const { companyId, contact } = await platformContactOr404(req.params.contactId, res);
+  if (!contact) return;
+  if (agentId) {
+    const agent = await prisma.agent.findFirst({ where: { id: agentId, companyId } });
+    if (!agent) return res.status(400).json({ error: "Invalid agent" });
+  }
+  const updated = await prisma.contact.update({
+    where: { id: contact.id },
+    data: { assignedAgentId: agentId || null },
+    include: { assignedAgent: true },
+  });
+  res.json({
+    assignedAgent: updated.assignedAgent
+      ? { id: updated.assignedAgent.id, name: updated.assignedAgent.name, color: updated.assignedAgent.color }
+      : null,
+  });
+});
+
+router.post("/inbox/conversations/:contactId/media", inboxUpload.single("file"), async (req, res) => {
+  const { companyId, contact } = await platformContactOr404(req.params.contactId, res);
+  if (!contact) return;
+  if (!req.file) return res.status(400).json({ error: "file required" });
+  const creds = platformWaCreds();
+  if (!creds?.phoneNumberId || !creds?.accessToken) {
+    return res.status(503).json({ error: "Platform WhatsApp not configured in server .env" });
+  }
+
+  const { originalname, mimetype, filename, path: tmpPath } = req.file;
+  const storedName = filename + (path.extname(originalname) || "");
+  fs.renameSync(tmpPath, path.join(UPLOAD_DIR, storedName));
+  const base = String(process.env.PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
+  const publicUrl = `${base}/uploads/${storedName}`;
+  const waType = waMediaType(mimetype);
+  const caption = req.body?.caption || "";
+
+  let waId = null;
+  try {
+    const mediaId = await uploadMedia(fs.readFileSync(path.join(UPLOAD_DIR, storedName)), mimetype, originalname, creds);
+    if (mediaId) {
+      const r = await sendMediaById(contact.phone, waType, mediaId, { filename: originalname, caption }, creds);
+      waId = r.messages?.[0]?.id || null;
+    }
+  } catch (e) {
+    return res.status(502).json({ error: e.message || "Upload failed" });
+  }
+
+  const msg = await prisma.message.create({
+    data: {
+      companyId,
+      contactId: contact.id,
+      waId,
+      direction: "out",
+      type: waType,
+      text: caption || originalname,
+      mediaUrl: publicUrl,
+      filename: originalname,
+      status: "sent",
+      senderName: req.user?.name || "Nexwapi",
+      senderUserId: req.user?.id || null,
+    },
+  });
+  res.status(201).json(toMessage(msg));
+});
+
+router.get("/inbox/conversations/:contactId/notes", async (req, res) => {
+  const { contact } = await platformContactOr404(req.params.contactId, res);
+  if (!contact) return;
+  const notes = await prisma.note.findMany({
+    where: { contactId: contact.id },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json(notes.map((n) => ({ ...n, createdAt: n.createdAt.getTime() })));
+});
+
+router.post("/inbox/conversations/:contactId/notes", async (req, res) => {
+  const { text } = req.body || {};
+  if (!text) return res.status(400).json({ error: "text required" });
+  const { contact } = await platformContactOr404(req.params.contactId, res);
+  if (!contact) return;
+  const note = await prisma.note.create({
+    data: { contactId: contact.id, text: String(text), author: req.user?.name || "Admin" },
+  });
+  res.status(201).json({ ...note, createdAt: note.createdAt.getTime() });
+});
+
+router.delete("/inbox/notes/:id", async (req, res) => {
+  const companyId = await getPlatformCompanyId();
+  if (!companyId) return res.sendStatus(404);
+  const note = await prisma.note.findUnique({
+    where: { id: req.params.id },
+    include: { contact: { select: { companyId: true } } },
+  });
+  if (!note || note.contact.companyId !== companyId) return res.sendStatus(404);
+  await prisma.note.delete({ where: { id: note.id } });
+  res.sendStatus(204);
 });
 
 /* ---------- Tickets / logs ---------- */

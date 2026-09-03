@@ -489,16 +489,26 @@ export function sendTemplate(to, name, lang = "en_US", creds) {
 export async function uploadMedia(buffer, mimetype, filename, creds) {
   const { accessToken, live, base } = resolveCreds(creds);
   if (!live) return null;
+  const bytes = Buffer.isBuffer(buffer) ? new Uint8Array(buffer) : new Uint8Array(Buffer.from(buffer));
   const form = new FormData();
   form.append("messaging_product", "whatsapp");
-  form.append("file", new Blob([buffer], { type: mimetype }), filename);
+  form.append("type", mimetype || "application/octet-stream");
+  form.append(
+    "file",
+    new Blob([bytes], { type: mimetype || "application/octet-stream" }),
+    filename || "file"
+  );
   const res = await fetch(`${base}/media`, {
     method: "POST",
     headers: { Authorization: `Bearer ${accessToken}` },
     body: form,
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`media upload failed: ${JSON.stringify(data)}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.error) {
+    const details = data?.error?.error_user_msg || data?.error?.message || JSON.stringify(data);
+    throw new Error(`media upload failed: ${details}`);
+  }
+  if (!data?.id) throw new Error("media upload failed: no media id returned");
   return data.id;
 }
 

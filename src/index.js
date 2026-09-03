@@ -7,7 +7,7 @@ import whatsappRoutes from "./routes/whatsappRoutes.js";
 import api from "./routes/api.js";
 import superAdmin from "./routes/superAdmin.js";
 import partner from "./routes/partner.js";
-import { WA_LIVE } from "./config/whatsapp.js";
+import { WA, WA_LIVE } from "./config/whatsapp.js";
 import { attachUser } from "./lib/auth.js";
 import { validateEnv, corsOriginCheck, isProduction } from "./lib/env.js";
 import { logEmailConfig } from "./lib/mailer.js";
@@ -97,6 +97,18 @@ ensureDatabaseReady()
     await ensureAdmin();
     const { ensurePlatformCompany } = await import("./lib/platformInbox.js");
     await ensurePlatformCompany().catch((e) => console.warn("[platformInbox boot]", e?.message || e));
+    if (WA.wabaId && WA.accessToken) {
+      const { subscribeWabaWebhooks } = await import("./lib/metaOAuth.js");
+      const sub = await subscribeWabaWebhooks(WA.wabaId, WA.accessToken).catch((e) => {
+        console.warn("[platformInbox] webhook subscribe failed:", e?.message || e);
+        return null;
+      });
+      if (sub) {
+        console.log("[platformInbox] WABA webhook subscribe", sub.ok ? "ok" : "failed", JSON.stringify(sub.data || {}));
+      }
+    } else {
+      console.warn("[platformInbox] skip webhook subscribe — WHATSAPP_WABA_ID / ACCESS_TOKEN missing");
+    }
     console.log("");
     });
   })

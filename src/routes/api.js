@@ -1363,20 +1363,29 @@ router.post("/conversations/:id/media", requireNotSuspended, upload.single("file
   const { originalname, mimetype, filename, path: tmpPath } = req.file;
   const storedName = filename + (path.extname(originalname) || "");
   fs.renameSync(tmpPath, path.join(UPLOAD_DIR, storedName));
-  const publicUrl = `${req.protocol}://${req.get("host")}/uploads/${storedName}`;
+  const publicUrl = publicUploadUrl(req, storedName);
   const waType = waMediaType(mimetype);
   const caption = req.body?.caption || "";
   const creds = await getEffectiveCreds(companyId);
 
   let waId = null;
   try {
-    const mediaId = await uploadMedia(fs.readFileSync(path.join(UPLOAD_DIR, storedName)), mimetype, originalname, creds);
-    if (mediaId) {
-      const r = await sendMediaById(contact.phone, waType, mediaId, { filename: originalname, caption }, creds);
-      waId = r.messages?.[0]?.id || null;
+    assertLiveCreds(creds);
+    assertTenantOutbound(creds);
+    const mediaId = await uploadMedia(
+      fs.readFileSync(path.join(UPLOAD_DIR, storedName)),
+      mimetype,
+      originalname,
+      creds
+    );
+    if (!mediaId) {
+      return res.status(502).json({ error: "WhatsApp media upload returned no id. Check Meta credentials." });
     }
+    const r = await sendMediaById(contact.phone, waType, mediaId, { filename: originalname, caption }, creds);
+    waId = r.messages?.[0]?.id || null;
   } catch (e) {
-    return res.status(502).json({ error: e.message });
+    const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" || e.code === "WA_NOT_CONNECTED" ? 400 : 502);
+    return res.status(status).json({ error: e.message || "Upload failed", code: e.code || undefined });
   }
 
   const msg = await prisma.message.create({
@@ -1390,6 +1399,8 @@ router.post("/conversations/:id/media", requireNotSuspended, upload.single("file
       mediaUrl: publicUrl,
       filename: originalname,
       status: "sent",
+      senderName: req.user?.name || null,
+      senderUserId: req.user?.id || null,
     },
   });
   res.status(201).json(toMessage(msg));
@@ -4152,9 +4163,7 @@ router.post("/whatsapp/refresh", async (req, res) => {
       where: { id: wa.id },
       data: {
         accessToken: token,
-        tokenExpiresAt: longLived.expires_in
-          ? new Date(Date.now() + Number(longLived.expires_in) * 1000)
-          : wa.tokenExpiresAt,
+        tokenExpiresAt,
         qualityRating: phoneMeta?.quality_rating || wa.qualityRating,
         messagingLimit: phoneMeta?.messaging_limit_tier || wa.messagingLimit,
         verifiedName: phoneMeta?.verified_name || wa.verifiedName,

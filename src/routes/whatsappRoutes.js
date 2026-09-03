@@ -17,7 +17,7 @@ import { maybeWelcome, maybeAway } from "../lib/inboxAutomations.js";
 import { buildTriggerCatalog, matchIntent } from "../lib/intentMatcher.js";
 import { maybeAiAgentReply } from "../lib/aiAgent.js";
 import { applyTemplateStatusUpdate, syncCompanyTemplates } from "../lib/templateSync.js";
-import { getPlatformCompanyId, isPlatformPhoneNumberId } from "../lib/platformInbox.js";
+import { getPlatformCompanyId, isPlatformWebhook } from "../lib/platformInbox.js";
 import { handleCallingWebhook } from "../lib/waCalling.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
@@ -54,7 +54,7 @@ async function resolveCompanyId(value, wabaId) {
   const phoneNumberId = value?.metadata?.phone_number_id || null;
 
   // Platform support number (+91 76311 00654) must always land in Super Admin inbox.
-  if (isPlatformPhoneNumberId(phoneNumberId)) {
+  if (isPlatformWebhook(value)) {
     const platformId = await getPlatformCompanyId();
     if (platformId) return platformId;
   }

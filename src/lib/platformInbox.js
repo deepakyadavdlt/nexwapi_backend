@@ -48,7 +48,11 @@ export async function reclaimPlatformWhatsAppAccount(platformCompanyId) {
     });
   }
 
-  await linkPlatformWhatsApp(platformCompanyId);
+  try {
+    await linkPlatformWhatsApp(platformCompanyId);
+  } catch (e) {
+    console.warn("[platformInbox] WhatsApp account link failed:", e?.message || e);
+  }
 }
 
 /** Ensure a dedicated company owns the platform WhatsApp number inbox. */
@@ -81,6 +85,13 @@ export async function ensurePlatformCompany() {
   return co.id;
 }
 
+async function upsertWaAccount(existing, data) {
+  if (existing) {
+    return prisma.whatsAppAccount.update({ where: { id: existing.id }, data });
+  }
+  return prisma.whatsAppAccount.create({ data });
+}
+
 async function linkPlatformWhatsApp(companyId) {
   if (!WA.phoneNumberId || !WA.accessToken) return;
   const phoneNumberId = String(WA.phoneNumberId);
@@ -103,11 +114,22 @@ async function linkPlatformWhatsApp(companyId) {
     verifiedName: "Nexwapi",
     lastSyncAt: new Date(),
     webhookStatus: "connected",
+    connectedAt: existing?.connectedAt || new Date(),
   };
-  if (existing) {
-    await prisma.whatsAppAccount.update({ where: { id: existing.id }, data });
-  } else {
-    await prisma.whatsAppAccount.create({ data });
+  try {
+    await upsertWaAccount(existing, data);
+  } catch (e) {
+    const msg = String(e?.message || e);
+    console.warn("[platformInbox] full account save failed, using minimal fields:", msg.split("\n")[0]);
+    await upsertWaAccount(existing, {
+      companyId,
+      phoneNumberId,
+      accessToken: WA.accessToken,
+      wabaId: WA.wabaId || null,
+      isConnected: true,
+      isDefault: true,
+      status: "connected",
+    });
   }
 }
 
@@ -134,10 +156,39 @@ export function isPlatformPhoneNumberId(phoneNumberId) {
   return Boolean(pid && phoneNumberId && String(phoneNumberId) === pid);
 }
 
+function samePhone(a, b) {
+  const x = String(a || "").replace(/\D/g, "");
+  const y = String(b || "").replace(/\D/g, "");
+  if (!x || !y) return false;
+  if (x === y) return true;
+  const tail = (s) => (s.length > 10 ? s.slice(-10) : s);
+  return tail(x).length >= 10 && tail(x) === tail(y);
+}
+
+/** Match by Cloud API phone_number_id or by the public Nexwapi number. */
+export function isPlatformWebhook(value) {
+  const phoneNumberId = value?.metadata?.phone_number_id || null;
+  if (isPlatformPhoneNumberId(phoneNumberId)) return true;
+  return samePhone(value?.metadata?.display_phone_number, platformPhoneDigits());
+}
+
+function lastPreview(last) {
+  if (!last) return "No messages yet";
+  const t = String(last.type || "text");
+  if (t === "image") return last.text ? `📷 ${last.text}` : "📷 Photo";
+  if (t === "video") return last.text ? `🎥 ${last.text}` : "🎥 Video";
+  if (t === "audio") return "🎵 Audio";
+  if (t === "document" || t === "sticker") return last.filename || last.text || "📄 Document";
+  return last.text || "Message";
+}
+
 export async function buildPlatformConversations(companyId) {
   const contacts = await prisma.contact.findMany({
     where: { companyId },
-    include: { messages: { orderBy: { at: "desc" }, take: 50 } },
+    include: {
+      messages: { orderBy: { at: "desc" }, take: 50 },
+      assignedAgent: { select: { id: true, name: true, color: true } },
+    },
   });
 
   const phoneSet = new Set(contacts.map((c) => c.phone));
@@ -152,6 +203,7 @@ export async function buildPlatformConversations(companyId) {
   return contacts
     .map((c) => {
       const last = c.messages[0];
+      const lastIn = c.messages.find((m) => m.direction === "in");
       const unread = c.messages.filter((m) => m.direction === "in" && m.status !== "read").length;
       const matched = clientByPhone.get(c.phone);
       return {
@@ -160,11 +212,15 @@ export async function buildPlatformConversations(companyId) {
         phone: c.phone,
         color: c.color,
         tags: c.tags,
-        lastMessage: last ? last.text : "No messages yet",
+        lastMessage: lastPreview(last),
         lastAt: last ? last.at.getTime() : c.createdAt.getTime(),
         lastDirection: last ? last.direction : null,
+        lastInboundAt: lastIn ? lastIn.at.getTime() : null,
         unread,
-        chatStatus: c.chatStatus,
+        chatStatus: c.chatStatus || "open",
+        assignedAgent: c.assignedAgent
+          ? { id: c.assignedAgent.id, name: c.assignedAgent.name, color: c.assignedAgent.color }
+          : null,
         clientCompany: matched?.name || null,
         clientPlan: matched?.plan || null,
       };

@@ -248,7 +248,7 @@ export async function reconcileCompanyCampaigns(companyId) {
     where: { companyId, status: { in: ["running", "completed"] } },
     select: { id: true },
     take: 50,
-    orderBy: { updatedAt: "desc" },
+    orderBy: { createdAt: "desc" },
   });
   for (const c of campaigns) {
     await reconcileCampaignStats(c.id).catch(() => {});

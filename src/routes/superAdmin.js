@@ -5,7 +5,7 @@ import { buildSegmentContactWhere } from "../lib/segmentFilters.js";
 import { requireAuth, requireSuperAdmin, signImpersonationToken, signToken, hashPassword } from "../lib/auth.js";
 import { publicCompanyUser, uniqueSlug, uniquePartnerSlug, publicPartnerBranding } from "../lib/tenant.js";
 import { createAgentSeat, ensureOwnerAgent } from "../lib/teamSeats.js";
-import { razorpay, RAZORPAY_ENABLED } from "../lib/razorpay.js";
+import { CASHFREE_ENABLED } from "../lib/cashfree.js";
 import { PLAN_CATALOG, normalizePlan, isPaidPlan } from "../lib/plans.js";
 import { WA_LIVE } from "../config/whatsapp.js";
 import { creditWallet, debitWallet, getPlatformPricing } from "../lib/wallet.js";
@@ -1461,16 +1461,9 @@ router.post("/payments/:id/refund", async (req, res) => {
   if (!payment) return res.status(404).json({ error: "not found" });
   if (payment.status !== "paid") return res.status(400).json({ error: "Only paid payments can be refunded" });
   let refundId = `manual_${Date.now()}`;
-  if (RAZORPAY_ENABLED && payment.razorpayPaymentId) {
-    try {
-      const rf = await razorpay().payments.refund(payment.razorpayPaymentId, {
-        amount: payment.amount,
-        notes: { nexwapiPaymentId: payment.id, reason: req.body?.reason || "admin_refund" },
-      });
-      refundId = rf.id || refundId;
-    } catch (e) {
-      return res.status(400).json({ error: e?.error?.description || e.message || "Razorpay refund failed" });
-    }
+  // Cashfree refund — mark as refunded manually (Cashfree refund API can be added later)
+  if (CASHFREE_ENABLED && payment.razorpayPaymentId) {
+    console.log("[refund] Cashfree payment id:", payment.razorpayPaymentId, "— marked refunded manually");
   }
   const updated = await prisma.payment.update({
     where: { id: payment.id },
@@ -1653,7 +1646,7 @@ router.get("/system", async (_req, res) => {
       label: "Platform messaging number",
       detail: platformPhone || "Set PLATFORM_MESSAGING_PHONE in server .env",
     },
-    razorpay: { ok: RAZORPAY_ENABLED, label: "Razorpay", detail: RAZORPAY_ENABLED ? "configured" : "missing keys" },
+    cashfree: { ok: CASHFREE_ENABLED, label: "Cashfree", detail: CASHFREE_ENABLED ? "configured" : "missing keys" },
     database: { ok: dbOk, label: "PostgreSQL" },
     redis: { ok: false, label: "Redis", detail: "optional — not configured" },
     queue: { ok: true, label: "Campaign/Drip queue", detail: "in-process scheduler" },

@@ -417,13 +417,29 @@ export async function sendPlanExpiry(to, name, plan) {
   });
 }
 
-export async function sendInvoiceEmail(to, { invoiceNo, amount, plan }) {
+export async function sendInvoiceEmail(to, { invoiceNo, amount, plan, ownerName }) {
+  const amountLabel = `₹${((amount || 0) / 100).toLocaleString("en-IN", { minimumFractionDigits: 2 })}`;
+  const planLabel = String(plan || "—").replace(/^\w/, (c) => c.toUpperCase());
+  const date = new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
   return sendMail({
     to,
-    subject: `Invoice ${invoiceNo || ""} from Nexwapi`,
-    html: wrap("Invoice", `<p>Thanks for your payment.</p>
-      <p>Invoice: <b>${invoiceNo || "—"}</b><br/>Plan: ${plan || "—"}<br/>Amount: ₹${((amount || 0) / 100).toFixed(2)}</p>
-      <p><a href="${APP_DASHBOARD_URL}/dashboard/upgrade">Download from Billing</a></p>`),
+    subject: `🧾 Invoice ${invoiceNo || ""} — Nexwapi Payment Confirmed`,
+    html: wrap("Payment Invoice", `
+      <p>Hi ${escapeHtml(ownerName || "there")},</p>
+      <p>Your payment has been received. Here are your invoice details:</p>
+      <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:14px">
+        <tr style="background:#f0fdf4"><td style="padding:10px 12px;border:1px solid #d1fae5;font-weight:600">Invoice No.</td><td style="padding:10px 12px;border:1px solid #d1fae5">${invoiceNo || "—"}</td></tr>
+        <tr><td style="padding:10px 12px;border:1px solid #e5e7eb;font-weight:600">Date</td><td style="padding:10px 12px;border:1px solid #e5e7eb">${date}</td></tr>
+        <tr style="background:#f9fafb"><td style="padding:10px 12px;border:1px solid #e5e7eb;font-weight:600">Plan</td><td style="padding:10px 12px;border:1px solid #e5e7eb">${planLabel}</td></tr>
+        <tr><td style="padding:10px 12px;border:1px solid #e5e7eb;font-weight:600">Amount Paid</td><td style="padding:10px 12px;border:1px solid #e5e7eb;font-weight:700;color:#15803d">${amountLabel}</td></tr>
+        <tr style="background:#f9fafb"><td style="padding:10px 12px;border:1px solid #e5e7eb;font-weight:600">Payment Via</td><td style="padding:10px 12px;border:1px solid #e5e7eb">Cashfree Payments</td></tr>
+      </table>
+      <p>🚀 Your <b>${planLabel} plan</b> is now <b style="color:#15803d">ACTIVE</b>. Start sending campaigns, chatbots, and bulk WhatsApp messages right away.</p>
+      <p style="text-align:center;margin:24px 0">
+        <a href="${APP_DASHBOARD_URL}/dashboard" style="display:inline-block;background:#00a884;color:#fff;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:700;font-size:15px">Open Dashboard →</a>
+      </p>
+      <p style="font-size:13px;color:#6b7280">This is a computer-generated invoice for Nexwapi software subscription. WhatsApp conversation charges are billed separately by Meta. For support, reply to this email or WhatsApp us at +91 76311 00654.</p>
+    `),
   });
 }
 

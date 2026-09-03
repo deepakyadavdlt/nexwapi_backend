@@ -66,7 +66,7 @@ import {
   userHasWorkspacePermission,
 } from "../lib/workspaceRbac.js";
 import { digitsOnly, findCompanyContactByPhone } from "../lib/phone.js";
-import { RAZORPAY_ENABLED, RAZORPAY_KEY_ID, PLANS, razorpay, verifySignature, verifyWebhook } from "../lib/razorpay.js";
+import { CASHFREE_ENABLED, PLAN_CATALOG as CF_PLAN_CATALOG, createOrder as cfCreateOrder, fetchOrder as cfFetchOrder, fetchOrderPayments as cfFetchOrderPayments, verifyWebhook as cfVerifyWebhook, parseWebhookEvent as cfParseWebhookEvent } from "../lib/cashfree.js";
 import { runCampaign, resolveAudience } from "../lib/campaignRunner.js";
 import { enrollContacts } from "../lib/dripRunner.js";
 import { fireEvent, logActivity } from "../lib/events.js";
@@ -249,6 +249,7 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
     }).catch(() => {});
 
     sendWelcome(user.email, user.name, partnerRow && partnerId ? publicPartnerBranding(partnerRow) : null).catch((e) => console.warn("[mail welcome]", e.message));
+    sendOnboardWelcomeWhatsApp(company.id).catch((e) => console.warn("[wa:onboard]", e.message));
     const companyWithPartner = partnerRow && partnerId ? { ...company, partner: partnerRow } : company;
     res.status(201).json({ token: signToken(user), user: publicCompanyUser(user, companyWithPartner) });
   } catch (e) {
@@ -526,6 +527,56 @@ function moneyInr(paise) {
   return `₹${(Number(paise || 0) / 100).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+// Send a WhatsApp message to the client's owner after a successful payment.
+// Uses the platform number (env creds) since the client's own WA may not be set up yet.
+async function sendPaymentWhatsApp(payment) {
+  try {
+    if (!payment?.companyId) return;
+    const owner = await prisma.user.findFirst({
+      where: { companyId: payment.companyId, role: { in: ["OWNER", "ADMIN"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (!owner?.phone) return;
+
+    const fresh = await prisma.payment.findUnique({ where: { id: payment.id } });
+    const amountLabel = moneyInr(fresh?.amount || payment.amount);
+    const plan = fresh?.plan || payment.plan || "";
+    const invoiceNo = fresh?.invoiceNo || "";
+    const isWallet = (fresh?.type || payment.type) === "wallet_recharge";
+
+    const body = isWallet
+      ? `✅ *Wallet Recharged Successfully!*\n\nAmount: *${amountLabel}*\nInvoice: *${invoiceNo || "—"}*\n\nYour wallet credits have been added. You can now send campaigns and messages.\n\nThank you for using *Nexwapi*! 🚀`
+      : `✅ *Payment Successful!*\n\nPlan: *${String(plan).toUpperCase()}*\nAmount: *${amountLabel}*\nInvoice: *${invoiceNo || "—"}*\n\nYour plan is now active. Start sending campaigns, chatbots, and bulk messages on WhatsApp!\n\nThank you for choosing *Nexwapi*! 🎉`;
+
+    const { sendText } = await import("../lib/whatsappService.js");
+    await sendText(owner.phone, body); // uses platform creds from env
+  } catch (e) {
+    console.warn("[wa:payment]", e.message);
+  }
+}
+
+// Send a WhatsApp welcome message to a newly onboarded client (platform number → client's phone).
+async function sendOnboardWelcomeWhatsApp(companyId) {
+  try {
+    if (!companyId) return;
+    const owner = await prisma.user.findFirst({
+      where: { companyId, role: { in: ["OWNER", "ADMIN"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (!owner?.phone) return;
+
+    const company = await prisma.company.findUnique({ where: { id: companyId } });
+    const name = owner.name || owner.email || "there";
+    const body = `👋 *Welcome to Nexwapi, ${name}!*\n\nYour account is ready. Here's what you can do:\n\n📣 *Campaigns* — Bulk WhatsApp broadcasts\n🤖 *Chatbots* — Automated replies & flows\n📥 *Inbox* — Manage all customer chats\n📊 *Analytics* — Track message performance\n\nOpen your dashboard 👉 https://app.nexwapi.com/dashboard\n\nNeed help? Reply here anytime. We're always around! 🙌`;
+
+    const { sendText } = await import("../lib/whatsappService.js");
+    await sendText(owner.phone, body); // platform creds from env
+    console.log("[wa:onboard] welcome sent to", owner.phone, "company", companyId);
+  } catch (e) {
+    console.warn("[wa:onboard]", e.message);
+  }
+}
+
 async function assignInvoiceNo(paymentId) {
   const y = new Date();
   const prefix = `NEX-${y.getFullYear()}${String(y.getMonth() + 1).padStart(2, "0")}-`;
@@ -544,7 +595,7 @@ async function emailInvoiceFor(payment) {
       orderBy: { createdAt: "asc" },
     });
     if (owner?.email) {
-      await sendInvoiceEmail(owner.email, { invoiceNo: fresh.invoiceNo, amount: fresh.amount, plan: fresh.plan });
+      await sendInvoiceEmail(owner.email, { invoiceNo: fresh.invoiceNo, amount: fresh.amount, plan: fresh.plan, ownerName: owner.name });
     }
   } catch (e) {
     console.warn("[mail invoice]", e.message);
@@ -567,12 +618,12 @@ router.get("/billing/config", async (_req, res) => {
   for (const key of Object.keys(plans)) {
     if (plans[key].active == null) plans[key].active = true;
   }
-  res.json({ enabled: RAZORPAY_ENABLED, keyId: RAZORPAY_KEY_ID, plans, legacyPlans: PLANS });
+  res.json({ enabled: CASHFREE_ENABLED, gateway: "cashfree", plans, legacyPlans: CF_PLAN_CATALOG });
 });
 
-// Create a Razorpay order for starter or growth plan.
+// Create a Cashfree order for starter, growth or professional plan.
 router.post("/billing/create-order", requireAuth, attachCompany, async (req, res) => {
-  if (!RAZORPAY_ENABLED) return res.status(503).json({ error: "Payments are not configured yet. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET." });
+  if (!CASHFREE_ENABLED) return res.status(503).json({ error: "Payments are not configured yet. Add CASHFREE_APP_ID and CASHFREE_SECRET_KEY." });
   const planKey = normalizePlan(req.body?.planKey || req.body?.plan || "growth");
   if (!["starter", "growth", "professional"].includes(planKey)) {
     return res.status(400).json({ error: "planKey must be starter, growth or professional" });
@@ -587,8 +638,15 @@ router.post("/billing/create-order", requireAuth, attachCompany, async (req, res
   const companyId = companyIdOf(req);
   if (!companyId) return res.status(403).json({ error: "No company linked to this account" });
   try {
-    const receipt = `rcpt_${req.user.id.slice(-8)}_${Date.now().toString(36)}`;
-    const order = await razorpay().orders.create({ amount: plan.amount, currency: plan.currency, receipt });
+    const cfOrderId = `NEX_${req.user.id.slice(-8)}_${Date.now().toString(36)}`;
+    const cfOrder = await cfCreateOrder({
+      orderId: cfOrderId,
+      amount: plan.amount,
+      currency: plan.currency,
+      customerPhone: req.user.phone || "9999999999",
+      customerEmail: req.user.email,
+      customerName: req.user.name || req.user.email,
+    });
     await prisma.payment.create({
       data: {
         userId: req.user.id,
@@ -597,29 +655,47 @@ router.post("/billing/create-order", requireAuth, attachCompany, async (req, res
         amount: plan.amount,
         currency: plan.currency,
         status: "created",
-        razorpayOrderId: order.id,
+        razorpayOrderId: cfOrderId, // reusing field to store Cashfree order id
       },
     });
-    res.json({ orderId: order.id, amount: plan.amount, currency: plan.currency, keyId: RAZORPAY_KEY_ID, planKey });
+    res.json({
+      orderId: cfOrderId,
+      paymentSessionId: cfOrder.paymentSessionId,
+      amount: plan.amount,
+      currency: plan.currency,
+      gateway: "cashfree",
+      planKey,
+    });
   } catch (e) {
-    console.error("[create-order]", e?.error?.description || e?.message || e);
+    console.error("[create-order]", e?.message || e);
     res.status(502).json({ error: "Could not start payment. Please try again." });
   }
 });
 
-// Verify the payment signature, mark it paid and upgrade the company plan.
+// Verify Cashfree payment — frontend calls this after Cashfree checkout completes.
+// We fetch order status from Cashfree server-to-server to confirm payment.
 router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+  const { order_id } = req.body || {};
   const companyId = companyIdOf(req);
   if (!companyId) return res.status(403).json({ error: "No company linked to this account" });
-  if (!verifySignature(razorpay_order_id, razorpay_payment_id, razorpay_signature)) {
-    await prisma.payment.updateMany({ where: { razorpayOrderId: razorpay_order_id, companyId }, data: { status: "failed" } }).catch(() => {});
-    return res.status(400).json({ error: "Payment verification failed" });
+  if (!order_id) return res.status(400).json({ error: "order_id required" });
+
+  // Verify with Cashfree server
+  let cfOrder;
+  try {
+    cfOrder = await cfFetchOrder(order_id);
+  } catch (e) {
+    return res.status(502).json({ error: "Could not verify payment with Cashfree. Try again." });
   }
-  const payment = await prisma.payment.findUnique({ where: { razorpayOrderId: razorpay_order_id } });
-  if (!payment || payment.companyId !== companyId) {
-    return res.status(404).json({ error: "Payment not found" });
+
+  const cfStatus = cfOrder?.order_status; // PAID, ACTIVE, EXPIRED
+  if (cfStatus !== "PAID") {
+    await prisma.payment.updateMany({ where: { razorpayOrderId: order_id, companyId }, data: { status: "failed" } }).catch(() => {});
+    return res.status(400).json({ error: `Payment not completed. Status: ${cfStatus}` });
   }
+
+  const payment = await prisma.payment.findFirst({ where: { razorpayOrderId: order_id, companyId } });
+  if (!payment) return res.status(404).json({ error: "Payment not found" });
 
   // Idempotent: webhook may have already credited — never double-credit
   if (payment.status === "paid") {
@@ -628,12 +704,22 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
     return res.json({ ok: true, alreadyProcessed: true, user: publicCompanyUser(user, company) });
   }
 
+  // Get cf_payment_id from payments list
+  let cfPaymentId = null;
+  try {
+    const payments = await cfFetchOrderPayments(order_id);
+    cfPaymentId = payments[0]?.cf_payment_id ? String(payments[0].cf_payment_id) : null;
+  } catch {}
+
   await prisma.payment.update({
-    where: { razorpayOrderId: razorpay_order_id },
-    data: { status: "paid", razorpayPaymentId: razorpay_payment_id, paidAt: new Date() },
+    where: { id: payment.id },
+    data: { status: "paid", razorpayPaymentId: cfPaymentId, paidAt: new Date() },
   });
   if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
   emailInvoiceFor(payment);
+  sendPaymentWhatsApp(payment).catch((e) => console.warn("[wa:payment]", e.message));
+
+  let company;
   if (payment.type === "wallet_recharge") {
     const pricing = await getPlatformPricing();
     const credits = payment.creditsAdded || creditsFromPaise(payment.amount, pricing.creditsPerRupee);
@@ -643,19 +729,13 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
       credits,
       reason: "recharge",
       createdBy: req.user.id,
-      meta: { orderId: razorpay_order_id },
+      meta: { orderId: order_id },
     });
     company = r.company;
     if (company.status === "EXPIRED" || company.status === "SUSPENDED") {
-      company = await prisma.company.update({
-        where: { id: companyId },
-        data: { status: "ACTIVE" },
-      });
+      company = await prisma.company.update({ where: { id: companyId }, data: { status: "ACTIVE" } });
     }
-    await prisma.payment.update({
-      where: { id: payment.id },
-      data: { creditsAdded: credits },
-    });
+    await prisma.payment.update({ where: { id: payment.id }, data: { creditsAdded: credits } });
   } else {
     const planKey = normalizePlan(payment.plan);
     company = await prisma.company.update({
@@ -745,6 +825,7 @@ router.get("/billing/invoices/:id", requireAuth, attachCompany, async (req, res)
     <thead><tr><th>Description</th><th>Payment ID</th><th>Amount</th></tr></thead>
     <tbody>
       <tr><td>${inv.planName} subscription</td><td class="muted">${inv.razorpayPaymentId || "—"}</td><td>${inv.amountLabel}</td></tr>
+      <tr><td colspan="2" style="font-size:12px;color:#888">Paid via Cashfree Payments</td><td></td></tr>
     </tbody>
   </table>
   <p class="total" style="text-align:right;margin-top:16px">Paid ${inv.amountLabel}</p>
@@ -755,29 +836,37 @@ router.get("/billing/invoices/:id", requireAuth, attachCompany, async (req, res)
   res.send(html);
 });
 
-// Razorpay webhook — server-to-server confirmation. Reliable even if the client
-// closes the browser before /billing/verify runs. Needs express.raw (bypasses
-// the global JSON parser via the exclusion in index.js) so the HMAC matches.
+// Cashfree webhook — server-to-server payment confirmation.
+// Set this URL in Cashfree Dashboard → Developers → Webhooks:
+//   https://api.nexwapi.com/api/billing/webhook
+// Events: PAYMENT_SUCCESS_WEBHOOK, PAYMENT_FAILED_WEBHOOK
 router.post("/billing/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  const signature = req.headers["x-razorpay-signature"];
-  if (!verifyWebhook(req.body, signature)) return res.status(400).send("invalid signature");
+  const signature = req.headers["x-webhook-signature"];
+  const timestamp = req.headers["x-webhook-timestamp"];
+  const rawBody = req.body.toString("utf8");
+
+  if (!cfVerifyWebhook(rawBody, signature, timestamp)) {
+    console.warn("[billing] webhook invalid signature");
+    return res.status(400).send("invalid signature");
+  }
   res.sendStatus(200); // ack fast; process after
 
   try {
-    const event = JSON.parse(req.body.toString("utf8"));
-    const type = event?.event;
-    if (type === "order.paid" || type === "payment.captured") {
-      const orderId = event?.payload?.payment?.entity?.order_id || event?.payload?.order?.entity?.id;
-      const paymentId = event?.payload?.payment?.entity?.id || null;
+    const { type, orderId, cfPaymentId, paymentStatus } = cfParseWebhookEvent(rawBody);
+
+    if (type === "PAYMENT_SUCCESS_WEBHOOK" || paymentStatus === "SUCCESS") {
       if (!orderId) return;
-      const payment = await prisma.payment.findUnique({ where: { razorpayOrderId: orderId } });
-      if (!payment || payment.status === "paid") return; // unknown or already handled
+      const payment = await prisma.payment.findFirst({ where: { razorpayOrderId: orderId } });
+      if (!payment || payment.status === "paid") return; // already handled
+
       await prisma.payment.update({
-        where: { razorpayOrderId: orderId },
-        data: { status: "paid", razorpayPaymentId: paymentId, paidAt: new Date() },
+        where: { id: payment.id },
+        data: { status: "paid", razorpayPaymentId: cfPaymentId ? String(cfPaymentId) : null, paidAt: new Date() },
       });
       if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
       emailInvoiceFor(payment);
+      sendPaymentWhatsApp(payment).catch((e) => console.warn("[wa:payment]", e.message));
+
       if (payment.companyId) {
         if (payment.type === "wallet_recharge") {
           const { creditWallet, creditsFromPaise, getPlatformPricing } = await import("../lib/wallet.js");
@@ -809,8 +898,7 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
         }
         console.log("[billing] webhook paid", payment.type, payment.companyId, "order", orderId);
       }
-    } else if (type === "payment.failed") {
-      const orderId = event?.payload?.payment?.entity?.order_id;
+    } else if (type === "PAYMENT_FAILED_WEBHOOK" || paymentStatus === "FAILED") {
       if (orderId) await prisma.payment.updateMany({ where: { razorpayOrderId: orderId }, data: { status: "failed" } }).catch(() => {});
     }
   } catch (e) {
@@ -4538,7 +4626,7 @@ router.get("/wallet/transactions", async (req, res) => {
 });
 
 router.post("/wallet/recharge", async (req, res) => {
-  if (!RAZORPAY_ENABLED) return res.status(503).json({ error: "Payments not configured" });
+  if (!CASHFREE_ENABLED) return res.status(503).json({ error: "Payments not configured" });
   const companyId = companyIdOf(req);
   const amountRupees = Math.max(1, Number(req.body?.amountRupees) || 0);
   if (amountRupees < 1) return res.status(400).json({ error: "amountRupees required (min ₹1)" });
@@ -4546,8 +4634,15 @@ router.post("/wallet/recharge", async (req, res) => {
   const pricing = await getPlatformPricing();
   const credits = creditsFromPaise(amount, pricing.creditsPerRupee);
   try {
-    const receipt = `wlt_${req.user.id.slice(-8)}_${Date.now().toString(36)}`;
-    const order = await razorpay().orders.create({ amount, currency: "INR", receipt });
+    const cfOrderId = `WLT_${req.user.id.slice(-8)}_${Date.now().toString(36)}`;
+    const cfOrder = await cfCreateOrder({
+      orderId: cfOrderId,
+      amount,
+      currency: "INR",
+      customerPhone: req.user.phone || "9999999999",
+      customerEmail: req.user.email,
+      customerName: req.user.name || req.user.email,
+    });
     await prisma.payment.create({
       data: {
         userId: req.user.id,
@@ -4558,14 +4653,15 @@ router.post("/wallet/recharge", async (req, res) => {
         currency: "INR",
         status: "created",
         creditsAdded: credits,
-        razorpayOrderId: order.id,
+        razorpayOrderId: cfOrderId,
       },
     });
     res.json({
-      orderId: order.id,
+      orderId: cfOrderId,
+      paymentSessionId: cfOrder.paymentSessionId,
       amount,
       currency: "INR",
-      keyId: RAZORPAY_KEY_ID,
+      gateway: "cashfree",
       credits,
       creditsPerRupee: pricing.creditsPerRupee,
     });

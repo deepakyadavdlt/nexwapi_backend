@@ -513,10 +513,13 @@ export async function uploadMedia(buffer, mimetype, filename, creds) {
 }
 
 export function sendMediaById(to, waType, mediaId, { filename, caption } = {}, creds) {
+  const type = String(waType || "document");
   const media = { id: mediaId };
-  if (filename) media.filename = filename;
-  if (caption) media.caption = caption;
-  return send({ to: waTo(to), type: waType, [waType]: media }, creds);
+  // Meta only allows `filename` on documents — image/video/audio reject it (error 100).
+  if (type === "document" && filename) media.filename = filename;
+  // Caption is supported on image, video, and document — not audio.
+  if (caption && type !== "audio") media.caption = String(caption);
+  return send({ to: waTo(to), type, [type]: media }, creds);
 }
 
 export function sendTemplateWithParams(to, name, params = [], lang = "en_US", creds) {

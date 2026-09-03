@@ -20,7 +20,7 @@ import {
 import { applyPartnerBillingToAccount, fetchWabaBilling, partnerBillingReady } from "../lib/partnerBilling.js";
 
 const UPLOAD_DIR = path.resolve("uploads");
-const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 16 * 1024 * 1024 } }); // 16MB (WhatsApp limit)
+const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 100 * 1024 * 1024 } }); // docs up to 100MB; image/video checked below
 const profileUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 // Map a mimetype to the WhatsApp media type.
@@ -1360,11 +1360,18 @@ router.post("/conversations/:id/media", requireNotSuspended, upload.single("file
   if (!req.file) return res.status(400).json({ error: "file required" });
 
   const companyId = companyIdOf(req);
-  const { originalname, mimetype, filename, path: tmpPath } = req.file;
+  const { originalname, mimetype, filename, path: tmpPath, size } = req.file;
+  const waType = waMediaType(mimetype);
+  const maxByType = { image: 5 * 1024 * 1024, video: 16 * 1024 * 1024, audio: 16 * 1024 * 1024, document: 100 * 1024 * 1024 };
+  const maxBytes = maxByType[waType] || maxByType.document;
+  if (Number(size || 0) > maxBytes) {
+    try { fs.unlinkSync(tmpPath); } catch {}
+    const label = waType === "image" ? "Images max 5 MB" : waType === "document" ? "Documents max 100 MB" : "Video/audio max 16 MB";
+    return res.status(400).json({ error: `File is too large. ${label} on WhatsApp.` });
+  }
   const storedName = filename + (path.extname(originalname) || "");
   fs.renameSync(tmpPath, path.join(UPLOAD_DIR, storedName));
   const publicUrl = publicUploadUrl(req, storedName);
-  const waType = waMediaType(mimetype);
   const caption = req.body?.caption || "";
   const creds = await getEffectiveCreds(companyId);
 

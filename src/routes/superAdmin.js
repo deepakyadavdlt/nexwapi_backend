@@ -57,7 +57,7 @@ router.use(async (req, res, next) => {
 const profileUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const UPLOAD_DIR = path.resolve("uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-const inboxUpload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 16 * 1024 * 1024 } });
+const inboxUpload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 100 * 1024 * 1024 } });
 
 function waMediaType(mime) {
   if (mime?.startsWith("image/")) return "image";

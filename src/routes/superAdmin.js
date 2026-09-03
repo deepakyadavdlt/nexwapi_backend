@@ -1878,6 +1878,134 @@ router.delete("/inbox/notes/:id", async (req, res) => {
   res.sendStatus(204);
 });
 
+router.delete("/inbox/conversations/:contactId/messages/:messageId", async (req, res) => {
+  const { companyId, contact } = await platformContactOr404(req.params.contactId, res);
+  if (!contact) return;
+  const messageId = String(req.params.messageId || "");
+  const scope = String(req.body?.scope || req.query.scope || "me").toLowerCase();
+  const msg = await prisma.message.findFirst({
+    where: {
+      companyId,
+      contactId: contact.id,
+      OR: [{ id: messageId }, { waId: messageId }],
+    },
+  });
+  if (!msg) return res.sendStatus(404);
+  if (scope === "everyone") {
+    if (msg.direction !== "out") {
+      return res.status(400).json({ error: "Delete for everyone only applies to messages you sent." });
+    }
+    const updated = await prisma.message.update({
+      where: { id: msg.id },
+      data: {
+        type: "deleted",
+        text: "This message was deleted",
+        mediaUrl: null,
+        filename: null,
+        status: "deleted",
+        error: null,
+      },
+    });
+    return res.json({
+      ok: true,
+      scope: "everyone",
+      note: "Removed in Nexwapi inbox. WhatsApp Cloud API cannot delete it from the customer's phone.",
+      message: toMessage(updated),
+    });
+  }
+  await prisma.message.delete({ where: { id: msg.id } });
+  res.json({ ok: true, scope: "me", deletedId: msg.id });
+});
+
+router.get("/inbox/calling/events", async (req, res) => {
+  const companyId = await getPlatformCompanyId();
+  if (!companyId) return res.json({ events: [], after: 0 });
+  const after = Number(req.query.after || 0) || 0;
+  const wait = Math.min(10000, Math.max(0, Number(req.query.wait || 0) || 0));
+  const { takeCallSignals } = await import("../lib/callBus.js");
+  const events = await takeCallSignals(companyId, after, wait, req);
+  const last = events.length ? events[events.length - 1].id : after;
+  res.json({ events, after: last });
+});
+
+router.get("/inbox/calling/status", async (_req, res) => {
+  const companyId = await getPlatformCompanyId();
+  if (!companyId) return res.status(503).json({ error: "Platform inbox not configured" });
+  const { callingStatusForAccount, waAccountForCompany } = await import("../lib/waCalling.js");
+  const wa = (await waAccountForCompany(companyId)) || {
+    isConnected: Boolean(platformWaCreds()),
+    phoneNumberId: platformWaCreds()?.phoneNumberId,
+    accessToken: platformWaCreds()?.accessToken,
+    displayPhoneNumber: platformPhoneDisplay(),
+    phoneNumber: process.env.PLATFORM_MESSAGING_PHONE,
+    messagingLimit: "TIER_10K",
+  };
+  const status = await callingStatusForAccount({
+    ...wa,
+    isConnected: Boolean(wa.phoneNumberId && wa.accessToken),
+  });
+  res.json(status);
+});
+
+router.post("/inbox/calling/enable", async (_req, res) => {
+  const creds = platformWaCreds();
+  if (!creds?.phoneNumberId || !creds?.accessToken) {
+    return res.status(503).json({ error: "Platform WhatsApp not configured in server .env" });
+  }
+  const { setCallingEnabled, ensureCallsWebhookSubscription, callingStatusForAccount } = await import("../lib/waCalling.js");
+  await ensureCallsWebhookSubscription().catch(() => {});
+  await setCallingEnabled(creds.phoneNumberId, creds.accessToken, true);
+  const after = await callingStatusForAccount({
+    isConnected: true,
+    phoneNumberId: creds.phoneNumberId,
+    accessToken: creds.accessToken,
+    messagingLimit: "TIER_10K",
+  });
+  res.json(after);
+});
+
+router.post("/inbox/calling/start", async (req, res) => {
+  const { companyId, contact } = await platformContactOr404(req.body?.contactId, res);
+  if (!contact) return;
+  const { sdp, sdpType } = req.body || {};
+  if (!sdp) return res.status(400).json({ error: "Missing WebRTC offer." });
+  const creds = platformWaCreds();
+  if (!creds?.phoneNumberId || !creds?.accessToken) {
+    return res.status(503).json({ error: "Platform WhatsApp not configured" });
+  }
+  const { graphCall, logCallMessage } = await import("../lib/waCalling.js");
+  const to = String(contact.phone).replace(/\D/g, "");
+  const data = await graphCall(creds.phoneNumberId, creds.accessToken, {
+    to,
+    action: "connect",
+    session: { sdp_type: sdpType || "offer", sdp },
+  });
+  const callId = data?.calls?.[0]?.id || data?.id || null;
+  await logCallMessage({
+    companyId,
+    contactId: contact.id,
+    callId,
+    event: "outbound",
+    text: `Calling +${to}`,
+    direction: "out",
+  });
+  res.json({ ok: true, callId, contactId: contact.id, phone: to, meta: data });
+});
+
+router.post("/inbox/calling/action", async (req, res) => {
+  const { callId, action, sdp, sdpType } = req.body || {};
+  if (!callId || !action) return res.status(400).json({ error: "callId and action required" });
+  const creds = platformWaCreds();
+  if (!creds?.phoneNumberId || !creds?.accessToken) {
+    return res.status(503).json({ error: "Platform WhatsApp not configured" });
+  }
+  const { graphCall } = await import("../lib/waCalling.js");
+  const body = { call_id: callId, action: String(action) };
+  if (sdp) body.session = { sdp_type: sdpType || "answer", sdp };
+  const data = await graphCall(creds.phoneNumberId, creds.accessToken, body);
+  res.json({ ok: true, meta: data });
+});
+
 /* ---------- Tickets / logs ---------- */
 router.get("/tickets", async (_req, res) => {
   const tickets = await prisma.ticket.findMany({

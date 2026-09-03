@@ -2693,6 +2693,51 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
   res.status(201).json(toMessage(msg));
 });
 
+/** Delete a message from the team inbox. Meta Cloud API cannot revoke messages on the customer's phone. */
+router.delete("/conversations/:id/messages/:messageId", requireNotSuspended, async (req, res) => {
+  const contact = await tenantContact(req, req.params.id);
+  if (!contact) return res.sendStatus(404);
+  const companyId = companyIdOf(req);
+  const messageId = String(req.params.messageId || "");
+  const scope = String(req.body?.scope || req.query.scope || "me").toLowerCase();
+  const msg = await prisma.message.findFirst({
+    where: {
+      companyId,
+      contactId: contact.id,
+      OR: [{ id: messageId }, { waId: messageId }],
+    },
+  });
+  if (!msg) return res.sendStatus(404);
+
+  if (scope === "everyone") {
+    if (msg.direction !== "out") {
+      return res.status(400).json({
+        error: "Delete for everyone only applies to messages you sent. Use Delete for me for incoming messages.",
+      });
+    }
+    const updated = await prisma.message.update({
+      where: { id: msg.id },
+      data: {
+        type: "deleted",
+        text: "This message was deleted",
+        mediaUrl: null,
+        filename: null,
+        status: "deleted",
+        error: null,
+      },
+    });
+    return res.json({
+      ok: true,
+      scope: "everyone",
+      note: "Removed in Nexwapi inbox. WhatsApp Cloud API cannot delete the message from the customer's phone.",
+      message: toMessage(updated),
+    });
+  }
+
+  await prisma.message.delete({ where: { id: msg.id } });
+  res.json({ ok: true, scope: "me", deletedId: msg.id });
+});
+
 // Send an approved template to a contact (business-initiated — works outside the 24h window).
 router.post("/conversations/:id/send-template", requireNotSuspended, async (req, res) => {
   const contact = await tenantContact(req, req.params.id);

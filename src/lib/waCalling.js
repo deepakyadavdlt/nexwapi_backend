@@ -315,12 +315,15 @@ export async function handleCallingWebhook(value, companyId) {
     });
 
     if ((event === "connect" || event === "ringing") && inbound) {
+      const { getPlatformCompanyId } = await import("./platformInbox.js");
+      const platformId = await getPlatformCompanyId().catch(() => null);
+      const isPlatform = platformId && companyId === platformId;
       notify({
-        audience: "client",
-        companyId,
+        audience: isPlatform ? "admin" : "client",
+        companyId: isPlatform ? undefined : companyId,
         title: `Incoming WhatsApp call from ${contact.name}`,
         body: `+${phone} is calling. Open Inbox and tap Answer.`,
-        href: "/dashboard/inbox",
+        href: isPlatform ? "/admin/inbox" : "/dashboard/inbox",
       }).catch(() => {});
     }
   }

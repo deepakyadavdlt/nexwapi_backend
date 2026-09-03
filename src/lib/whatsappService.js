@@ -282,13 +282,16 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
   const headerTextVars = headerComp && String(headerComp.format || "").toUpperCase() === "TEXT"
     ? templateVarCount(headerComp.text || "")
     : 0;
+  const buttons = comps.find((c) => String(c.type).toUpperCase() === "BUTTONS")?.buttons || [];
+  const isAuthTpl =
+    String(meta?.category || "").toUpperCase().includes("AUTH")
+    || buttons.some((b) => String(b.type || "").toUpperCase() === "OTP");
 
-  const filled = Array.from({ length: Math.max(bodyVars, params.length) }, (_, i) => {
+  const filled = Array.from({ length: Math.max(bodyVars, params.length, isAuthTpl ? 1 : 0) }, (_, i) => {
     const v = params[i];
     return String(v == null || v === "" ? (params[0] || "Customer") : v).slice(0, 1024);
   });
 
-  const buttons = comps.find((c) => String(c.type).toUpperCase() === "BUTTONS")?.buttons || [];
   const langs = sendLanguageTries(meta?.language, language);
   const headerUrls = headerComp ? collectHeaderMediaUrls(headerComp, headerImageUrl) : [];
 
@@ -321,26 +324,42 @@ export async function sendResolvedTemplate(to, name, { params = [], language, bo
           })),
         });
       }
-      if (bodyVars) {
+      if (isAuthTpl) {
+        // Auth OTP: Meta body has no custom text at create-time, but send still needs the code
+        // on BODY + COPY_CODE button (sub_type url).
+        const code = String(filled[0] || params[0] || "000000").replace(/\D/g, "").slice(0, 15) || "000000";
         tryComponents.push({
           type: "body",
-          parameters: Array.from({ length: bodyVars }, (_, i) => ({
-            type: "text",
-            text: filled[i] || "Customer",
-          })),
+          parameters: [{ type: "text", text: code }],
         });
-      }
-      buttons.forEach((b, idx) => {
-        const urlVars = templateVarCount(b.url || "");
-        if (String(b.type).toUpperCase() === "URL" && urlVars) {
+        tryComponents.push({
+          type: "button",
+          sub_type: "url",
+          index: "0",
+          parameters: [{ type: "text", text: code }],
+        });
+      } else {
+        if (bodyVars) {
           tryComponents.push({
-            type: "button",
-            sub_type: "url",
-            index: String(idx),
-            parameters: Array.from({ length: urlVars }, () => ({ type: "text", text: "https://nexwapi.com" })),
+            type: "body",
+            parameters: Array.from({ length: bodyVars }, (_, i) => ({
+              type: "text",
+              text: filled[i] || "Customer",
+            })),
           });
         }
-      });
+        buttons.forEach((b, idx) => {
+          const urlVars = templateVarCount(b.url || "");
+          if (String(b.type).toUpperCase() === "URL" && urlVars) {
+            tryComponents.push({
+              type: "button",
+              sub_type: "url",
+              index: String(idx),
+              parameters: Array.from({ length: urlVars }, () => ({ type: "text", text: "https://nexwapi.com" })),
+            });
+          }
+        });
+      }
 
       try {
         console.log("[wa] send template", tplName, lang, "to", waTo(to));
@@ -541,10 +560,74 @@ function bodyExample(text) {
   return { body_text: [row] };
 }
 
+function isAuthCategory(category) {
+  return String(category || "").toUpperCase().includes("AUTH");
+}
+
+/**
+ * Meta Authentication (OTP) templates reject BODY.text — they use a fixed body
+ * plus add_security_recommendation, optional expiry footer, and an OTP button.
+ * @see https://developers.facebook.com/docs/whatsapp/business-management-api/authentication-templates
+ */
+export function buildAuthTemplatePayload({
+  name,
+  language,
+  addSecurityRecommendation = true,
+  codeExpirationMinutes = 10,
+  otpType = "COPY_CODE",
+  otpButtonText = "Copy Code",
+  packageName,
+  signatureHash,
+}) {
+  const components = [
+    {
+      type: "BODY",
+      add_security_recommendation: Boolean(addSecurityRecommendation),
+    },
+  ];
+  const mins = Math.min(90, Math.max(1, Number(codeExpirationMinutes) || 10));
+  components.push({
+    type: "FOOTER",
+    code_expiration_minutes: mins,
+  });
+  const otp = String(otpType || "COPY_CODE").toUpperCase();
+  const button = {
+    type: "OTP",
+    otp_type: otp === "ONE_TAP" ? "ONE_TAP" : "COPY_CODE",
+    text: String(otpButtonText || (otp === "ONE_TAP" ? "Autofill" : "Copy Code")).slice(0, 25),
+  };
+  if (button.otp_type === "ONE_TAP") {
+    if (packageName) button.package_name = String(packageName);
+    if (signatureHash) button.signature_hash = String(signatureHash);
+  }
+  components.push({ type: "BUTTONS", buttons: [button] });
+  return {
+    name,
+    language: waLang(language),
+    category: "AUTHENTICATION",
+    components,
+  };
+}
+
 /** Map Nexwapi form fields to Meta Cloud API template create payload. */
 export function buildMetaTemplatePayload({
   name, category, language, body, headerType, headerText, buttons,
+  addSecurityRecommendation, codeExpirationMinutes, otpType, otpButtonText,
+  packageName, signatureHash,
 }) {
+  if (isAuthCategory(category)) {
+    return buildAuthTemplatePayload({
+      name,
+      language,
+      addSecurityRecommendation: addSecurityRecommendation !== false,
+      codeExpirationMinutes,
+      otpType,
+      otpButtonText,
+      packageName,
+      signatureHash,
+    });
+  }
+
   const components = [];
   if (headerType === "text" && headerText) {
     components.push({ type: "HEADER", format: "TEXT", text: headerText });
@@ -561,6 +644,9 @@ export function buildMetaTemplatePayload({
       buttons: buttons.slice(0, 3).map((b) => {
         const t = String(b.type || "QUICK_REPLY").toUpperCase();
         if (t === "URL") return { type: "URL", text: String(b.text || "Open").slice(0, 25), url: b.url };
+        if (t === "OTP" || t === "COPY_CODE") {
+          return { type: "OTP", otp_type: "COPY_CODE", text: String(b.text || "Copy Code").slice(0, 25) };
+        }
         return { type: "QUICK_REPLY", text: String(b.text || "OK").slice(0, 25) };
       }),
     });

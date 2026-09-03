@@ -2997,9 +2997,31 @@ router.post("/templates", async (req, res) => {
   if (!(await userHasWorkspacePermission(req, "templates.create"))) {
     return res.status(403).json({ error: "You do not have permission for this action", code: "PERMISSION_DENIED", permission: "templates.create" });
   }
-  const { name, category = "Utility", body, headerType, headerText, headerImageUrl, buttons, format = "text", cards } = req.body || {};
+  const {
+    name,
+    category = "Utility",
+    body,
+    headerType,
+    headerText,
+    headerImageUrl,
+    buttons,
+    format = "text",
+    cards,
+    addSecurityRecommendation,
+    codeExpirationMinutes,
+    otpType,
+    otpButtonText,
+    packageName,
+    signatureHash,
+  } = req.body || {};
   let language = req.body?.language || "en";
-  if (!name || !body) return res.status(400).json({ error: "name and body required" });
+  const isAuth = String(category || "").toUpperCase().includes("AUTH");
+  // Auth OTP templates: Meta sets the body text; we still store a local preview string.
+  const bodyText = body
+    || (isAuth
+      ? "Your verification code is {{1}}. For your security, do not share this code."
+      : "");
+  if (!name || !bodyText) return res.status(400).json({ error: "name and body required" });
   const cleanName = String(name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
 
   let status = "pending";
@@ -3011,9 +3033,27 @@ router.post("/templates", async (req, res) => {
     if (!creds) {
       throw Object.assign(new Error("Connect WhatsApp first (Dashboard → WhatsApp), then submit templates."), { status: 400 });
     }
+    if (isAuth && format === "carousel") {
+      throw Object.assign(new Error("Authentication templates cannot be carousels."), { status: 400 });
+    }
     const r = format === "carousel" && Array.isArray(cards) && cards.length
-      ? await createCarouselTemplate({ name: cleanName, category, language, body, cards }, creds)
-      : await createTemplate({ name: cleanName, category, language, body, headerType, headerText, headerImageUrl, buttons }, creds);
+      ? await createCarouselTemplate({ name: cleanName, category, language, body: bodyText, cards }, creds)
+      : await createTemplate({
+        name: cleanName,
+        category,
+        language,
+        body: bodyText,
+        headerType: isAuth ? undefined : headerType,
+        headerText: isAuth ? undefined : headerText,
+        headerImageUrl: isAuth ? undefined : headerImageUrl,
+        buttons: isAuth ? undefined : buttons,
+        addSecurityRecommendation,
+        codeExpirationMinutes,
+        otpType,
+        otpButtonText,
+        packageName,
+        signatureHash,
+      }, creds);
     status = (r.status || "pending").toLowerCase();
     if (r.language) language = r.language;
   } catch (e) {
@@ -3027,12 +3067,12 @@ router.post("/templates", async (req, res) => {
         name: cleanName,
         category,
         language,
-        body,
+        body: bodyText,
         status,
-        format,
-        cards: format === "carousel" ? cards : undefined,
-        headerFormat: headerType === "image" ? "IMAGE" : headerType === "text" ? "TEXT" : null,
-        headerImageUrl: headerImageUrl ? String(headerImageUrl).trim() : null,
+        format: isAuth ? "text" : format,
+        cards: !isAuth && format === "carousel" ? cards : undefined,
+        headerFormat: isAuth ? null : (headerType === "image" ? "IMAGE" : headerType === "text" ? "TEXT" : null),
+        headerImageUrl: !isAuth && headerImageUrl ? String(headerImageUrl).trim() : null,
       },
     });
     res.status(201).json({ ...tpl, createdAt: tpl.createdAt.getTime() });

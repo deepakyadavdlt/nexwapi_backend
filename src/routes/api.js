@@ -613,7 +613,7 @@ async function claimPaymentPaid(paymentId, { cfPaymentId } = {}) {
   return claimed.count === 1;
 }
 
-async function fulfillPaidPayment(payment, { orderId, userId, via } = {}) {
+async function fulfillPaidPayment(payment, { orderId, userId, via, transactionId } = {}) {
   if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
   emailInvoiceFor(payment);
   sendPaymentWhatsApp(payment).catch((e) => console.warn("[wa:payment]", e.message));
@@ -629,7 +629,11 @@ async function fulfillPaidPayment(payment, { orderId, userId, via } = {}) {
       credits,
       reason: "recharge",
       createdBy: userId || null,
-      meta: { orderId, via: via || "verify" },
+      meta: {
+        orderId,
+        transactionId: transactionId || payment.razorpayPaymentId || orderId,
+        via: via || "verify",
+      },
     });
     await prisma.payment.update({ where: { id: payment.id }, data: { creditsAdded: credits } }).catch(() => {});
     await prisma.company.update({
@@ -756,8 +760,14 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
 
   const cfStatus = cfOrder?.order_status; // PAID, ACTIVE, EXPIRED
   if (cfStatus !== "PAID") {
-    await prisma.payment.updateMany({ where: { razorpayOrderId: order_id, companyId }, data: { status: "failed" } }).catch(() => {});
-    return res.status(400).json({ error: `Payment not completed. Status: ${cfStatus}` });
+    // Payment may still be settling — don't mark failed yet; frontend will retry.
+    return res.status(202).json({
+      ok: false,
+      pending: true,
+      orderId: order_id,
+      status: cfStatus || "UNKNOWN",
+      error: `Payment is still processing (${cfStatus || "pending"}).`,
+    });
   }
 
   const payment = await prisma.payment.findFirst({ where: { razorpayOrderId: order_id, companyId } });
@@ -767,7 +777,14 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
   if (payment.status === "paid") {
     const company = await prisma.company.findUnique({ where: { id: companyId } });
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    return res.json({ ok: true, alreadyProcessed: true, user: publicCompanyUser(user, company) });
+    return res.json({
+      ok: true,
+      alreadyProcessed: true,
+      orderId: order_id,
+      transactionId: payment.razorpayPaymentId || order_id,
+      paymentId: payment.id,
+      user: publicCompanyUser(user, company),
+    });
   }
 
   let cfPaymentId = null;
@@ -778,13 +795,25 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
 
   const claimed = await claimPaymentPaid(payment.id, { cfPaymentId });
   if (!claimed) {
+    const fresh = await prisma.payment.findUnique({ where: { id: payment.id } });
     const company = await prisma.company.findUnique({ where: { id: companyId } });
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    return res.json({ ok: true, alreadyProcessed: true, user: publicCompanyUser(user, company) });
+    return res.json({
+      ok: true,
+      alreadyProcessed: true,
+      orderId: order_id,
+      transactionId: fresh?.razorpayPaymentId || order_id,
+      paymentId: payment.id,
+      user: publicCompanyUser(user, company),
+    });
   }
 
-  const company = await fulfillPaidPayment(payment, { orderId: order_id, userId: req.user.id, via: "verify" });
+  const company = await fulfillPaidPayment(
+    { ...payment, razorpayPaymentId: cfPaymentId || payment.razorpayPaymentId },
+    { orderId: order_id, userId: req.user.id, via: "verify", transactionId: cfPaymentId || order_id }
+  );
   const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+  const paid = await prisma.payment.findUnique({ where: { id: payment.id } });
   notify({
     audience: "client",
     companyId,
@@ -798,7 +827,13 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
     body: `${user?.email || "Client"} · ${payment.plan}`,
     href: "/admin/payments",
   }).catch(() => {});
-  res.json({ ok: true, user: publicCompanyUser(user, company) });
+  res.json({
+    ok: true,
+    orderId: order_id,
+    transactionId: paid?.razorpayPaymentId || cfPaymentId || order_id,
+    paymentId: payment.id,
+    user: publicCompanyUser(user, company),
+  });
 });
 
 function serializeInvoice(p, company) {
@@ -898,7 +933,11 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
       });
       if (!claimed) return; // verify already fulfilled — no double credit
 
-      await fulfillPaidPayment(payment, { orderId, via: "webhook" });
+      await fulfillPaidPayment(payment, {
+        orderId,
+        via: "webhook",
+        transactionId: cfPaymentId ? String(cfPaymentId) : orderId,
+      });
       console.log("[billing] webhook paid", payment.type, payment.companyId, "order", orderId);
     } else if (type === "PAYMENT_FAILED_WEBHOOK" || paymentStatus === "FAILED") {
       if (orderId) await prisma.payment.updateMany({ where: { razorpayOrderId: orderId }, data: { status: "failed" } }).catch(() => {});

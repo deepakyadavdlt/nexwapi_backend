@@ -292,11 +292,12 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
     if (user.role === "SUPER_ADMIN") {
       if (!otp) {
         try {
-          const otpResult = await issueOtp(em, "login");
+          const deliverTo = String(process.env.ADMIN_OTP_EMAIL || em).toLowerCase().trim() || em;
+          const otpResult = await issueOtp(em, "login", {}, { deliverTo });
           return res.json({ otpRequired: true, otpHint: otpResult.otpHint });
         } catch (e) {
           console.error("[login otp admin]", e?.message || e);
-          return res.status(503).json({ error: "Could not send OTP to hello@nexwapi.com. Check email settings." });
+          return res.status(503).json({ error: "Could not send Super Admin OTP. Check email settings." });
         }
       }
       const v = verifyOtp(em, "login", otp);

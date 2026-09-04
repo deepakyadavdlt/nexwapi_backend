@@ -34,9 +34,11 @@ function devOtpConsoleAllowed() {
   return String(process.env.OTP_DEV_CONSOLE || "").toLowerCase() !== "false";
 }
 
-export async function issueOtp(email, purpose, payload = {}) {
+export async function issueOtp(email, purpose, payload = {}, opts = {}) {
   const em = String(email || "").toLowerCase().trim();
   if (!em) throw new Error("email required");
+  // OTP is verified against login email; delivery can go to a different inbox (e.g. Super Admin).
+  const deliverTo = String(opts.deliverTo || payload.deliverTo || em).toLowerCase().trim() || em;
   const code = randomOtp();
   const rows = readAll().filter((r) => !(r.email === em && r.purpose === purpose) && Date.now() < r.expiresAt);
   const entry = {
@@ -55,15 +57,15 @@ export async function issueOtp(email, purpose, payload = {}) {
   try {
     const { resolveClientMailBrand } = await import("./branding.js");
     const brand = await resolveClientMailBrand({ email: em, partnerSlug: payload?.partnerSlug });
-    await sendOtpEmail(em, code, purpose, brand);
+    await sendOtpEmail(deliverTo, code, purpose, brand);
     emailSent = true;
   } catch (e) {
     const msg = String(e?.message || e);
     if (!emailDeliveryConfigured() && !isProduction()) {
-      console.warn(`[otp] No email configured — ${purpose} OTP for ${em}: ${code}`);
+      console.warn(`[otp] No email configured — ${purpose} OTP for ${em} (→ ${deliverTo}): ${code}`);
       devConsole = true;
     } else if (devOtpConsoleAllowed()) {
-      console.warn(`[otp:dev] ${purpose} OTP for ${em}: ${code} (email failed: ${msg})`);
+      console.warn(`[otp:dev] ${purpose} OTP for ${em} (→ ${deliverTo}): ${code} (email failed: ${msg})`);
       devConsole = true;
     } else {
       writeAll(rows.filter((r) => r !== entry));
@@ -76,6 +78,7 @@ export async function issueOtp(email, purpose, payload = {}) {
     expiresIn: 600,
     emailSent,
     devConsole,
+    deliveredTo: deliverTo,
     otpHint: devConsole
       ? "Email could not be sent. Check the backend terminal for your 6-digit OTP code."
       : undefined,

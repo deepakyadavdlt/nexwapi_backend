@@ -681,6 +681,26 @@ export async function createTemplate(payload, creds) {
   return { ...data, language: body.language };
 }
 
+/** Delete a template by name from Meta WABA (all languages). */
+export async function deleteMetaTemplate(name, creds) {
+  const accessToken = creds?.accessToken;
+  const wabaId = await wabaIdForSending(creds);
+  if (!wabaId || !accessToken || !name) return { ok: false, skipped: true };
+  const version = WA.version || "v22.0";
+  const url = `https://graph.facebook.com/${version}/${wabaId}/message_templates?name=${encodeURIComponent(name)}`;
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.error) {
+    const msg = data?.error?.error_user_msg || data?.error?.message || `Meta delete failed (${res.status})`;
+    console.warn("[wa] deleteMetaTemplate", name, msg);
+    return { ok: false, error: msg };
+  }
+  return { ok: true, data };
+}
+
 async function graphFetch(url, accessToken, timeoutMs = 25000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

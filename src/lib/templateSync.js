@@ -136,6 +136,9 @@ export async function syncCompanyTemplates(companyId) {
     if (!mt.name || !status) continue;
     const nameKey = String(mt.name).toLowerCase();
     const existing = byName.get(nameKey) || null;
+    // Soft-deleted locally → keep deleted; do not resurrect from Meta sync.
+    if (existing?.deletedAt) continue;
+
     const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
     const body = bodyComp?.text || existing?.body || "(synced from Meta)";
     const headerFields = headerFieldsFromMeta(mt);
@@ -144,7 +147,7 @@ export async function syncCompanyTemplates(companyId) {
 
     try {
       const row = await prisma.template.upsert({
-        where: { companyId_name: { companyId, name: mt.name } },
+        where: { companyId_name: { companyId, name: existing?.name || mt.name } },
         create: {
           companyId,
           name: mt.name,
@@ -158,7 +161,6 @@ export async function syncCompanyTemplates(companyId) {
           category,
           language,
           body,
-          deletedAt: null,
         },
       });
       byName.set(nameKey, row);
@@ -171,11 +173,10 @@ export async function syncCompanyTemplates(companyId) {
         notifyOwner(companyId, mt.name, status).catch(() => {});
       }
     } catch (e) {
-      // Fallback if unique name casing differs (Meta name vs local casing)
-      if (existing?.id) {
+      if (existing?.id && !existing.deletedAt) {
         await prisma.template.update({
           where: { id: existing.id },
-          data: { status, category, language, body, deletedAt: null },
+          data: { status, category, language, body },
         }).catch((err) => console.warn("[templateSync] update", mt.name, err?.message || err));
       } else {
         console.warn("[templateSync] upsert", mt.name, e?.message || e);

@@ -288,9 +288,20 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
         : "This workspace is not active yet.";
       return res.status(403).json({ error: msg, code: "PARTNER_INACTIVE" });
     }
-    // Super Admin and Partner skip OTP (console operators).
-    const skipOtp = user.role === "SUPER_ADMIN" || user.role === "PARTNER";
-    if (!skipOtp) {
+    // Partner skips OTP. Super Admin always requires email OTP.
+    if (user.role === "SUPER_ADMIN") {
+      if (!otp) {
+        try {
+          const otpResult = await issueOtp(em, "login");
+          return res.json({ otpRequired: true, otpHint: otpResult.otpHint });
+        } catch (e) {
+          console.error("[login otp admin]", e?.message || e);
+          return res.status(503).json({ error: "Could not send OTP to hello@nexwapi.com. Check email settings." });
+        }
+      }
+      const v = verifyOtp(em, "login", otp);
+      if (!v.ok) return res.status(400).json({ error: v.error || "Invalid OTP" });
+    } else if (user.role !== "PARTNER") {
       if (!otp) {
         let otpResult;
         try {
@@ -3250,8 +3261,18 @@ router.delete("/templates/:id", async (req, res) => {
   if (!(await otpGate(req, res, "template_delete"))) return;
   const existing = await prisma.template.findFirst({ where: { id: req.params.id, ...tenantWhere(req) } });
   if (!existing) return res.sendStatus(404);
-  // Soft-delete: move to "deleted" tab
+  // Soft-delete locally and remove from Meta so sync cannot bring it back.
   await prisma.template.update({ where: { id: existing.id }, data: { deletedAt: new Date(), status: "deleted" } });
+  try {
+    const { getEffectiveCreds, deleteMetaTemplate } = await import("../lib/whatsappService.js");
+    const companyId = existing.companyId || companyIdOf(req);
+    const creds = companyId ? await getEffectiveCreds(companyId) : null;
+    if (creds && !creds.incomplete && !creds.platformFallback) {
+      await deleteMetaTemplate(existing.name, creds);
+    }
+  } catch (e) {
+    console.warn("[templates] meta delete:", e?.message || e);
+  }
   res.sendStatus(204);
 });
 

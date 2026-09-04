@@ -74,6 +74,15 @@ async function ensureAdmin() {
       update: adminData,
       create: { email, ...adminData },
     });
+    // Deactivate legacy admin emails so only ADMIN_EMAIL can sign in as Super Admin.
+    const legacy = ["admin@nexwapi.com"];
+    for (const old of legacy) {
+      if (old === email) continue;
+      await prisma.user.updateMany({
+        where: { email: old, role: "SUPER_ADMIN" },
+        data: { isActive: false, password: hash },
+      }).catch(() => {});
+    }
     console.log(`  Super Admin ensured: ${email}`);
     await ensureDefaultPlans();
     await ensureDefaultCoupons();

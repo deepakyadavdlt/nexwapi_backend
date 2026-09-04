@@ -3701,13 +3701,19 @@ router.post("/automation/ai-agent/documents", asyncRoute(async (req, res) => {
 router.get("/whatsapp/calling", asyncRoute(async (req, res) => {
   const companyId = requireWorkspace(req, res);
   if (!companyId) return;
-  const { callingStatusForAccount } = await import("../lib/waCalling.js");
-  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
-  const status = await callingStatusForAccount(wa);
+  const { callingStatusForAccount, ensureCallingReady, waAccountForCompany } = await import("../lib/waCalling.js");
+  const wa = await waAccountForCompany(companyId);
+  let status;
+  try {
+    // Auto-enable like superadmin — inbox call button works without Automation setup.
+    status = await ensureCallingReady(wa, { companyId, businessName: req.company?.name });
+  } catch {
+    status = await callingStatusForAccount(wa);
+  }
   const s = await prisma.setting.findUnique({ where: { companyId } });
   res.json({
     ...status,
-    planEnabled: s?.voiceAiEnabled ?? false,
+    planEnabled: s?.voiceAiEnabled ?? Boolean(status.callingEnabled),
     plan: s?.voiceAiPlan ?? "business",
     credits: s?.voiceAiCredits ?? 100,
   });
@@ -3809,16 +3815,13 @@ router.post("/whatsapp/calling/start", asyncRoute(async (req, res) => {
   if (!sdp) return res.status(400).json({ error: "Missing WebRTC offer." });
   const contact = await callingContact(companyId, contactId);
   if (!contact?.phone) return res.status(400).json({ error: "Open a contact with a phone number." });
-  const { waAccountForCompany, graphCall, callingStatusForAccount, logCallMessage } = await import("../lib/waCalling.js");
+  const { waAccountForCompany, graphCall, ensureCallingReady, logCallMessage } = await import("../lib/waCalling.js");
   const wa = await waAccountForCompany(companyId);
-  if (!wa?.phoneNumberId || !wa.accessToken) {
-    return res.status(400).json({ error: "Connect WhatsApp first (Dashboard → WhatsApp)." });
-  }
-  const status = await callingStatusForAccount(wa);
-  if (!status.callingEnabled) {
-    return res.status(400).json({
-      error: "Turn on WhatsApp Calling first (Automation → WhatsApp Calling).",
-    });
+  // Same as superadmin inbox: enable calling automatically, then dial — no Automation toggle.
+  try {
+    await ensureCallingReady(wa, { companyId, businessName: req.company?.name });
+  } catch (e) {
+    return res.status(e.status || 400).json({ error: e.message, meta: e.meta || null });
   }
   const to = String(contact.phone).replace(/\D/g, "");
   const data = await graphCall(wa.phoneNumberId, wa.accessToken, {

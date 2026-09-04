@@ -164,6 +164,58 @@ export async function callingStatusForAccount(wa) {
   };
 }
 
+/**
+ * Like superadmin inbox: calling should work from Inbox without a manual
+ * Automation → Enable step. Turn Meta calling on when needed, then return status.
+ */
+export async function ensureCallingReady(wa, { companyId, businessName } = {}) {
+  if (!wa?.phoneNumberId || !wa?.accessToken) {
+    const err = new Error("Connect WhatsApp first (Dashboard → WhatsApp).");
+    err.status = 400;
+    throw err;
+  }
+  let status = await callingStatusForAccount(wa);
+  if (status.callingEnabled) {
+    if (companyId) {
+      await prisma.setting.upsert({
+        where: { companyId },
+        update: { voiceAiEnabled: true },
+        create: { companyId, businessName: businessName || "Nexwapi", voiceAiEnabled: true, voiceAiPlan: "business" },
+      }).catch(() => {});
+    }
+    return status;
+  }
+  // Soft gate: try enable even if tier looks low — Meta is source of truth.
+  try {
+    await setCallingEnabled(wa.phoneNumberId, wa.accessToken, true);
+    await ensureCallsWebhookSubscription().catch(() => null);
+  } catch (e) {
+    const msg = e?.message || "Could not enable WhatsApp Calling on this number.";
+    const err = new Error(
+      status.eligible === false
+        ? "Meta has not unlocked WhatsApp Calling on this number yet (needs ~2,000 unique customers / day messaging limit)."
+        : msg
+    );
+    err.status = e?.status || 400;
+    err.meta = e?.meta || null;
+    throw err;
+  }
+  if (companyId) {
+    await prisma.setting.upsert({
+      where: { companyId },
+      update: { voiceAiEnabled: true, voiceAiPlan: "business" },
+      create: { companyId, businessName: businessName || "Nexwapi", voiceAiEnabled: true, voiceAiPlan: "business" },
+    }).catch(() => {});
+  }
+  status = await callingStatusForAccount(wa);
+  if (!status.callingEnabled) {
+    const err = new Error("WhatsApp Calling could not be turned on for this number. Check Meta Business Manager.");
+    err.status = 400;
+    throw err;
+  }
+  return status;
+}
+
 export async function waAccountForCompany(companyId) {
   if (!companyId) return null;
   return (

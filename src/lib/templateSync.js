@@ -127,55 +127,58 @@ export async function syncCompanyTemplates(companyId) {
     throw e;
   }
 
-  const localRows = await prisma.template.findMany({
-    where: { companyId, deletedAt: null },
-  });
+  // Include soft-deleted so we can restore instead of Unique constraint fail on create.
+  const localRows = await prisma.template.findMany({ where: { companyId } });
+  const byName = new Map(localRows.map((t) => [String(t.name || "").toLowerCase(), t]));
 
   for (const mt of metaTemplates || []) {
     const status = normalizeTemplateStatus(mt.status);
     if (!mt.name || !status) continue;
-    const existing =
-      localRows.find((t) => t.name.toLowerCase() === String(mt.name).toLowerCase()) ||
-      null;
-    if (existing) {
-      const prev = existing.status;
-      const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
-      const body = bodyComp?.text || existing.body;
-      const headerFields = headerFieldsFromMeta(mt);
-      await prisma.template.update({
-        where: { id: existing.id },
-        data: {
-          status,
-          category: cap(mt.category) || existing.category,
-          language: mt.language || existing.language,
-          body,
-        },
-      });
-      if (Object.keys(headerFields).length) {
-        await patchTemplateHeaderMedia(existing.id, headerFields).catch((e) => {
-          console.warn("[templateSync] header patch", existing.name, e?.message || e);
-        });
-      }
-      if (prev !== status && /approv|reject/i.test(status)) {
-        notifyOwner(companyId, mt.name, status).catch(() => {});
-      }
-    } else {
-      const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
-      const headerFields = headerFieldsFromMeta(mt);
-      const created = await prisma.template.create({
-        data: {
+    const nameKey = String(mt.name).toLowerCase();
+    const existing = byName.get(nameKey) || null;
+    const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
+    const body = bodyComp?.text || existing?.body || "(synced from Meta)";
+    const headerFields = headerFieldsFromMeta(mt);
+    const category = cap(mt.category) || existing?.category || "Utility";
+    const language = mt.language || existing?.language || "en";
+
+    try {
+      const row = await prisma.template.upsert({
+        where: { companyId_name: { companyId, name: mt.name } },
+        create: {
           companyId,
           name: mt.name,
           status,
-          category: cap(mt.category) || "Utility",
-          language: mt.language || "en",
-          body: bodyComp?.text || "(synced from Meta)",
+          category,
+          language,
+          body,
+        },
+        update: {
+          status,
+          category,
+          language,
+          body,
+          deletedAt: null,
         },
       });
+      byName.set(nameKey, row);
       if (Object.keys(headerFields).length) {
-        await patchTemplateHeaderMedia(created.id, headerFields).catch((e) => {
+        await patchTemplateHeaderMedia(row.id, headerFields).catch((e) => {
           console.warn("[templateSync] header patch", mt.name, e?.message || e);
         });
+      }
+      if (existing && existing.status !== status && /approv|reject/i.test(status)) {
+        notifyOwner(companyId, mt.name, status).catch(() => {});
+      }
+    } catch (e) {
+      // Fallback if unique name casing differs (Meta name vs local casing)
+      if (existing?.id) {
+        await prisma.template.update({
+          where: { id: existing.id },
+          data: { status, category, language, body, deletedAt: null },
+        }).catch((err) => console.warn("[templateSync] update", mt.name, err?.message || err));
+      } else {
+        console.warn("[templateSync] upsert", mt.name, e?.message || e);
       }
     }
   }

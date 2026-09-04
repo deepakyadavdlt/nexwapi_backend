@@ -3275,7 +3275,7 @@ router.post("/templates/sync", async (req, res) => {
         all = await syncCompanyTemplates(companyId);
       } catch (e) {
         console.error("[templates] sync failed:", e?.message || e);
-        syncWarning = e?.message || "Meta sync failed";
+        syncWarning = String(e?.message || "Meta sync failed").replace(/[\r\n\t]+/g, " ").slice(0, 240);
         all = await prisma.template.findMany({
           where: { companyId, deletedAt: null },
           orderBy: { createdAt: "desc" },
@@ -3283,11 +3283,20 @@ router.post("/templates/sync", async (req, res) => {
       }
     }
     const enriched = await enrichTemplatesWithHeaders(all);
-    if (syncWarning) res.setHeader("X-Sync-Warning", syncWarning.slice(0, 240));
-    res.json(enriched.map(serializeTemplateRow));
+    const templates = enriched.map(serializeTemplateRow);
+    // Header must be single-line ASCII-ish; also return warning in JSON for the client.
+    if (syncWarning) {
+      const safe = String(syncWarning).replace(/[^\x20-\x7E]/g, " ").slice(0, 240);
+      try {
+        res.setHeader("X-Sync-Warning", safe);
+      } catch {
+        /* ignore invalid header */
+      }
+    }
+    res.json({ templates, warning: syncWarning || null });
   } catch (e) {
     console.error("[templates] sync failed:", e?.message || e);
-    res.status(502).json({ error: e.message || "Sync failed" });
+    res.status(502).json({ error: String(e?.message || "Sync failed").replace(/[\r\n]+/g, " ").slice(0, 300) });
   }
 });
 

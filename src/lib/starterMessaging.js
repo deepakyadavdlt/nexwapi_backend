@@ -71,8 +71,9 @@ export async function ensureStarterMessaging(companyId) {
         console.warn("[starter] template submit:", e.message);
       }
     }
-    await prisma.template.create({
-      data: {
+    await prisma.template.upsert({
+      where: { companyId_name: { companyId, name: "hello_offer" } },
+      create: {
         companyId,
         name: "hello_offer",
         category: "Utility",
@@ -80,6 +81,7 @@ export async function ensureStarterMessaging(companyId) {
         body: HELLO_BODY,
         status: metaError ? "pending" : status,
       },
+      update: {},
     }).catch(() => {});
     created.template = true;
   }

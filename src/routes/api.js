@@ -597,6 +597,61 @@ async function assignInvoiceNo(paymentId) {
   return invoiceNo;
 }
 
+/**
+ * Atomically mark payment paid. Returns false if already paid/claimed (prevents double credit
+ * when Cashfree webhook and /billing/verify race).
+ */
+async function claimPaymentPaid(paymentId, { cfPaymentId } = {}) {
+  const claimed = await prisma.payment.updateMany({
+    where: { id: paymentId, status: { not: "paid" } },
+    data: {
+      status: "paid",
+      paidAt: new Date(),
+      ...(cfPaymentId ? { razorpayPaymentId: String(cfPaymentId) } : {}),
+    },
+  });
+  return claimed.count === 1;
+}
+
+async function fulfillPaidPayment(payment, { orderId, userId, via } = {}) {
+  if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
+  emailInvoiceFor(payment);
+  sendPaymentWhatsApp(payment).catch((e) => console.warn("[wa:payment]", e.message));
+
+  if (!payment.companyId) return null;
+
+  if (payment.type === "wallet_recharge") {
+    const pricing = await getPlatformPricing();
+    const credits = payment.creditsAdded || creditsFromPaise(payment.amount, pricing.creditsPerRupee);
+    const r = await creditWallet({
+      companyId: payment.companyId,
+      amountPaise: payment.amount,
+      credits,
+      reason: "recharge",
+      createdBy: userId || null,
+      meta: { orderId, via: via || "verify" },
+    });
+    await prisma.payment.update({ where: { id: payment.id }, data: { creditsAdded: credits } }).catch(() => {});
+    await prisma.company.update({
+      where: { id: payment.companyId },
+      data: { status: "ACTIVE" },
+    }).catch(() => {});
+    return r.company;
+  }
+
+  const planKey = normalizePlan(payment.plan);
+  await prisma.company.update({
+    where: { id: payment.companyId },
+    data: { plan: planKey, status: "ACTIVE", upgradedAt: new Date(), trialEndsAt: null },
+  });
+  await prisma.subscription.update({
+    where: { companyId: payment.companyId },
+    data: { plan: planKey, status: "active", activatedAt: new Date(), trialEndsAt: null },
+  }).catch(() => {});
+  await applyPlanCredits(payment.companyId, planKey, userId).catch(() => {});
+  return prisma.company.findUnique({ where: { id: payment.companyId } });
+}
+
 async function emailInvoiceFor(payment) {
   try {
     const fresh = await prisma.payment.findUnique({ where: { id: payment.id } });
@@ -715,52 +770,20 @@ router.post("/billing/verify", requireAuth, attachCompany, async (req, res) => {
     return res.json({ ok: true, alreadyProcessed: true, user: publicCompanyUser(user, company) });
   }
 
-  // Get cf_payment_id from payments list
   let cfPaymentId = null;
   try {
     const payments = await cfFetchOrderPayments(order_id);
     cfPaymentId = payments[0]?.cf_payment_id ? String(payments[0].cf_payment_id) : null;
   } catch {}
 
-  await prisma.payment.update({
-    where: { id: payment.id },
-    data: { status: "paid", razorpayPaymentId: cfPaymentId, paidAt: new Date() },
-  });
-  if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
-  emailInvoiceFor(payment);
-  sendPaymentWhatsApp(payment).catch((e) => console.warn("[wa:payment]", e.message));
-
-  let company;
-  if (payment.type === "wallet_recharge") {
-    const pricing = await getPlatformPricing();
-    const credits = payment.creditsAdded || creditsFromPaise(payment.amount, pricing.creditsPerRupee);
-    const r = await creditWallet({
-      companyId,
-      amountPaise: payment.amount,
-      credits,
-      reason: "recharge",
-      createdBy: req.user.id,
-      meta: { orderId: order_id },
-    });
-    company = r.company;
-    if (company.status === "EXPIRED" || company.status === "SUSPENDED") {
-      company = await prisma.company.update({ where: { id: companyId }, data: { status: "ACTIVE" } });
-    }
-    await prisma.payment.update({ where: { id: payment.id }, data: { creditsAdded: credits } });
-  } else {
-    const planKey = normalizePlan(payment.plan);
-    company = await prisma.company.update({
-      where: { id: companyId },
-      data: { plan: planKey, status: "ACTIVE", upgradedAt: new Date(), trialEndsAt: null },
-    });
-    await prisma.subscription.update({
-      where: { companyId },
-      data: { plan: planKey, status: "active", activatedAt: new Date(), trialEndsAt: null },
-    }).catch(() => {});
-    await applyPlanCredits(companyId, planKey, req.user.id).catch(() => {});
-    company = await prisma.company.findUnique({ where: { id: companyId } });
+  const claimed = await claimPaymentPaid(payment.id, { cfPaymentId });
+  if (!claimed) {
+    const company = await prisma.company.findUnique({ where: { id: companyId } });
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    return res.json({ ok: true, alreadyProcessed: true, user: publicCompanyUser(user, company) });
   }
 
+  const company = await fulfillPaidPayment(payment, { orderId: order_id, userId: req.user.id, via: "verify" });
   const user = await prisma.user.findUnique({ where: { id: req.user.id } });
   notify({
     audience: "client",
@@ -868,47 +891,15 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
     if (type === "PAYMENT_SUCCESS_WEBHOOK" || paymentStatus === "SUCCESS") {
       if (!orderId) return;
       const payment = await prisma.payment.findFirst({ where: { razorpayOrderId: orderId } });
-      if (!payment || payment.status === "paid") return; // already handled
+      if (!payment || payment.status === "paid") return;
 
-      await prisma.payment.update({
-        where: { id: payment.id },
-        data: { status: "paid", razorpayPaymentId: cfPaymentId ? String(cfPaymentId) : null, paidAt: new Date() },
+      const claimed = await claimPaymentPaid(payment.id, {
+        cfPaymentId: cfPaymentId ? String(cfPaymentId) : null,
       });
-      if (!payment.invoiceNo) await assignInvoiceNo(payment.id);
-      emailInvoiceFor(payment);
-      sendPaymentWhatsApp(payment).catch((e) => console.warn("[wa:payment]", e.message));
+      if (!claimed) return; // verify already fulfilled — no double credit
 
-      if (payment.companyId) {
-        if (payment.type === "wallet_recharge") {
-          const { creditWallet, creditsFromPaise, getPlatformPricing } = await import("../lib/wallet.js");
-          const pricing = await getPlatformPricing();
-          const credits = payment.creditsAdded || creditsFromPaise(payment.amount, pricing.creditsPerRupee);
-          await creditWallet({
-            companyId: payment.companyId,
-            amountPaise: payment.amount,
-            credits,
-            reason: "recharge",
-            meta: { orderId, via: "webhook" },
-          });
-          await prisma.company.update({
-            where: { id: payment.companyId },
-            data: { status: "ACTIVE" },
-          }).catch(() => {});
-        } else {
-          const planKey = normalizePlan(payment.plan);
-          await prisma.company.update({
-            where: { id: payment.companyId },
-            data: { plan: planKey, status: "ACTIVE", upgradedAt: new Date(), trialEndsAt: null },
-          });
-          await prisma.subscription.update({
-            where: { companyId: payment.companyId },
-            data: { plan: planKey, status: "active", activatedAt: new Date(), trialEndsAt: null },
-          }).catch(() => {});
-          const { applyPlanCredits } = await import("../lib/wallet.js");
-          await applyPlanCredits(payment.companyId, planKey).catch(() => {});
-        }
-        console.log("[billing] webhook paid", payment.type, payment.companyId, "order", orderId);
-      }
+      await fulfillPaidPayment(payment, { orderId, via: "webhook" });
+      console.log("[billing] webhook paid", payment.type, payment.companyId, "order", orderId);
     } else if (type === "PAYMENT_FAILED_WEBHOOK" || paymentStatus === "FAILED") {
       if (orderId) await prisma.payment.updateMany({ where: { razorpayOrderId: orderId }, data: { status: "failed" } }).catch(() => {});
     }

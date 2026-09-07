@@ -10,22 +10,39 @@ async function sendAutoText({ companyId, contact, text, automationSource }) {
   const company = await prisma.company.findUnique({ where: { id: companyId } });
   const { assertCompanyOutbound } = await import("./tenant.js");
   assertCompanyOutbound(company);
+  const { chargeSessionOutbound, refundCredits } = await import("./wallet.js");
+  let charge = { charged: false, creditsNeeded: 0 };
+  try {
+    charge = await chargeSessionOutbound(companyId, { to: contact.phone, automationSource });
+  } catch (e) {
+    throw e;
+  }
   const creds = await getEffectiveCreds(companyId);
   assertLiveCreds(creds);
-  const r = await sendText(contact.phone, text, creds);
-  await prisma.message.create({
-    data: {
-      companyId,
-      contactId: contact.id,
-      waId: r.messages?.[0]?.id || null,
-      direction: "out",
-      type: "text",
-      text,
-      status: "sent",
-      automationSource,
-    },
-  });
-  return r;
+  try {
+    const r = await sendText(contact.phone, text, creds);
+    await prisma.message.create({
+      data: {
+        companyId,
+        contactId: contact.id,
+        waId: r.messages?.[0]?.id || null,
+        direction: "out",
+        type: "text",
+        text,
+        status: "sent",
+        automationSource,
+      },
+    });
+    return r;
+  } catch (e) {
+    if (charge.charged) {
+      await refundCredits(companyId, charge.creditsNeeded, "message_refund", {
+        to: contact.phone,
+        reason: e.message,
+      }).catch(() => {});
+    }
+    throw e;
+  }
 }
 
 /** Interakt: welcome on first message OR returning customer after 24h+ gap */

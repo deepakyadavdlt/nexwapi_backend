@@ -50,9 +50,24 @@ export async function runDelayedReplies() {
         const company = await prisma.company.findUnique({ where: { id: s.companyId } });
         const { assertCompanyOutbound } = await import("./tenant.js");
         assertCompanyOutbound(company);
+        const { chargeSessionOutbound, refundCredits } = await import("./wallet.js");
+        let charge = { charged: false, creditsNeeded: 0 };
+        try {
+          charge = await chargeSessionOutbound(s.companyId, { to: contact.phone, channel: "delayed" });
+        } catch {
+          continue;
+        }
         const creds = await getEffectiveCreds(s.companyId);
         assertLiveCreds(creds);
-        const r = await sendText(contact.phone, s.delayedMessage, creds);
+        let r;
+        try {
+          r = await sendText(contact.phone, s.delayedMessage, creds);
+        } catch (e) {
+          if (charge.charged) {
+            await refundCredits(s.companyId, charge.creditsNeeded, "message_refund", { to: contact.phone }).catch(() => {});
+          }
+          throw e;
+        }
         await prisma.message.create({
           data: {
             companyId: s.companyId,

@@ -11,7 +11,7 @@ import {
   sendText, sendTemplate, sendTemplateWithParams, sendResolvedTemplate, createTemplate, listTemplates,
   uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getEffectiveCreds, assertLiveCreds, assertTenantOutbound,
 } from "../lib/whatsappService.js";
-import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits, templateChargeCredits } from "../lib/wallet.js";
+import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits, templateChargeCredits, chargeSessionOutbound } from "../lib/wallet.js";
 import {
   metaSignupConfig, exchangeEmbeddedSignupCode, exchangeForLongLivedToken,
   fetchPhoneNumbers, subscribeWabaWebhooks, fetchPhoneDetails, fetchSharedWabas,
@@ -639,6 +639,8 @@ async function fulfillPaidPayment(payment, { orderId, userId, via, transactionId
     await prisma.payment.update({ where: { id: payment.id }, data: { creditsAdded: credits } }).catch(() => {});
     await prisma.company.update({
       where: { id: payment.companyId },
+      // Wallet recharge = pay-as-you-go credits. Keep/restore ACTIVE so outbound works;
+      // do not invent a paid plan — subscribe separately for seats/API.
       data: { status: "ACTIVE" },
     }).catch(() => {});
     return r.company;
@@ -980,6 +982,8 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
     assertCompanyOutbound(auth.company);
     if (template) {
       charge = await templateChargeCredits(auth.companyId, template, { to, channel: "api_key" });
+    } else if (text) {
+      charge = await chargeSessionOutbound(auth.companyId, { to, channel: "api_key" });
     }
   } catch (e) {
     return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
@@ -1505,6 +1509,14 @@ router.post("/conversations/:id/media", requireNotSuspended, upload.single("file
   fs.renameSync(tmpPath, path.join(UPLOAD_DIR, storedName));
   const publicUrl = publicUploadUrl(req, storedName);
   const caption = req.body?.caption || "";
+
+  let charge = { charged: false, creditsNeeded: 0 };
+  try {
+    charge = await chargeSessionOutbound(companyId, { to: contact.phone, contactId: contact.id, media: true });
+  } catch (e) {
+    return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
+  }
+
   const creds = await getEffectiveCreds(companyId);
 
   let waId = null;
@@ -1518,11 +1530,20 @@ router.post("/conversations/:id/media", requireNotSuspended, upload.single("file
       creds
     );
     if (!mediaId) {
+      if (charge.charged) {
+        await refundCredits(companyId, charge.creditsNeeded, "message_refund", { to: contact.phone }).catch(() => {});
+      }
       return res.status(502).json({ error: "WhatsApp media upload returned no id. Check Meta credentials." });
     }
     const r = await sendMediaById(contact.phone, waType, mediaId, { filename: originalname, caption }, creds);
     waId = r.messages?.[0]?.id || null;
   } catch (e) {
+    if (charge.charged) {
+      await refundCredits(companyId, charge.creditsNeeded, "message_refund", {
+        to: contact.phone,
+        reason: e.message,
+      }).catch(() => {});
+    }
     const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" || e.code === "WA_NOT_CONNECTED" ? 400 : 502);
     return res.status(status).json({ error: e.message || "Upload failed", code: e.code || undefined });
   }
@@ -2797,6 +2818,14 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
   if (!text) return res.status(400).json({ error: "text required" });
   const companyId = companyIdOf(req);
   const sendTextBody = outboundTextWithAgent(req, text);
+
+  let charge = { charged: false, creditsNeeded: 0 };
+  try {
+    charge = await chargeSessionOutbound(companyId, { to: contact.phone, contactId: contact.id });
+  } catch (e) {
+    return res.status(e.status || 402).json({ error: e.message, code: e.code || "NO_CREDITS" });
+  }
+
   const creds = await getEffectiveCreds(companyId);
   let waId = null;
   try {
@@ -2804,6 +2833,12 @@ router.post("/conversations/:id/messages", requireNotSuspended, async (req, res)
     const result = await sendText(contact.phone, sendTextBody, creds);
     waId = result.messages?.[0]?.id || null;
   } catch (e) {
+    if (charge.charged) {
+      await refundCredits(companyId, charge.creditsNeeded, "message_refund", {
+        to: contact.phone,
+        reason: e.message,
+      }).catch(() => {});
+    }
     const status = e.status || (e.code === "WA_CREDS_INCOMPLETE" ? 400 : 502);
     return res.status(status).json({ error: e.message, code: e.code || undefined });
   }
@@ -4676,9 +4711,14 @@ router.get("/wallet", async (req, res) => {
     walletBalancePaise: company.walletBalancePaise,
     messageCredits: company.messageCredits,
     freeAccess: company.freeAccess,
+    plan: company.plan,
+    status: company.status,
     creditsPerRupee: pricing.creditsPerRupee,
     creditPerOutbound: pricing.creditPerOutbound,
     creditPerInbound: pricing.creditPerInbound,
+    trialCredits: pricing.trialCredits,
+    starterCredits: pricing.starterCredits,
+    growthCredits: pricing.growthCredits,
   });
 });
 

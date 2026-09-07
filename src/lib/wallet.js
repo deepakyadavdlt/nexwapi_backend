@@ -141,16 +141,27 @@ export async function spendCredits(companyId, creditsNeeded = 1, reason = "messa
   const company = await prisma.company.findUnique({ where: { id: companyId } });
   if (!company) throw Object.assign(new Error("Company not found"), { status: 404 });
   if (company.freeAccess) {
-    // Free access from Super Admin — no deduction, but log usage as 0-cost
     return { company, skipped: true };
   }
+  const needed = Math.max(1, Math.floor(Number(creditsNeeded) || 1));
+  const pricing = await getPlatformPricing();
+  const cpr = Math.max(1, Number(pricing.creditsPerRupee) || 10);
+  const paisePerCredit = Math.max(1, Math.round(100 / cpr));
+  const paiseNeeded = needed * paisePerCredit;
+
   const updated = await prisma.$transaction(async (tx) => {
+    const current = await tx.company.findUnique({ where: { id: companyId } });
+    if (!current) throw Object.assign(new Error("Company not found"), { status: 404 });
+    const paiseDebit = Math.min(paiseNeeded, Math.max(0, current.walletBalancePaise || 0));
     const debit = await tx.company.updateMany({
-      where: { id: companyId, messageCredits: { gte: creditsNeeded } },
-      data: { messageCredits: { decrement: creditsNeeded } },
+      where: { id: companyId, messageCredits: { gte: needed } },
+      data: {
+        messageCredits: { decrement: needed },
+        ...(paiseDebit > 0 ? { walletBalancePaise: { decrement: paiseDebit } } : {}),
+      },
     });
     if (!debit.count) {
-      const err = new Error("Insufficient message credits. Please recharge your wallet.");
+      const err = new Error("Insufficient message credits. Please recharge your wallet or subscribe to a plan.");
       err.status = 402;
       err.code = "NO_CREDITS";
       throw err;
@@ -161,8 +172,8 @@ export async function spendCredits(companyId, creditsNeeded = 1, reason = "messa
         companyId,
         type: "debit",
         reason,
-        amountPaise: 0,
-        creditsDelta: -creditsNeeded,
+        amountPaise: paiseDebit ? -paiseDebit : 0,
+        creditsDelta: -needed,
         balanceAfter: next.walletBalancePaise,
         creditsAfter: next.messageCredits,
         meta: meta || undefined,
@@ -170,7 +181,18 @@ export async function spendCredits(companyId, creditsNeeded = 1, reason = "messa
     });
     return next;
   });
-  return { company: updated, skipped: false };
+  return { company: updated, skipped: false, creditsNeeded: needed };
+}
+
+/** Charge platform credits for a session text/media outbound (inbox / API text). */
+export async function chargeSessionOutbound(companyId, extraMeta = {}) {
+  const pricing = await getPlatformPricing();
+  const creditsNeeded = pricing.creditPerOutbound || 1;
+  const r = await spendCredits(companyId, creditsNeeded, "message_send", {
+    channel: "session",
+    ...extraMeta,
+  });
+  return { charged: !r.skipped, creditsNeeded: r.skipped ? 0 : creditsNeeded };
 }
 
 /** Refund credits when outbound send fails after debit reservation. */

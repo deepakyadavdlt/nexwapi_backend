@@ -27,14 +27,31 @@ async function outboundChargeAndSend(companyId, to, sendFn, meta = {}) {
   const company = await prisma.company.findUnique({ where: { id: companyId } });
   const { assertCompanyOutbound } = await import("../lib/tenant.js");
   assertCompanyOutbound(company);
+  const { chargeSessionOutbound, refundCredits } = await import("../lib/wallet.js");
+  let charge = { charged: false, creditsNeeded: 0 };
+  try {
+    charge = await chargeSessionOutbound(companyId, { to, ...meta });
+  } catch (e) {
+    throw e;
+  }
   const creds = await getCompanyCreds(companyId);
   assertLiveCreds(creds);
   if (!creds) {
+    if (charge.charged) {
+      await refundCredits(companyId, charge.creditsNeeded, "message_refund", { to }).catch(() => {});
+    }
     const err = new Error("WhatsApp is not connected");
     err.status = 400;
     throw err;
   }
-  return sendFn(creds);
+  try {
+    return await sendFn(creds);
+  } catch (e) {
+    if (charge.charged) {
+      await refundCredits(companyId, charge.creditsNeeded, "message_refund", { to, reason: e.message }).catch(() => {});
+    }
+    throw e;
+  }
 }
 
 // Download an inbound media file and return a servable local URL.

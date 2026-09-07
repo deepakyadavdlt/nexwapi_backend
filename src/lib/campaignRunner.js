@@ -48,16 +48,11 @@ export async function runCampaign(id) {
 
   const companyId = campaign.companyId;
   const company = await prisma.company.findUnique({ where: { id: companyId } });
-  if (company?.status === "SUSPENDED") {
-    throw new Error("Account is suspended");
-  }
-  // Pay-as-you-go: allow EXPIRED if freeAccess OR has message credits
-  if (
-    !company?.freeAccess &&
-    (company?.status === "EXPIRED" || company?.plan === "expired") &&
-    (company?.messageCredits || 0) < 1
-  ) {
-    throw new Error("Plan expired — add wallet credits or upgrade");
+  const { assertCompanyOutbound } = await import("./tenant.js");
+  try {
+    assertCompanyOutbound(company);
+  } catch (e) {
+    throw new Error(e.message || "Plan expired — add wallet credits or upgrade");
   }
 
   const { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } = await import("./wallet.js");

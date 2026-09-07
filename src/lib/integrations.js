@@ -314,6 +314,9 @@ async function upsertContactFromLead(companyId, { name, phone, email, tags = [],
 async function maybeWelcomeWhatsApp(companyId, contact, message) {
   if (!message || !contact?.phone) return;
   try {
+    const company = await prisma.company.findUnique({ where: { id: companyId } });
+    const { assertCompanyOutbound } = await import("./tenant.js");
+    assertCompanyOutbound(company);
     const creds = await getEffectiveCreds(companyId);
     assertLiveCreds(creds);
     await sendText(contact.phone, message, creds);

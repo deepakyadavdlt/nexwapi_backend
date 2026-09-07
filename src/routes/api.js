@@ -976,6 +976,8 @@ router.post("/v1/messages", apiMessageLimiter, async (req, res) => {
 
   let charge = { charged: false, creditsNeeded: 0 };
   try {
+    const { assertCompanyOutbound } = await import("../lib/tenant.js");
+    assertCompanyOutbound(auth.company);
     if (template) {
       charge = await templateChargeCredits(auth.companyId, template, { to, channel: "api_key" });
     }

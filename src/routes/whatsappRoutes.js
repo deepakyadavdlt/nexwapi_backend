@@ -24,6 +24,9 @@ const UPLOAD_DIR = path.resolve("uploads");
 const EXT = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf", "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3" };
 
 async function outboundChargeAndSend(companyId, to, sendFn, meta = {}) {
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  const { assertCompanyOutbound } = await import("../lib/tenant.js");
+  assertCompanyOutbound(company);
   const creds = await getCompanyCreds(companyId);
   assertLiveCreds(creds);
   if (!creds) {

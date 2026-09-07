@@ -7,6 +7,9 @@ const WELCOME_GAP_MS = 24 * 60 * 60 * 1000;
 const AWAY_COOLDOWN_MS = 60 * 60 * 1000;
 
 async function sendAutoText({ companyId, contact, text, automationSource }) {
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  const { assertCompanyOutbound } = await import("./tenant.js");
+  assertCompanyOutbound(company);
   const creds = await getEffectiveCreds(companyId);
   assertLiveCreds(creds);
   const r = await sendText(contact.phone, text, creds);

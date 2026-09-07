@@ -82,6 +82,9 @@ export async function maybeAiAgentReply(contact, message, companyId) {
   if (!s?.aiAgentEnabled) return false;
   const reply = composeAgentReply(message, s);
   try {
+    const company = await prisma.company.findUnique({ where: { id: companyId } });
+    const { assertCompanyOutbound } = await import("./tenant.js");
+    assertCompanyOutbound(company);
     const creds = await getEffectiveCreds(companyId);
     assertLiveCreds(creds);
     const r = await sendText(contact.phone, reply, creds);

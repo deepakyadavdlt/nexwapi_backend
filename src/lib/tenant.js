@@ -90,50 +90,85 @@ export async function attachCompany(req, _res, next) {
   }
 }
 
-export function requireActiveCompany(req, res, next) {
-  if (isSuperAdmin(req.user) && !req.impersonateCompanyId) return next();
-  const c = req.company;
-  if (!c) return res.status(403).json({ error: "No company linked to this account" });
-  if (c.partner && c.partner.status !== "ACTIVE") {
-    return res.status(403).json({
-      error: "This workspace is temporarily unavailable. Contact your provider.",
-      code: "PARTNER_INACTIVE",
-    });
+/**
+ * Outbound allowed when:
+ * - freeAccess, or
+ * - trial / paid plan still active, or
+ * - trial expired but wallet has messageCredits (pay-as-you-go).
+ */
+export function companyOutboundGate(company) {
+  if (!company) {
+    return { ok: false, status: 403, code: "NO_COMPANY", message: "No company linked to this account" };
   }
-  if (c.freeAccess) return next(); // Super Admin free grant
-  if (c.status === "SUSPENDED") {
-    if (req.allowBilling) return next();
-    return res.status(403).json({
-      error: "Account suspended",
+  if (company.partner && company.partner.status !== "ACTIVE") {
+    return {
+      ok: false,
+      status: 403,
+      code: "PARTNER_INACTIVE",
+      message: "This workspace is temporarily unavailable. Contact your provider.",
+    };
+  }
+  if (company.freeAccess) return { ok: true };
+  if (company.status === "SUSPENDED") {
+    return {
+      ok: false,
+      status: 403,
       code: "SUSPENDED",
       message: "Your account is suspended. Please upgrade or contact support.",
-    });
+    };
   }
-  if (c.status === "EXPIRED" || c.plan === "expired") {
-    if (req.allowBilling) return next();
-    return res.status(402).json({
-      error: "Trial ended",
+  const plan = normalizePlan(company.plan);
+  const trialPast =
+    company.status === "TRIAL" &&
+    company.trialEndsAt &&
+    new Date(company.trialEndsAt).getTime() < Date.now();
+  const expired = company.status === "EXPIRED" || plan === "expired" || trialPast;
+  if (expired && (Number(company.messageCredits) || 0) < 1) {
+    return {
+      ok: false,
+      status: 402,
       code: "TRIAL_EXPIRED",
-      message: "Your free trial has ended. Please upgrade to continue.",
-    });
+      message: "Your free trial has ended. Recharge your wallet or subscribe to continue sending messages, templates, and campaigns.",
+    };
   }
-  next();
+  return { ok: true, expired, payg: Boolean(expired) };
 }
 
-/** Block messaging features when suspended (billing stays open). */
+export function assertCompanyOutbound(company) {
+  const gate = companyOutboundGate(company);
+  if (gate.ok) return gate;
+  const err = new Error(gate.message);
+  err.status = gate.status;
+  err.code = gate.code;
+  throw err;
+}
+
+export function requireActiveCompany(req, res, next) {
+  if (isSuperAdmin(req.user) && !req.impersonateCompanyId) return next();
+  if (req.allowBilling) return next();
+  const gate = companyOutboundGate(req.company);
+  if (gate.ok) return next();
+  return res.status(gate.status).json({
+    error: gate.message,
+    code: gate.code,
+    message: gate.message,
+  });
+}
+
+/** Block messaging when suspended or trial ended with no wallet credits / subscription. */
 export function requireNotSuspended(req, res, next) {
   if (isSuperAdmin(req.user) && !req.impersonateCompanyId) return next();
-  if (req.company?.partner && req.company.partner.status !== "ACTIVE") {
-    return res.status(403).json({
-      error: "This workspace is temporarily unavailable. Contact your provider.",
-      code: "PARTNER_INACTIVE",
-    });
-  }
-  if (req.company?.status === "SUSPENDED") {
-    return res.status(403).json({ error: "Account suspended", code: "SUSPENDED" });
-  }
-  next();
+  const gate = companyOutboundGate(req.company);
+  if (gate.ok) return next();
+  return res.status(gate.status).json({
+    error: gate.message,
+    code: gate.code,
+    message: gate.message,
+  });
 }
+
+/** Alias — same gate as requireNotSuspended (outbound / messaging). */
+export const requireOutboundAccess = requireNotSuspended;
 
 export function requireFeature(feature) {
   return (req, res, next) => {
@@ -153,12 +188,27 @@ export function requireFeature(feature) {
 
 export function publicCompanyUser(user, company) {
   const plan = normalizePlan(company?.plan || user?.plan || "trial");
-  const features = planFeatures(plan).features;
   const trialEndsAt = company?.trialEndsAt ? new Date(company.trialEndsAt).getTime() : null;
   const daysLeft = trialEndsAt ? Math.max(0, Math.ceil((trialEndsAt - Date.now()) / 86400000)) : null;
   const expired =
     !company?.freeAccess &&
     (company?.status === "EXPIRED" || plan === "expired" || (company?.status === "TRIAL" && daysLeft === 0));
+  const messageCredits = company?.messageCredits ?? 0;
+  const canOutbound =
+    Boolean(company?.freeAccess) ||
+    !expired ||
+    Number(messageCredits) >= 1;
+  // Pay-as-you-go after trial: unlock messaging features when wallet has credits.
+  let features = { ...planFeatures(plan).features };
+  if (expired && canOutbound) {
+    features = {
+      ...features,
+      inbox: true,
+      campaign: true,
+      chatbot: true,
+      automation: true,
+    };
+  }
   return {
     id: user.id,
     name: user.name,
@@ -176,11 +226,12 @@ export function publicCompanyUser(user, company) {
     trialEndsAt,
     trialDaysLeft: daysLeft,
     trialExpired: expired,
+    canOutbound,
     features,
     agentLimit: planFeatures(plan).agentLimit,
     unlimitedAgents: Boolean(planFeatures(plan).features.unlimitedAgents),
     walletBalancePaise: company?.walletBalancePaise ?? 0,
-    messageCredits: company?.messageCredits ?? 0,
+    messageCredits,
     isSuperAdmin: isSuperAdmin(user),
     isPartner: isPartner(user),
     isPlatformStaff: isSuperAdmin(user) || ((user.role === "ADMIN" || user.role === "Admin") && !user.companyId && !isPartner(user)),

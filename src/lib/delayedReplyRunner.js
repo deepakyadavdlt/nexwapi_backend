@@ -47,6 +47,9 @@ export async function runDelayedReplies() {
       if (replyAfter) continue;
 
       try {
+        const company = await prisma.company.findUnique({ where: { id: s.companyId } });
+        const { assertCompanyOutbound } = await import("./tenant.js");
+        assertCompanyOutbound(company);
         const creds = await getEffectiveCreds(s.companyId);
         assertLiveCreds(creds);
         const r = await sendText(contact.phone, s.delayedMessage, creds);

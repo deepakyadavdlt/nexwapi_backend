@@ -47,6 +47,9 @@ export async function runFlowMaintenance() {
       if (Date.now() - lastOut.at.getTime() < followMs) continue;
 
       try {
+        const company = await prisma.company.findUnique({ where: { id: companyId } });
+        const { assertCompanyOutbound } = await import("./tenant.js");
+        assertCompanyOutbound(company);
         const creds = await getEffectiveCreds(companyId);
         assertLiveCreds(creds);
         const r = await sendText(contact.phone, s.flowFollowUpMessage, creds);

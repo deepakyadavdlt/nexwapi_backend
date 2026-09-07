@@ -54,17 +54,21 @@ export async function requireApiKey(req, res) {
   }
 
   const plan = normalizePlan(apiKey.company?.plan || "trial");
-  if (!hasFeature(plan, "api")) {
+  const company = apiKey.company;
+  const { companyOutboundGate } = await import("./tenant.js");
+  const gate = companyOutboundGate(company);
+  if (!gate.ok) {
+    res.status(gate.status).json({ error: gate.message, code: gate.code, message: gate.message });
+    return null;
+  }
+  // Paid / trial plans need API feature; pay-as-you-go after trial allows API when credits remain.
+  if (!hasFeature(plan, "api") && !gate.payg) {
     res.status(403).json({
       error: "Your plan does not include API access",
       code: "FEATURE_LOCKED",
       feature: "api",
       plan,
     });
-    return null;
-  }
-  if (apiKey.company?.status === "SUSPENDED") {
-    res.status(403).json({ error: "Account suspended", code: "SUSPENDED" });
     return null;
   }
 

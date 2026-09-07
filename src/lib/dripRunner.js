@@ -44,7 +44,12 @@ export async function runDueDrips() {
 
     const companyId = contact.companyId || drip.companyId;
     const company = await prisma.company.findUnique({ where: { id: companyId } });
-    if (company?.status === "SUSPENDED") continue;
+    try {
+      const { assertCompanyOutbound } = await import("./tenant.js");
+      assertCompanyOutbound(company);
+    } catch {
+      continue;
+    }
 
     const creds = await getEffectiveCreds(companyId);
     assertTenantOutbound(creds);

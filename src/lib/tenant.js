@@ -39,8 +39,12 @@ export function publicPartnerBranding(partner) {
 }
 
 export function resolveBranding(user, company) {
+  // Partner agency console uses their own white-label brand.
+  if (isPartner(user) && user?.partner) {
+    return publicPartnerBranding(user.partner);
+  }
   const partner = company?.partner || user?.partner;
-  if (partner && user?.role !== "SUPER_ADMIN" && user?.role !== "PARTNER") {
+  if (partner && !isSuperAdmin(user)) {
     return publicPartnerBranding(partner);
   }
   return { ...DEFAULT_BRANDING };

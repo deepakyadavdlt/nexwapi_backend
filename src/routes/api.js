@@ -197,10 +197,20 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
 
     const { getPlatformPricing } = await import("../lib/wallet.js");
     const pricing = await getPlatformPricing();
-    const partnerSlug = String(req.body?.partnerSlug || v.payload?.partnerSlug || "").trim().toLowerCase();
+    let partnerSlug = String(req.body?.partnerSlug || v.payload?.partnerSlug || "").trim().toLowerCase();
     let partnerId = null;
     let partnerRow = null;
-    if (partnerSlug) {
+    // White-label: resolve partner from request Host when slug not in body
+    if (!partnerSlug) {
+      const host = String(req.headers.host || "").split(":")[0].toLowerCase();
+      const { resolvePartnerByHost } = await import("../lib/branding.js");
+      partnerRow = await resolvePartnerByHost(prisma, { host });
+      if (partnerRow?.status === "ACTIVE") {
+        partnerId = partnerRow.id;
+        partnerSlug = partnerRow.slug;
+      }
+    }
+    if (partnerSlug && !partnerId) {
       partnerRow = await prisma.partner.findUnique({ where: { slug: partnerSlug } });
       if (partnerRow && partnerRow.status === "ACTIVE") partnerId = partnerRow.id;
     }

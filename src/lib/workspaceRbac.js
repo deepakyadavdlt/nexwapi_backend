@@ -54,7 +54,7 @@ export async function resolveWorkspaceRole(req) {
   const companyId = req.companyId || req.user?.companyId;
   const user = req.user;
   if (!user || !companyId) return { role: "Teammate", permissions: defaultPermissionsForRole("Teammate") };
-  if (user.role === "OWNER" || user.role === "SUPER_ADMIN") {
+  if (user.role === "OWNER" || user.role === "SUPER_ADMIN" || user.role === "PARTNER") {
     return { role: "Owner", permissions: defaultPermissionsForRole("Owner") };
   }
   const agent = await prisma.agent.findFirst({

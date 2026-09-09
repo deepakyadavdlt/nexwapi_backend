@@ -12,7 +12,7 @@ export function isPartner(user) {
 
 export function isCompanyAdmin(user) {
   const r = user?.role;
-  return r === "OWNER" || r === "Owner" || r === "ADMIN" || r === "Admin" || isSuperAdmin(user);
+  return r === "OWNER" || r === "Owner" || r === "ADMIN" || r === "Admin" || r === "PARTNER" || isSuperAdmin(user);
 }
 
 export const DEFAULT_BRANDING = {
@@ -65,6 +65,24 @@ export function tenantWhere(req, extra = {}) {
 /** Load company + effective plan/status onto req. */
 export async function attachCompany(req, _res, next) {
   try {
+    // Partner JWT may still have null companyId until re-login — attach home CRM workspace.
+    if (
+      !companyIdOf(req)
+      && req.user?.role === "PARTNER"
+      && req.user?.partnerId
+      && !req.user?.impersonating
+    ) {
+      const partner = await prisma.partner.findUnique({ where: { id: req.user.partnerId } }).catch(() => null);
+      if (partner?.status === "ACTIVE") {
+        const { ensurePartnerWorkspace } = await import("./partnerWorkspace.js");
+        const ws = await ensurePartnerWorkspace(partner, {
+          id: req.user.id,
+          companyId: null,
+          email: req.user.email,
+        }).catch(() => null);
+        if (ws?.id) req.user.companyId = ws.id;
+      }
+    }
     const companyId = companyIdOf(req);
     if (!companyId) {
       req.company = null;

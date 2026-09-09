@@ -39,7 +39,9 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 app.use((req, res, next) => {
   if (req.originalUrl === "/api/whatsapp/webhook") return next();
   if (req.originalUrl === "/api/billing/webhook") return next();
-  return express.json()(req, res, next);
+  // Multipart logo upload — skip JSON body parser so multer owns the stream.
+  if (req.originalUrl?.startsWith("/api/partner/branding/logo")) return next();
+  return express.json({ limit: "2mb" })(req, res, next);
 });
 
 app.use("/uploads", express.static(UPLOAD_DIR)); // media files (images, docs)

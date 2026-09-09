@@ -344,6 +344,10 @@ router.post("/partners", async (req, res) => {
         isActive: true,
       },
     });
+    if (activate) {
+      const { ensurePartnerWorkspace } = await import("../lib/partnerWorkspace.js");
+      await ensurePartnerWorkspace(partner, owner).catch((e) => console.warn("[partner workspace]", e?.message || e));
+    }
     await prisma.auditLog.create({
       data: {
         userId: req.user.id,
@@ -424,6 +428,11 @@ router.post("/partners/:id/activate", async (req, res) => {
   await prisma.auditLog.create({
     data: { userId: req.user.id, action: "partner_activate", entity: "Partner", entityId: partner.id, meta: { paymentNote, paymentAmount } },
   }).catch(() => {});
+  const owner = updated.users?.[0];
+  if (owner) {
+    const { ensurePartnerWorkspace } = await import("../lib/partnerWorkspace.js");
+    await ensurePartnerWorkspace(updated, owner).catch((e) => console.warn("[partner workspace]", e?.message || e));
+  }
   bumpPartnerCorsCache();
   notifyPartnerActivated(updated);
   res.json(serializePartner(updated));
@@ -1029,6 +1038,10 @@ router.post("/partners", async (req, res) => {
       isActive: true,
     },
   });
+  if (activate) {
+    const { ensurePartnerWorkspace } = await import("../lib/partnerWorkspace.js");
+    await ensurePartnerWorkspace(partner, user).catch((e) => console.warn("[partner workspace]", e?.message || e));
+  }
   await prisma.auditLog.create({
     data: {
       userId: req.user.id,
@@ -1086,6 +1099,10 @@ router.post("/partners/:id/activate", async (req, res) => {
   const owner = updated.users[0];
   if (owner && owner.isActive === false) {
     await prisma.user.update({ where: { id: owner.id }, data: { isActive: true } });
+  }
+  if (owner) {
+    const { ensurePartnerWorkspace } = await import("../lib/partnerWorkspace.js");
+    await ensurePartnerWorkspace(updated, owner).catch((e) => console.warn("[partner workspace]", e?.message || e));
   }
   await prisma.auditLog.create({
     data: { userId: req.user.id, action: "partner_activate", entity: "Partner", entityId: partner.id, meta: { paymentNote: updated.paymentNote } },

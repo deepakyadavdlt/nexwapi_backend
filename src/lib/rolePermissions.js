@@ -297,7 +297,7 @@ export function normalizeRolePermMap(role, input) {
 
 export function mapUserToWorkspaceRole(user, agentRow) {
   if (!user) return "Teammate";
-  if (user.role === "OWNER") return "Owner";
+  if (user.role === "OWNER" || user.role === "PARTNER") return "Owner";
   if (agentRow?.role && WORKSPACE_ROLE_IDS.includes(agentRow.role)) return agentRow.role;
   if (user.role === "ADMIN") return "Admin";
   if (agentRow?.role === "Agent") return "Teammate";

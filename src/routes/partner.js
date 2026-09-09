@@ -14,6 +14,7 @@ import { patchAsyncRouter } from "../lib/asyncRouter.js";
 import {
   normalizeHost, normalizeWebsiteUrl, assertUniqueCustomDomain, bumpPartnerCorsCache, publicUploadUrl,
 } from "../lib/partnerDomain.js";
+import { ensurePartnerWorkspace, partnerClientWhere } from "../lib/partnerWorkspace.js";
 
 const router = express.Router();
 patchAsyncRouter(router);
@@ -31,6 +32,7 @@ router.use(async (req, res, next) => {
     if (row.role !== "PARTNER") return res.status(403).json({ error: "Partner access only" });
     req.user.partnerId = row.partnerId;
     req.user.role = row.role;
+    req.user.companyId = row.companyId;
     if (!row.partnerId) return res.status(403).json({ error: "Partner account is not linked" });
     const partner = await prisma.partner.findUnique({ where: { id: row.partnerId } });
     if (!partner) return res.status(403).json({ error: "Partner not found" });
@@ -38,6 +40,11 @@ router.use(async (req, res, next) => {
       return res.status(403).json({ error: "This partner account is suspended. Contact Nexwapi.", code: "PARTNER_SUSPENDED" });
     }
     req.partner = partner;
+    // Full CRM workspace for the agency itself (inbox, wallet, templates…)
+    if (partner.status === "ACTIVE") {
+      const ws = await ensurePartnerWorkspace(partner, { id: req.user.id, companyId: row.companyId, email: req.user.email });
+      if (ws) req.user.companyId = ws.id;
+    }
     next();
   } catch (e) {
     next(e);
@@ -90,7 +97,7 @@ function mapClient(c) {
 }
 
 function partnerWhere(req) {
-  return { partnerId: req.partner.id };
+  return partnerClientWhere(req.partner);
 }
 
 async function scopedCompany(req, id, extraInclude = {}) {
@@ -124,7 +131,9 @@ router.get("/me", async (req, res) => {
   const clientCount = await prisma.company.count({ where: partnerWhere(req) });
   res.json({
     ...serializePartner(req.partner, { clientCount }),
-    user: { id: req.user.id, email: req.user.email, name: req.user.name, role: "PARTNER" },
+    workspaceCompanyId: req.user.companyId || null,
+    crmPath: "/dashboard",
+    user: { id: req.user.id, email: req.user.email, name: req.user.name, role: "PARTNER", companyId: req.user.companyId || null },
   });
 });
 
@@ -515,24 +524,45 @@ router.patch("/branding", async (req, res) => {
 
 const logoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
-router.post("/branding/logo", logoUpload.single("file"), async (req, res) => {
-  const file = req.file;
-  if (!file?.buffer) return res.status(400).json({ error: "Upload a PNG, JPG, or SVG logo (max 2MB)." });
-  const mime = String(file.mimetype || "");
-  const map = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/svg+xml": "svg" };
-  const ext = map[mime];
-  if (!ext) return res.status(400).json({ error: "Logo must be PNG, JPG, WEBP, or SVG." });
-  const dir = path.resolve("uploads/branding");
-  fs.mkdirSync(dir, { recursive: true });
-  const stored = `branding/${req.partner.id}.${ext}`;
-  fs.writeFileSync(path.resolve("uploads", stored), file.buffer);
-  const logoUrl = publicUploadUrl(req, stored);
-  const partner = await prisma.partner.update({
-    where: { id: req.partner.id },
-    data: { logoUrl },
+router.post("/branding/logo", (req, res, next) => {
+  logoUpload.single("file")(req, res, (err) => {
+    if (err) {
+      const msg = err.code === "LIMIT_FILE_SIZE"
+        ? "Logo file is too large (max 2MB). Compress the image and try again."
+        : (err.message || "Upload failed");
+      return res.status(400).json({ error: msg });
+    }
+    next();
   });
-  req.partner = partner;
-  res.json(serializePartner(partner));
+}, async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file?.buffer) return res.status(400).json({ error: "Upload a PNG, JPG, or SVG logo (max 2MB)." });
+    const mime = String(file.mimetype || "");
+    const map = {
+      "image/png": "png",
+      "image/jpeg": "jpg",
+      "image/jpg": "jpg",
+      "image/webp": "webp",
+      "image/svg+xml": "svg",
+    };
+    const ext = map[mime];
+    if (!ext) return res.status(400).json({ error: "Logo must be PNG, JPG, WEBP, or SVG." });
+    const dir = path.resolve("uploads/branding");
+    fs.mkdirSync(dir, { recursive: true });
+    const stored = `branding/${req.partner.id}.${ext}`;
+    fs.writeFileSync(path.resolve("uploads", stored), file.buffer);
+    const logoUrl = publicUploadUrl(req, stored);
+    const partner = await prisma.partner.update({
+      where: { id: req.partner.id },
+      data: { logoUrl },
+    });
+    req.partner = partner;
+    res.json(serializePartner(partner));
+  } catch (e) {
+    console.error("[partner logo]", e?.message || e);
+    res.status(500).json({ error: e?.message || "Logo upload failed" });
+  }
 });
 
 router.get("/tickets", async (req, res) => {

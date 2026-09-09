@@ -290,6 +290,15 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
       if (partner.status === "PENDING") {
         return res.status(403).json({ error: "Partner access is pending payment confirmation by Nexwapi. You cannot log in until Nexwapi marks payment received." });
       }
+      const { ensurePartnerWorkspace } = await import("../lib/partnerWorkspace.js");
+      const ws = await ensurePartnerWorkspace(partner, user).catch(() => null);
+      if (ws) {
+        user.companyId = ws.id;
+        user.company = await prisma.company.findUnique({
+          where: { id: ws.id },
+          include: { subscription: true, partner: true },
+        });
+      }
     }
     const companyPartner = user.company?.partner;
     if (companyPartner && companyPartner.status !== "ACTIVE" && user.role !== "SUPER_ADMIN") {
@@ -352,7 +361,7 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
       userId: user.id,
       title: "New sign-in",
       body: `${user.name || user.email} signed in`,
-      href: user.role === "SUPER_ADMIN" ? "/admin" : user.role === "PARTNER" ? "/partner" : "/dashboard",
+      href: user.role === "SUPER_ADMIN" ? "/admin" : user.role === "PARTNER" ? "/dashboard" : "/dashboard",
     }).catch(() => {});
     return res.json({ token: signToken(user), user: publicCompanyUser(user, user.company) });
   }
@@ -389,12 +398,23 @@ router.post("/auth/reset", signupLimiter, async (req, res) => {
 });
 
 router.get("/me", requireAuth, attachCompany, async (req, res) => {
-  const user = await prisma.user.findUnique({
+  let user = await prisma.user.findUnique({
     where: { id: req.user.id },
     include: { company: { include: { subscription: true, partner: true } }, partner: true },
   });
   if (!user) return res.status(404).json({ error: "User not found" });
   if (user.isActive === false) return res.status(403).json({ error: "Account disabled" });
+  if (user.role === "PARTNER" && user.partner?.status === "ACTIVE") {
+    const { ensurePartnerWorkspace } = await import("../lib/partnerWorkspace.js");
+    const ws = await ensurePartnerWorkspace(user.partner, user).catch(() => null);
+    if (ws && user.companyId !== ws.id) {
+      user = await prisma.user.findUnique({
+        where: { id: req.user.id },
+        include: { company: { include: { subscription: true, partner: true } }, partner: true },
+      });
+      req.company = user.company;
+    }
+  }
   const rbac = user.companyId
     ? await resolveWorkspaceRole({ user, companyId: user.companyId })
     : { role: "Owner", permissions: {} };

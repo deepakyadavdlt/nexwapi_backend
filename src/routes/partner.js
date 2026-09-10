@@ -495,10 +495,79 @@ router.post("/clients/:id/login-as", async (req, res) => {
   });
 });
 
+const LOGO_MIME = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/webp": "webp",
+  "image/svg+xml": "svg",
+};
+
+/** Save partner logo from a data URL or raw base64 — avoids multipart (nginx often strips CORS on 413). */
+function persistPartnerLogo(req, { dataUrl, base64, mimeType } = {}) {
+  let mime = String(mimeType || "").toLowerCase().trim();
+  let b64 = String(base64 || "").trim();
+  const raw = String(dataUrl || "").trim();
+  if (raw.startsWith("data:")) {
+    const m = raw.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/);
+    if (!m) {
+      const err = new Error("Invalid logo data URL");
+      err.status = 400;
+      throw err;
+    }
+    mime = m[1].toLowerCase();
+    b64 = m[2].replace(/\s+/g, "");
+  }
+  if (!b64) {
+    const err = new Error("Upload a PNG, JPG, WEBP, or SVG logo (max 2MB).");
+    err.status = 400;
+    throw err;
+  }
+  const ext = LOGO_MIME[mime];
+  if (!ext) {
+    const err = new Error("Logo must be PNG, JPG, WEBP, or SVG.");
+    err.status = 400;
+    throw err;
+  }
+  const buffer = Buffer.from(b64, "base64");
+  if (!buffer.length) {
+    const err = new Error("Logo file is empty or corrupt.");
+    err.status = 400;
+    throw err;
+  }
+  if (buffer.length > 2 * 1024 * 1024) {
+    const err = new Error("Logo file is too large (max 2MB). Compress the image and try again.");
+    err.status = 400;
+    throw err;
+  }
+  const dir = path.resolve("uploads/branding");
+  fs.mkdirSync(dir, { recursive: true });
+  // Clear old extensions so stale files are not served.
+  for (const old of Object.values(LOGO_MIME)) {
+    const p = path.resolve("uploads", `branding/${req.partner.id}.${old}`);
+    if (fs.existsSync(p) && old !== ext) fs.unlinkSync(p);
+  }
+  const stored = `branding/${req.partner.id}.${ext}`;
+  fs.writeFileSync(path.resolve("uploads", stored), buffer);
+  return publicUploadUrl(req, stored);
+}
+
 router.patch("/branding", async (req, res) => {
   const data = {};
   if (req.body?.productName != null) data.productName = String(req.body.productName).trim().slice(0, 60);
-  if (req.body?.logoUrl != null) data.logoUrl = String(req.body.logoUrl).trim() || null;
+  if (req.body?.logoUrl != null) {
+    const raw = String(req.body.logoUrl).trim();
+    if (!raw) data.logoUrl = null;
+    else if (raw.startsWith("data:image/")) {
+      try {
+        data.logoUrl = persistPartnerLogo(req, { dataUrl: raw });
+      } catch (e) {
+        return res.status(e.status || 400).json({ error: e.message || "Invalid logo" });
+      }
+    } else {
+      data.logoUrl = raw.slice(0, 2000);
+    }
+  }
   if (req.body?.primaryColor != null) {
     const color = String(req.body.primaryColor).trim();
     if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(color)) data.primaryColor = color;
@@ -522,37 +591,44 @@ router.patch("/branding", async (req, res) => {
   res.json(serializePartner(partner));
 });
 
-const logoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
-
-router.post("/branding/logo", (req, res, next) => {
-  logoUpload.single("file")(req, res, (err) => {
-    if (err) {
-      const msg = err.code === "LIMIT_FILE_SIZE"
-        ? "Logo file is too large (max 2MB). Compress the image and try again."
-        : (err.message || "Upload failed");
-      return res.status(400).json({ error: msg });
-    }
-    next();
-  });
+/** JSON logo upload (preferred). Multipart kept as legacy fallback. */
+router.post("/branding/logo", async (req, res, next) => {
+  const ct = String(req.headers["content-type"] || "");
+  if (ct.includes("multipart/form-data")) {
+    return multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } }).single("file")(req, res, (err) => {
+      if (err) {
+        const msg = err.code === "LIMIT_FILE_SIZE"
+          ? "Logo file is too large (max 2MB). Compress the image and try again."
+          : (err.message || "Upload failed");
+        return res.status(400).json({ error: msg });
+      }
+      next();
+    });
+  }
+  try {
+    const logoUrl = persistPartnerLogo(req, {
+      dataUrl: req.body?.dataUrl,
+      base64: req.body?.base64,
+      mimeType: req.body?.mimeType || req.body?.mime,
+    });
+    const partner = await prisma.partner.update({
+      where: { id: req.partner.id },
+      data: { logoUrl },
+    });
+    req.partner = partner;
+    return res.json(serializePartner(partner));
+  } catch (e) {
+    console.error("[partner logo]", e?.message || e);
+    return res.status(e.status || 500).json({ error: e.message || "Logo upload failed" });
+  }
 }, async (req, res) => {
   try {
     const file = req.file;
     if (!file?.buffer) return res.status(400).json({ error: "Upload a PNG, JPG, or SVG logo (max 2MB)." });
-    const mime = String(file.mimetype || "");
-    const map = {
-      "image/png": "png",
-      "image/jpeg": "jpg",
-      "image/jpg": "jpg",
-      "image/webp": "webp",
-      "image/svg+xml": "svg",
-    };
-    const ext = map[mime];
-    if (!ext) return res.status(400).json({ error: "Logo must be PNG, JPG, WEBP, or SVG." });
-    const dir = path.resolve("uploads/branding");
-    fs.mkdirSync(dir, { recursive: true });
-    const stored = `branding/${req.partner.id}.${ext}`;
-    fs.writeFileSync(path.resolve("uploads", stored), file.buffer);
-    const logoUrl = publicUploadUrl(req, stored);
+    const logoUrl = persistPartnerLogo(req, {
+      base64: file.buffer.toString("base64"),
+      mimeType: file.mimetype,
+    });
     const partner = await prisma.partner.update({
       where: { id: req.partner.id },
       data: { logoUrl },
@@ -561,7 +637,7 @@ router.post("/branding/logo", (req, res, next) => {
     res.json(serializePartner(partner));
   } catch (e) {
     console.error("[partner logo]", e?.message || e);
-    res.status(500).json({ error: e?.message || "Logo upload failed" });
+    res.status(e.status || 500).json({ error: e?.message || "Logo upload failed" });
   }
 });
 

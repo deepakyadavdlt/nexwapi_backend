@@ -173,6 +173,20 @@ export async function syncCompanyTemplates(companyId) {
         notifyOwner(companyId, mt.name, status).catch(() => {});
       }
     } catch (e) {
+      // Upsert create can race / case-clash → update existing by name.
+      if (String(e?.message || "").includes("Unique constraint") || e?.code === "P2002") {
+        const hit = await prisma.template.findFirst({
+          where: { companyId, name: { equals: mt.name, mode: "insensitive" } },
+        }).catch(() => null);
+        if (hit?.id && !hit.deletedAt) {
+          await prisma.template.update({
+            where: { id: hit.id },
+            data: { status, category, language, body },
+          }).catch((err) => console.warn("[templateSync] update after clash", mt.name, err?.message || err));
+          byName.set(nameKey, hit);
+          continue;
+        }
+      }
       if (existing?.id && !existing.deletedAt) {
         await prisma.template.update({
           where: { id: existing.id },

@@ -23,6 +23,7 @@ export const DEFAULT_BRANDING = {
   slug: null,
   websiteUrl: "",
   customDomain: "",
+  supportPhone: "",
 };
 
 export function publicPartnerBranding(partner) {
@@ -35,6 +36,7 @@ export function publicPartnerBranding(partner) {
     slug: partner.slug || null,
     websiteUrl: partner.websiteUrl || "",
     customDomain: partner.customDomain || "",
+    supportPhone: partner.phone || "",
   };
 }
 

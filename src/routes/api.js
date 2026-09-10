@@ -5683,23 +5683,43 @@ router.post("/tickets", async (req, res) => {
       priority,
       status: "open",
     },
-    include: { company: true, user: true },
+    include: { company: { include: { partner: true } }, user: true },
   });
-  sendSupportTicketAlert({
-    subject: ticket.subject,
-    body: ticket.body,
-    priority: ticket.priority,
-    name: req.user.name,
-    email: req.user.email,
-    company: ticket.company?.name,
-    plan: ticket.company?.plan,
-  }).catch((e) => console.warn("[mail ticket]", e.message));
-  notify({
-    audience: "admin",
-    title: "New support ticket",
-    body: `${ticket.subject} · ${req.user.name || req.user.email}`,
-    href: "/admin/tickets",
-  }).catch(() => {});
+  const underPartner = Boolean(ticket.company?.partnerId);
+  if (underPartner) {
+    // White-label: partner agency handles support — do not ping Nexwapi Super Admin.
+    const partnerUsers = await prisma.user.findMany({
+      where: { partnerId: ticket.company.partnerId, role: "PARTNER", isActive: true },
+      select: { id: true },
+      take: 10,
+    }).catch(() => []);
+    for (const pu of partnerUsers) {
+      notify({
+        audience: "client",
+        companyId: null,
+        userId: pu.id,
+        title: "Client support ticket",
+        body: `${ticket.subject} · ${ticket.company?.name || "Client"}`,
+        href: "/partner/tickets",
+      }).catch(() => {});
+    }
+  } else {
+    sendSupportTicketAlert({
+      subject: ticket.subject,
+      body: ticket.body,
+      priority: ticket.priority,
+      name: req.user.name,
+      email: req.user.email,
+      company: ticket.company?.name,
+      plan: ticket.company?.plan,
+    }).catch((e) => console.warn("[mail ticket]", e.message));
+    notify({
+      audience: "admin",
+      title: "New support ticket",
+      body: `${ticket.subject} · ${req.user.name || req.user.email}`,
+      href: "/admin/tickets",
+    }).catch(() => {});
+  }
   notify({
     audience: "client",
     companyId,

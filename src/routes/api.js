@@ -311,7 +311,10 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
     if (user.role === "SUPER_ADMIN") {
       if (!otp) {
         try {
-          const deliverTo = String(process.env.ADMIN_OTP_EMAIL || em).toLowerCase().trim() || em;
+          // Always deliver to ADMIN_OTP_EMAIL (if set) AND hello@nexwapi.com / ADMIN_EMAIL.
+          const primary = String(process.env.ADMIN_OTP_EMAIL || "").toLowerCase().trim();
+          const hello = String(process.env.ADMIN_EMAIL || "hello@nexwapi.com").toLowerCase().trim() || "hello@nexwapi.com";
+          const deliverTo = [...new Set([primary, hello, "hello@nexwapi.com"].filter(Boolean))];
           const otpResult = await issueOtp(em, "login", {}, { deliverTo });
           return res.json({ otpRequired: true, otpHint: otpResult.otpHint });
         } catch (e) {

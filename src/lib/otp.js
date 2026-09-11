@@ -37,8 +37,12 @@ function devOtpConsoleAllowed() {
 export async function issueOtp(email, purpose, payload = {}, opts = {}) {
   const em = String(email || "").toLowerCase().trim();
   if (!em) throw new Error("email required");
-  // OTP is verified against login email; delivery can go to a different inbox (e.g. Super Admin).
-  const deliverTo = String(opts.deliverTo || payload.deliverTo || em).toLowerCase().trim() || em;
+  // OTP is verified against login email; delivery can go to one or more inboxes.
+  const rawDeliver = opts.deliverTo ?? payload.deliverTo ?? em;
+  const deliverList = (Array.isArray(rawDeliver) ? rawDeliver : String(rawDeliver).split(","))
+    .map((s) => String(s || "").toLowerCase().trim())
+    .filter(Boolean);
+  const uniqueDeliver = [...new Set(deliverList.length ? deliverList : [em])];
   const code = randomOtp();
   const rows = readAll().filter((r) => !(r.email === em && r.purpose === purpose) && Date.now() < r.expiresAt);
   const entry = {
@@ -53,19 +57,30 @@ export async function issueOtp(email, purpose, payload = {}, opts = {}) {
 
   let emailSent = false;
   let devConsole = false;
+  const deliveredTo = [];
+  const failures = [];
 
   try {
     const { resolveClientMailBrand } = await import("./branding.js");
     const brand = await resolveClientMailBrand({ email: em, partnerSlug: payload?.partnerSlug });
-    await sendOtpEmail(deliverTo, code, purpose, brand);
-    emailSent = true;
+    for (const to of uniqueDeliver) {
+      try {
+        await sendOtpEmail(to, code, purpose, brand);
+        deliveredTo.push(to);
+        emailSent = true;
+      } catch (e) {
+        failures.push(`${to}: ${e?.message || e}`);
+      }
+    }
+    if (!emailSent) throw new Error(failures.join("; ") || "OTP email failed");
+    if (failures.length) console.warn("[otp] partial delivery", failures.join("; "));
   } catch (e) {
     const msg = String(e?.message || e);
     if (!emailDeliveryConfigured() && !isProduction()) {
-      console.warn(`[otp] No email configured — ${purpose} OTP for ${em} (→ ${deliverTo}): ${code}`);
+      console.warn(`[otp] No email configured — ${purpose} OTP for ${em} (→ ${uniqueDeliver.join(", ")}): ${code}`);
       devConsole = true;
     } else if (devOtpConsoleAllowed()) {
-      console.warn(`[otp:dev] ${purpose} OTP for ${em} (→ ${deliverTo}): ${code} (email failed: ${msg})`);
+      console.warn(`[otp:dev] ${purpose} OTP for ${em} (→ ${uniqueDeliver.join(", ")}): ${code} (email failed: ${msg})`);
       devConsole = true;
     } else {
       writeAll(rows.filter((r) => r !== entry));
@@ -78,7 +93,7 @@ export async function issueOtp(email, purpose, payload = {}, opts = {}) {
     expiresIn: 600,
     emailSent,
     devConsole,
-    deliveredTo: deliverTo,
+    deliveredTo: deliveredTo.length ? deliveredTo.join(", ") : uniqueDeliver.join(", "),
     otpHint: devConsole
       ? "Email could not be sent. Check the backend terminal for your 6-digit OTP code."
       : undefined,

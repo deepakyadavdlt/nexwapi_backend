@@ -147,4 +147,9 @@ Promise.all([
   }).catch(() => {});
   setInterval(() => life.runLifecycleEmails().catch(() => {}), 60 * 60 * 1000);
   setTimeout(() => life.runLifecycleEmails().catch(() => {}), 15 * 1000);
+  import("./lib/subscriptionBilling.js").then((sb) => {
+    const tick = () => sb.runSubscriptionRenewals().catch((e) => console.warn("[subscriptionRenewal]", e?.message || e));
+    setTimeout(tick, 45 * 1000);
+    setInterval(tick, 60 * 60 * 1000);
+  }).catch(() => {});
 });

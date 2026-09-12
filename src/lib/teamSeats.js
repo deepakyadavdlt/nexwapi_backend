@@ -200,6 +200,10 @@ export async function createAgentSeat(
     usersByEmail: new Map([[em, user]]),
   });
 
+  // Enterprise: each seat beyond the included owner adds ₹500 to monthly subscription.
+  const { refreshEnterpriseSubscriptionAmount } = await import("./subscriptionBilling.js");
+  await refreshEnterpriseSubscriptionAmount(companyId).catch(() => {});
+
   return {
     agent: serialized,
     login: { email: em, password: existingUser ? null : plain },

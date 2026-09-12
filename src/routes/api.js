@@ -684,10 +684,8 @@ async function fulfillPaidPayment(payment, { orderId, userId, via, transactionId
     where: { id: payment.companyId },
     data: { plan: planKey, status: "ACTIVE", upgradedAt: new Date(), trialEndsAt: null },
   });
-  await prisma.subscription.update({
-    where: { companyId: payment.companyId },
-    data: { plan: planKey, status: "active", activatedAt: new Date(), trialEndsAt: null },
-  }).catch(() => {});
+  const { activatePaidSubscription } = await import("../lib/subscriptionBilling.js");
+  await activatePaidSubscription(payment.companyId, planKey, { autoRenew: true }).catch(() => {});
   await applyPlanCredits(payment.companyId, planKey, userId).catch(() => {});
   return prisma.company.findUnique({ where: { id: payment.companyId } });
 }
@@ -1851,6 +1849,8 @@ router.delete("/agents/:id", async (req, res) => {
     await prisma.contact.updateMany({ where: { assignedAgentId: agent.id, ...tenantWhere(req) }, data: { assignedAgentId: null } });
     await prisma.agent.delete({ where: { id: agent.id } });
     await prisma.user.deleteMany({ where: { email: agent.email, companyId: companyIdOf(req), role: { in: ["AGENT", "ADMIN", "MEMBER"] } } }).catch(() => {});
+    const { refreshEnterpriseSubscriptionAmount } = await import("../lib/subscriptionBilling.js");
+    await refreshEnterpriseSubscriptionAmount(companyIdOf(req)).catch(() => {});
     res.sendStatus(204);
   } catch {
     res.sendStatus(404);

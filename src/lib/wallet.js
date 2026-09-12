@@ -216,7 +216,8 @@ export async function refundCredits(companyId, credits = 1, reason = "message_re
   return company;
 }
 
-export async function applyPlanCredits(companyId, planKey, createdBy = null) {
+/** Plan allotment for a key (platform settings). */
+export async function planCreditAllotment(planKey) {
   const pricing = await getPlatformPricing();
   const map = {
     trial: pricing.trialCredits,
@@ -225,14 +226,40 @@ export async function applyPlanCredits(companyId, planKey, createdBy = null) {
     professional: pricing.growthCredits,
     enterprise: pricing.growthCredits,
   };
-  const credits = map[planKey] || 0;
-  if (!credits) return null;
-  return creditWallet({
-    companyId,
-    amountPaise: 0,
-    credits,
-    reason: planKey === "trial" ? "admin_grant" : "plan",
-    createdBy,
-    meta: { planKey },
+  return Math.max(0, Math.floor(Number(map[planKey]) || 0));
+}
+
+/**
+ * Set message credits to the plan allotment (replace, do not stack on switch).
+ * Wallet rupees are unchanged — only messageCredits are reset to the plan pack.
+ */
+export async function applyPlanCredits(companyId, planKey, createdBy = null) {
+  const target = await planCreditAllotment(planKey);
+  if (!target && planKey !== "expired") return null;
+
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  if (!company) return null;
+
+  const before = Math.max(0, Number(company.messageCredits) || 0);
+  const delta = target - before;
+  if (delta === 0) return { company, skipped: true };
+
+  const updated = await prisma.company.update({
+    where: { id: companyId },
+    data: { messageCredits: target },
   });
+  await prisma.walletTransaction.create({
+    data: {
+      companyId,
+      type: delta > 0 ? "credit" : "debit",
+      reason: planKey === "trial" ? "admin_grant" : "plan",
+      amountPaise: 0,
+      creditsDelta: delta,
+      balanceAfter: updated.walletBalancePaise,
+      creditsAfter: updated.messageCredits,
+      createdBy,
+      meta: { planKey, mode: "set", before, target },
+    },
+  });
+  return { company: updated, txn: true };
 }

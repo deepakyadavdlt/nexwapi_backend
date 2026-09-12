@@ -659,17 +659,30 @@ router.post("/clients/:id/plan", async (req, res) => {
     data.status = "EXPIRED";
   }
   const company = await prisma.company.update({ where: { id: req.params.id }, data });
-  await prisma.subscription.upsert({
-    where: { companyId: company.id },
-    update: { plan, status: "active", amount: PLAN_CATALOG[plan]?.amount || 0 },
-    create: {
-      companyId: company.id,
-      plan,
-      status: "active",
-      amount: PLAN_CATALOG[plan]?.amount || 0,
-      trialEndsAt: company.trialEndsAt,
-    },
-  }).catch(() => {});
+  if (isPaidPlan(plan)) {
+    const { activatePaidSubscription } = await import("../lib/subscriptionBilling.js");
+    await activatePaidSubscription(company.id, plan, { autoRenew: true }).catch(() => {});
+  } else {
+    await prisma.subscription.upsert({
+      where: { companyId: company.id },
+      update: {
+        plan,
+        status: plan === "expired" ? "cancelled" : "active",
+        amount: PLAN_CATALOG[plan]?.amount || 0,
+        autoRenew: false,
+        expiresAt: null,
+        trialEndsAt: company.trialEndsAt,
+      },
+      create: {
+        companyId: company.id,
+        plan,
+        status: "active",
+        amount: PLAN_CATALOG[plan]?.amount || 0,
+        trialEndsAt: company.trialEndsAt,
+        autoRenew: false,
+      },
+    }).catch(() => {});
+  }
   if (isPaidPlan(plan) || plan === "trial") {
     const { applyPlanCredits } = await import("../lib/wallet.js");
     await applyPlanCredits(company.id, plan, req.user.id).catch(() => {});

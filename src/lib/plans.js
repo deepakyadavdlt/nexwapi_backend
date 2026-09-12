@@ -69,6 +69,13 @@ export const PLAN_CATALOG = {
 
 export const PAID_PLAN_KEYS = ["starter", "growth", "professional", "enterprise"];
 
+/** ₹500 / extra Enterprise team user (paise), billed on top of base subscription. */
+export const EXTRA_SEAT_PAISE = 50000;
+/** First seat (owner) is included in Enterprise base; each additional user adds EXTRA_SEAT_PAISE. */
+export const ENTERPRISE_INCLUDED_SEATS = 1;
+
+export const BILLING_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
+
 export function normalizePlan(plan) {
   if (!plan) return "trial";
   if (plan === "pro") return "growth";

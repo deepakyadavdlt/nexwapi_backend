@@ -379,16 +379,26 @@ model Notification {
 }
 
 model SalesLead {
-  id        String   @id @default(cuid())
-  name      String
-  email     String
-  phone     String   @default("")
-  company   String   @default("")
-  message   String
-  status    String   @default("new")
-  note      String   @default("")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id               String   @id @default(cuid())
+  name             String
+  email            String
+  phone            String   @default("")
+  company          String   @default("")
+  message          String
+  status           String   @default("new")
+  note             String   @default("")
+  /// Linked client workspace after Super Admin assigns an agent
+  companyId        String?
+  /// User id of the sales agent given access to the client
+  assignedUserId   String?
+  assignedAgentEmail String @default("")
+  assignedAt       DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([companyId])
+  @@index([assignedUserId])
+  @@index([status, createdAt])
 }
 
 model Team {

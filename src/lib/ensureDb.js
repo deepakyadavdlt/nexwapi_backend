@@ -161,6 +161,10 @@ async function applyCriticalPatches() {
     `ALTER TABLE "Partner" ADD COLUMN IF NOT EXISTS "websiteUrl" TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE "Team" ADD COLUMN IF NOT EXISTS "leadIds" TEXT[] DEFAULT ARRAY[]::TEXT[]`,
     `ALTER TABLE "Team" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE "SalesLead" ADD COLUMN IF NOT EXISTS "companyId" TEXT`,
+    `ALTER TABLE "SalesLead" ADD COLUMN IF NOT EXISTS "assignedUserId" TEXT`,
+    `ALTER TABLE "SalesLead" ADD COLUMN IF NOT EXISTS "assignedAgentEmail" TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE "SalesLead" ADD COLUMN IF NOT EXISTS "assignedAt" TIMESTAMP(3)`,
   ];
 
   const tablePatches = [

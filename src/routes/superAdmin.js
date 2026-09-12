@@ -694,17 +694,32 @@ router.post("/clients/:id/plan", async (req, res) => {
 });
 
 router.post("/clients/:id/team-user", async (req, res) => {
-  const { name, email, role = "Agent", password } = req.body || {};
+  const { name, email, password } = req.body || {};
+  let role = String(req.body?.role || "Sales Agent").trim();
+  if (role === "Agent") role = "Sales Agent";
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
   try {
+    const company = await prisma.company.findUnique({ where: { id: req.params.id } });
+    if (!company) return res.status(404).json({ error: "Client not found" });
     const { agent, login } = await createAgentSeat(req.params.id, { name, email, role, password });
+    const { subscriptionMonthlyPaise, enterpriseExtraSeats } = await import("../lib/subscriptionBilling.js");
+    const monthlyPaise = await subscriptionMonthlyPaise(company.id, company.plan).catch(() => 0);
+    const extraSeats = await enterpriseExtraSeats(company.id).catch(() => 0);
     res.status(201).json({
       ok: true,
       agent,
       loginEmail: login.email,
       tempPassword: login.password,
+      plan: company.plan,
+      extraSeats,
+      monthlyPaise,
+      monthlyLabel: `₹${Math.round((monthlyPaise || 0) / 100).toLocaleString("en-IN")}/mo`,
       message: login.password
-        ? `Login created. Email: ${login.email}  Password: ${login.password}`
+        ? `Login created. Email: ${login.email}  Password: ${login.password}${
+            normalizePlan(company.plan) === "enterprise"
+              ? ` · Enterprise seats: ${extraSeats} extra × ₹500 = ${`₹${Math.round((monthlyPaise || 0) / 100).toLocaleString("en-IN")}/mo`}`
+              : ""
+          }`
         : "User already had a login. Agent seat added.",
     });
   } catch (e) {
@@ -2266,7 +2281,23 @@ router.delete("/segments/:id", async (req, res) => {
 
 router.get("/sales-leads", async (_req, res) => {
   const leads = await prisma.salesLead.findMany({ orderBy: { createdAt: "desc" }, take: 300 });
-  res.json(leads.map((l) => ({ ...l, createdAt: l.createdAt.getTime(), updatedAt: l.updatedAt.getTime() })));
+  const companyIds = [...new Set(leads.map((l) => l.companyId).filter(Boolean))];
+  const companies = companyIds.length
+    ? await prisma.company.findMany({
+        where: { id: { in: companyIds } },
+        select: { id: true, name: true, plan: true, status: true, email: true },
+      })
+    : [];
+  const byId = new Map(companies.map((c) => [c.id, c]));
+  res.json(
+    leads.map((l) => ({
+      ...l,
+      createdAt: l.createdAt.getTime(),
+      updatedAt: l.updatedAt.getTime(),
+      assignedAt: l.assignedAt ? l.assignedAt.getTime() : null,
+      client: l.companyId ? byId.get(l.companyId) || null : null,
+    }))
+  );
 });
 
 router.patch("/sales-leads/:id", async (req, res) => {
@@ -2274,7 +2305,183 @@ router.patch("/sales-leads/:id", async (req, res) => {
   if (req.body?.status) data.status = String(req.body.status);
   if (req.body?.note != null) data.note = String(req.body.note);
   const lead = await prisma.salesLead.update({ where: { id: req.params.id }, data });
-  res.json({ ...lead, createdAt: lead.createdAt.getTime(), updatedAt: lead.updatedAt.getTime() });
+  res.json({
+    ...lead,
+    createdAt: lead.createdAt.getTime(),
+    updatedAt: lead.updatedAt.getTime(),
+    assignedAt: lead.assignedAt ? lead.assignedAt.getTime() : null,
+  });
+});
+
+/**
+ * Assign a sales agent to a Talk-to-Sales lead:
+ * 1) Find or create the client workspace (Enterprise by default)
+ * 2) Create Sales Agent seat on that client (+₹500/seat on Enterprise)
+ * 3) Link the lead so Super Admin can open the client / agent can log in
+ */
+router.post("/sales-leads/:id/assign", async (req, res) => {
+  const lead = await prisma.salesLead.findUnique({ where: { id: req.params.id } });
+  if (!lead) return res.status(404).json({ error: "Lead not found" });
+
+  const agentName = String(req.body?.agentName || req.body?.name || "").trim();
+  const agentEmail = String(req.body?.agentEmail || req.body?.email || "").toLowerCase().trim();
+  const agentPassword = req.body?.password ? String(req.body.password) : undefined;
+  const existingCompanyId = String(req.body?.companyId || lead.companyId || "").trim() || null;
+  const plan = normalizePlan(req.body?.plan || "enterprise");
+
+  if (!agentName || !agentEmail) {
+    return res.status(400).json({ error: "agentName and agentEmail required" });
+  }
+
+  try {
+    let company = existingCompanyId
+      ? await prisma.company.findUnique({ where: { id: existingCompanyId } })
+      : null;
+
+    if (!company) {
+      const leadEmail = String(lead.email || "").toLowerCase().trim();
+      if (leadEmail) {
+        const owner = await prisma.user.findUnique({ where: { email: leadEmail } });
+        if (owner?.companyId) {
+          company = await prisma.company.findUnique({ where: { id: owner.companyId } });
+        }
+      }
+    }
+
+    if (!company) {
+      const companyName = String(lead.company || lead.name || "Sales lead").trim() || "Sales lead";
+      const slug = await uniqueSlug(companyName);
+      const pricing = await getPlatformPricing();
+      const paid = isPaidPlan(plan);
+      company = await prisma.company.create({
+        data: {
+          name: companyName,
+          slug,
+          email: String(lead.email || "").toLowerCase().trim() || null,
+          phone: String(lead.phone || "").trim() || null,
+          status: paid ? "ACTIVE" : "TRIAL",
+          plan: paid ? plan : "trial",
+          trialEndsAt: paid ? null : new Date(Date.now() + 7 * DAY_MS),
+          trialStartedAt: paid ? null : new Date(),
+          upgradedAt: paid ? new Date() : null,
+          messageCredits: pricing.trialCredits,
+          walletBalancePaise: 0,
+        },
+      });
+
+      const ownerEmail = String(lead.email || "").toLowerCase().trim();
+      if (ownerEmail) {
+        const existingUser = await prisma.user.findUnique({ where: { email: ownerEmail } });
+        if (!existingUser) {
+          await prisma.user.create({
+            data: {
+              name: lead.name || companyName,
+              email: ownerEmail,
+              phone: String(lead.phone || "").trim() || null,
+              password: await hashPassword(Math.random().toString(36).slice(-10) + "Aa1"),
+              role: "OWNER",
+              companyId: company.id,
+            },
+          });
+        } else if (!existingUser.companyId) {
+          await prisma.user.update({
+            where: { id: existingUser.id },
+            data: { companyId: company.id, role: existingUser.role === "SUPER_ADMIN" ? existingUser.role : "OWNER" },
+          });
+        }
+      }
+
+      await prisma.subscription.create({
+        data: {
+          companyId: company.id,
+          plan: company.plan,
+          status: "active",
+          amount: PLAN_CATALOG[company.plan]?.amount || 0,
+          autoRenew: paid,
+          activatedAt: paid ? new Date() : null,
+          trialEndsAt: company.trialEndsAt,
+        },
+      }).catch(() => {});
+      await prisma.setting.create({
+        data: { companyId: company.id, businessName: companyName, autoAssign: true },
+      }).catch(() => {});
+      if (ownerEmail) {
+        await ensureOwnerAgent(company.id, { name: lead.name || companyName, email: ownerEmail }).catch(() => {});
+      }
+      if (paid) {
+        const { activatePaidSubscription } = await import("../lib/subscriptionBilling.js");
+        await activatePaidSubscription(company.id, company.plan, { autoRenew: true }).catch(() => {});
+      }
+    }
+
+    const { agent, login } = await createAgentSeat(company.id, {
+      name: agentName,
+      email: agentEmail,
+      role: "Sales Agent",
+      password: agentPassword,
+      createdBy: req.user?.id || "super-admin",
+    });
+
+    const agentUser = await prisma.user.findUnique({ where: { email: agentEmail } });
+    const updatedLead = await prisma.salesLead.update({
+      where: { id: lead.id },
+      data: {
+        status: lead.status === "new" ? "contacted" : lead.status,
+        companyId: company.id,
+        assignedUserId: agentUser?.id || null,
+        assignedAgentEmail: agentEmail,
+        assignedAt: new Date(),
+        note: lead.note
+          ? `${lead.note}\nAssigned to ${agentName} <${agentEmail}>`
+          : `Assigned to ${agentName} <${agentEmail}>`,
+      },
+    });
+
+    const { subscriptionMonthlyPaise, enterpriseExtraSeats } = await import("../lib/subscriptionBilling.js");
+    const monthlyPaise = await subscriptionMonthlyPaise(company.id, company.plan).catch(() => 0);
+    const extraSeats = await enterpriseExtraSeats(company.id).catch(() => 0);
+
+    await prisma.auditLog.create({
+      data: {
+        companyId: company.id,
+        userId: req.user.id,
+        action: "sales_lead_assign",
+        entity: "SalesLead",
+        entityId: lead.id,
+        meta: { agentEmail, plan: company.plan, monthlyPaise, extraSeats },
+      },
+    }).catch(() => {});
+
+    res.status(201).json({
+      ok: true,
+      lead: {
+        ...updatedLead,
+        createdAt: updatedLead.createdAt.getTime(),
+        updatedAt: updatedLead.updatedAt.getTime(),
+        assignedAt: updatedLead.assignedAt ? updatedLead.assignedAt.getTime() : null,
+      },
+      client: {
+        id: company.id,
+        name: company.name,
+        plan: company.plan,
+        email: company.email,
+      },
+      agent,
+      loginEmail: login.email,
+      tempPassword: login.password,
+      extraSeats,
+      monthlyPaise,
+      monthlyLabel: `₹${Math.round((monthlyPaise || 0) / 100).toLocaleString("en-IN")}/mo`,
+      message: login.password
+        ? `Agent can log in with ${login.email} / ${login.password}. Client: ${company.name} (${company.plan}).`
+        : `Agent seat added on ${company.name}. They can log in with ${login.email}.`,
+    });
+  } catch (e) {
+    if (e.code === "P2002") return res.status(409).json({ error: "This email is already used on another workspace" });
+    if (e.status) return res.status(e.status).json({ error: e.message, code: e.code, limit: e.limit, used: e.used });
+    console.error("[sales-lead assign]", e);
+    res.status(400).json({ error: e.message || "Could not assign agent" });
+  }
 });
 
 router.delete("/sales-leads/:id", async (req, res) => {

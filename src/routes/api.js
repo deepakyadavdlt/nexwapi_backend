@@ -680,12 +680,22 @@ async function fulfillPaidPayment(payment, { orderId, userId, via, transactionId
   }
 
   const planKey = normalizePlan(payment.plan);
+  const seats = Math.floor(Number(payment.seats) || 0);
   await prisma.company.update({
     where: { id: payment.companyId },
-    data: { plan: planKey, status: "ACTIVE", upgradedAt: new Date(), trialEndsAt: null },
+    data: {
+      plan: planKey,
+      status: "ACTIVE",
+      upgradedAt: new Date(),
+      trialEndsAt: null,
+      ...(planKey === "enterprise" && seats > 0 ? { purchasedSeats: seats } : { purchasedSeats: 0 }),
+    },
   });
   const { activatePaidSubscription } = await import("../lib/subscriptionBilling.js");
-  await activatePaidSubscription(payment.companyId, planKey, { autoRenew: true }).catch(() => {});
+  await activatePaidSubscription(payment.companyId, planKey, {
+    autoRenew: true,
+    seats: planKey === "enterprise" ? seats || undefined : null,
+  }).catch(() => {});
   await applyPlanCredits(payment.companyId, planKey, userId).catch(() => {});
   return prisma.company.findUnique({ where: { id: payment.companyId } });
 }
@@ -725,28 +735,42 @@ router.get("/billing/config", async (_req, res) => {
   res.json({ enabled: CASHFREE_ENABLED, gateway: "cashfree", plans, legacyPlans: CF_PLAN_CATALOG });
 });
 
-// Create a Cashfree order for starter, growth or professional plan.
+// Create a Cashfree order for starter, growth, professional, or enterprise (+seats).
 router.post("/billing/create-order", requireAuth, attachCompany, async (req, res) => {
   if (!CASHFREE_ENABLED) return res.status(503).json({ error: "Payments are not configured yet. Add CASHFREE_APP_ID and CASHFREE_SECRET_KEY." });
   const planKey = normalizePlan(req.body?.planKey || req.body?.plan || "growth");
-  if (!["starter", "growth", "professional"].includes(planKey)) {
-    return res.status(400).json({ error: "planKey must be starter, growth or professional" });
+  if (!["starter", "growth", "professional", "enterprise"].includes(planKey)) {
+    return res.status(400).json({ error: "planKey must be starter, growth, professional or enterprise" });
   }
-  const planRow = await prisma.plan.findUnique({ where: { key: planKey } }).catch(() => null);
-  if (planRow && planRow.active === false) {
+  const planRow = await prisma.plan.findUnique({ where: { key: planKey === "enterprise" ? "professional" : planKey } }).catch(() => null);
+  if (planKey !== "enterprise" && planRow && planRow.active === false) {
     return res.status(400).json({ error: "This plan is currently unavailable. Choose another plan or contact support." });
   }
-  const plan = planRow
-    ? { ...PLAN_CATALOG[planKey], amount: planRow.amount, name: planRow.name }
-    : PLAN_CATALOG[planKey];
   const companyId = companyIdOf(req);
   if (!companyId) return res.status(403).json({ error: "No company linked to this account" });
+
+  let amount = planRow
+    ? planRow.amount
+    : (PLAN_CATALOG[planKey]?.amount || 0);
+  let seats = 0;
+  let quote = null;
+  if (planKey === "enterprise") {
+    const { quoteEnterprise, planBaseAmountPaise } = await import("../lib/subscriptionBilling.js");
+    const proBase = await planBaseAmountPaise("professional");
+    quote = quoteEnterprise(req.body?.seats || req.body?.teamSeats || 13, proBase);
+    amount = quote.amountPaise;
+    seats = quote.purchasedSeats;
+  } else {
+    const catalog = PLAN_CATALOG[planKey];
+    amount = planRow?.amount ?? catalog.amount;
+  }
+
   try {
     const cfOrderId = `NEX_${req.user.id.slice(-8)}_${Date.now().toString(36)}`;
     const cfOrder = await cfCreateOrder({
       orderId: cfOrderId,
-      amount: plan.amount,
-      currency: plan.currency,
+      amount,
+      currency: "INR",
       customerPhone: req.user.phone || "9999999999",
       customerEmail: req.user.email,
       customerName: req.user.name || req.user.email,
@@ -756,24 +780,34 @@ router.post("/billing/create-order", requireAuth, attachCompany, async (req, res
         userId: req.user.id,
         companyId,
         plan: planKey,
-        amount: plan.amount,
-        currency: plan.currency,
+        amount,
+        currency: "INR",
         status: "created",
-        razorpayOrderId: cfOrderId, // reusing field to store Cashfree order id
+        seats,
+        razorpayOrderId: cfOrderId,
       },
     });
     res.json({
       orderId: cfOrderId,
       paymentSessionId: cfOrder.paymentSessionId,
-      amount: plan.amount,
-      currency: plan.currency,
+      amount,
+      currency: "INR",
       gateway: "cashfree",
       planKey,
+      seats,
+      quote,
     });
   } catch (e) {
     console.error("[create-order]", e?.message || e);
     res.status(502).json({ error: "Could not start payment. Please try again." });
   }
+});
+
+router.get("/billing/enterprise-quote", requireAuth, attachCompany, async (req, res) => {
+  const seats = req.query?.seats || req.query?.teamSeats || 13;
+  const { quoteEnterprise, planBaseAmountPaise } = await import("../lib/subscriptionBilling.js");
+  const proBase = await planBaseAmountPaise("professional");
+  res.json(quoteEnterprise(seats, proBase));
 });
 
 // Verify Cashfree payment — frontend calls this after Cashfree checkout completes.
@@ -1207,16 +1241,18 @@ router.post("/sales-leads", async (req, res) => {
   const phone = String(req.body?.phone || "").trim();
   const company = String(req.body?.company || "").trim();
   const message = String(req.body?.message || "").trim();
+  const { normalizeEnterpriseSeats } = await import("../lib/plans.js");
+  const requestedSeats = normalizeEnterpriseSeats(req.body?.teamSeats || req.body?.requestedSeats || req.body?.seats || 13);
   if (!name || !email || !message) {
     return res.status(400).json({ error: "name, email and message are required" });
   }
   const lead = await prisma.salesLead.create({
-    data: { name, email, phone, company, message },
+    data: { name, email, phone, company, message, requestedSeats },
   });
   notify({
     audience: "admin",
     title: "New Talk to Sales lead",
-    body: `${name} (${email})${company ? " · " + company : ""}`,
+    body: `${name} (${email})${company ? " · " + company : ""} · ${requestedSeats} seats`,
     href: "/admin/sales",
   }).catch(() => {});
   res.status(201).json({ ok: true, id: lead.id });

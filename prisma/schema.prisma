@@ -90,6 +90,8 @@ model Company {
   messageCredits     Int       @default(500) // trial starter credits
   freeAccess         Boolean   @default(false) // Super Admin grant — no payment required
   freeAccessNote     String?
+  /// Enterprise: paid team-inbox seat capacity (Professional max is 12; Enterprise is 13+)
+  purchasedSeats     Int       @default(0)
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
@@ -241,6 +243,8 @@ model Payment {
   currency          String   @default("INR")
   status            String   @default("created") // created | pending | paid | failed | refunded
   creditsAdded      Int      @default(0)
+  /// Enterprise seat count purchased with this plan payment (0 = N/A)
+  seats             Int      @default(0)
   razorpayOrderId   String?  @unique
   razorpayPaymentId String?
   invoiceNo         String?
@@ -393,6 +397,8 @@ model SalesLead {
   assignedUserId   String?
   assignedAgentEmail String @default("")
   assignedAt       DateTime?
+  /// How many team inbox seats the lead asked for (Enterprise = 13+)
+  requestedSeats   Int      @default(13)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 

@@ -128,6 +128,7 @@ function mapClient(c) {
     trialExpired: c.status === "EXPIRED" || (c.status === "TRIAL" && daysLeft === 0),
     suspended: c.status === "SUSPENDED",
     freeAccess: Boolean(c.freeAccess),
+    purchasedSeats: Math.floor(Number(c.purchasedSeats) || 0),
     walletBalancePaise: c.walletBalancePaise || 0,
     messageCredits: c.messageCredits || 0,
     chatbotUsed: c.chatbotUsed,
@@ -646,6 +647,7 @@ router.post("/clients/:id/plan", async (req, res) => {
   if (!["trial", "starter", "growth", "professional", "enterprise", "expired"].includes(plan)) {
     return res.status(400).json({ error: "invalid plan" });
   }
+  const seatsIn = req.body?.seats ?? req.body?.teamSeats ?? req.body?.purchasedSeats;
   const data = { plan };
   if (isPaidPlan(plan)) {
     data.status = "ACTIVE";
@@ -655,11 +657,18 @@ router.post("/clients/:id/plan", async (req, res) => {
     data.status = "TRIAL";
     data.trialEndsAt = new Date(Date.now() + 7 * DAY_MS);
     data.trialStartedAt = new Date();
+    data.purchasedSeats = 0;
   } else {
     data.status = "EXPIRED";
+    data.purchasedSeats = 0;
   }
   const company = await prisma.company.update({ where: { id: req.params.id }, data });
-  if (isPaidPlan(plan)) {
+  let quote = null;
+  if (plan === "enterprise") {
+    const { setEnterpriseSeats } = await import("../lib/subscriptionBilling.js");
+    const r = await setEnterpriseSeats(company.id, seatsIn || 13, { activate: true });
+    quote = r.quote;
+  } else if (isPaidPlan(plan)) {
     const { activatePaidSubscription } = await import("../lib/subscriptionBilling.js");
     await activatePaidSubscription(company.id, plan, { autoRenew: true }).catch(() => {});
   } else {
@@ -683,14 +692,39 @@ router.post("/clients/:id/plan", async (req, res) => {
       },
     }).catch(() => {});
   }
+  let creditsAfter = company.messageCredits;
   if (isPaidPlan(plan) || plan === "trial") {
     const { applyPlanCredits } = await import("../lib/wallet.js");
-    await applyPlanCredits(company.id, plan, req.user.id).catch(() => {});
+    const cr = await applyPlanCredits(company.id, plan, req.user.id).catch(() => null);
+    creditsAfter = cr?.company?.messageCredits ?? creditsAfter;
+  } else if (plan === "expired") {
+    await prisma.company.update({ where: { id: company.id }, data: { messageCredits: 0 } }).catch(() => {});
+    creditsAfter = 0;
   }
+  const fresh = await prisma.company.findUnique({ where: { id: company.id } });
   await prisma.auditLog.create({
-    data: { companyId: company.id, userId: req.user.id, action: "plan_change", entity: "Company", entityId: company.id, meta: { plan } },
+    data: { companyId: company.id, userId: req.user.id, action: "plan_change", entity: "Company", entityId: company.id, meta: { plan, seats: seatsIn, creditsAfter, quote } },
   }).catch(() => {});
-  res.json(company);
+  res.json({ ...fresh, messageCredits: creditsAfter, quote });
+});
+
+router.post("/clients/:id/seats", async (req, res) => {
+  const company = await prisma.company.findUnique({ where: { id: req.params.id } });
+  if (!company) return res.status(404).json({ error: "not found" });
+  const seats = req.body?.seats ?? req.body?.teamSeats;
+  if (!seats) return res.status(400).json({ error: "seats required (13+ for Enterprise)" });
+  try {
+    const { setEnterpriseSeats } = await import("../lib/subscriptionBilling.js");
+    const r = await setEnterpriseSeats(company.id, seats, { activate: true });
+    res.json({
+      ok: true,
+      client: r.company,
+      quote: r.quote,
+      message: `Enterprise set to ${r.quote.purchasedSeats} team inbox seats · ${r.quote.amountLabel} (${r.quote.breakdown})`,
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message || "Could not set seats" });
+  }
 });
 
 router.post("/clients/:id/team-user", async (req, res) => {
@@ -2285,7 +2319,7 @@ router.get("/sales-leads", async (_req, res) => {
   const companies = companyIds.length
     ? await prisma.company.findMany({
         where: { id: { in: companyIds } },
-        select: { id: true, name: true, plan: true, status: true, email: true },
+        select: { id: true, name: true, plan: true, status: true, email: true, purchasedSeats: true },
       })
     : [];
   const byId = new Map(companies.map((c) => [c.id, c]));
@@ -2408,10 +2442,22 @@ router.post("/sales-leads/:id/assign", async (req, res) => {
       if (ownerEmail) {
         await ensureOwnerAgent(company.id, { name: lead.name || companyName, email: ownerEmail }).catch(() => {});
       }
-      if (paid) {
-        const { activatePaidSubscription } = await import("../lib/subscriptionBilling.js");
-        await activatePaidSubscription(company.id, company.plan, { autoRenew: true }).catch(() => {});
-      }
+    }
+
+    const seatNeed = req.body?.seats || req.body?.teamSeats || lead.requestedSeats || 13;
+    const { setEnterpriseSeats, quoteEnterprise, planBaseAmountPaise } = await import("../lib/subscriptionBilling.js");
+    const proBase = await planBaseAmountPaise("professional");
+    const quote = quoteEnterprise(seatNeed, proBase);
+    await setEnterpriseSeats(company.id, quote.purchasedSeats, { activate: true });
+    const { applyPlanCredits } = await import("../lib/wallet.js");
+    await applyPlanCredits(company.id, "enterprise", req.user.id).catch(() => {});
+    company = await prisma.company.findUnique({ where: { id: company.id } });
+
+    if (lead.requestedSeats !== quote.purchasedSeats) {
+      await prisma.salesLead.update({
+        where: { id: lead.id },
+        data: { requestedSeats: quote.purchasedSeats },
+      }).catch(() => {});
     }
 
     const { agent, login } = await createAgentSeat(company.id, {
@@ -2431,15 +2477,12 @@ router.post("/sales-leads/:id/assign", async (req, res) => {
         assignedUserId: agentUser?.id || null,
         assignedAgentEmail: agentEmail,
         assignedAt: new Date(),
+        requestedSeats: quote.purchasedSeats,
         note: lead.note
-          ? `${lead.note}\nAssigned to ${agentName} <${agentEmail}>`
-          : `Assigned to ${agentName} <${agentEmail}>`,
+          ? `${lead.note}\nAssigned to ${agentName} <${agentEmail}> · ${quote.purchasedSeats} seats · ${quote.amountLabel}`
+          : `Assigned to ${agentName} <${agentEmail}> · ${quote.purchasedSeats} seats · ${quote.amountLabel}`,
       },
     });
-
-    const { subscriptionMonthlyPaise, enterpriseExtraSeats } = await import("../lib/subscriptionBilling.js");
-    const monthlyPaise = await subscriptionMonthlyPaise(company.id, company.plan).catch(() => 0);
-    const extraSeats = await enterpriseExtraSeats(company.id).catch(() => 0);
 
     await prisma.auditLog.create({
       data: {
@@ -2448,7 +2491,7 @@ router.post("/sales-leads/:id/assign", async (req, res) => {
         action: "sales_lead_assign",
         entity: "SalesLead",
         entityId: lead.id,
-        meta: { agentEmail, plan: company.plan, monthlyPaise, extraSeats },
+        meta: { agentEmail, plan: "enterprise", quote },
       },
     }).catch(() => {});
 
@@ -2465,16 +2508,18 @@ router.post("/sales-leads/:id/assign", async (req, res) => {
         name: company.name,
         plan: company.plan,
         email: company.email,
+        purchasedSeats: company.purchasedSeats,
       },
       agent,
       loginEmail: login.email,
       tempPassword: login.password,
-      extraSeats,
-      monthlyPaise,
-      monthlyLabel: `₹${Math.round((monthlyPaise || 0) / 100).toLocaleString("en-IN")}/mo`,
+      quote,
+      extraSeats: quote.extraSeats,
+      monthlyPaise: quote.amountPaise,
+      monthlyLabel: quote.amountLabel,
       message: login.password
-        ? `Agent can log in with ${login.email} / ${login.password}. Client: ${company.name} (${company.plan}).`
-        : `Agent seat added on ${company.name}. They can log in with ${login.email}.`,
+        ? `Agent login ${login.email} / ${login.password}. Client ${company.name}: ${quote.purchasedSeats} seats · ${quote.amountLabel} (${quote.breakdown}).`
+        : `Agent seat on ${company.name}. ${quote.purchasedSeats} seats · ${quote.amountLabel}.`,
     });
   } catch (e) {
     if (e.code === "P2002") return res.status(409).json({ error: "This email is already used on another workspace" });

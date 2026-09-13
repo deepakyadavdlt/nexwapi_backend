@@ -1,6 +1,6 @@
 import { prisma } from "./prisma.js";
 import { hashPassword } from "./auth.js";
-import { agentSeatLimit, normalizePlan } from "./plans.js";
+import { agentSeatLimitForCompany, normalizePlan } from "./plans.js";
 
 const SALES_ROLES = new Set(["Sales Lead", "Sales Agent"]);
 const ADMIN_ROLES = new Set(["Admin", "Super Admin", "Owner"]);
@@ -44,7 +44,7 @@ export function fullName(firstName, lastName, fallback = "") {
 export async function companySeatUsage(companyId) {
   const company = await prisma.company.findUnique({ where: { id: companyId } });
   const plan = normalizePlan(company?.plan || "trial");
-  const limit = agentSeatLimit(plan);
+  const limit = agentSeatLimitForCompany(company);
   const used = await prisma.agent.count({ where: { companyId } });
   const salesUsed = await prisma.agent.count({
     where: { companyId, OR: [{ kind: "sales" }, { role: { in: [...SALES_ROLES] } }] },
@@ -53,16 +53,23 @@ export async function companySeatUsage(companyId) {
     plan,
     used,
     limit,
-    unlimited: !Number.isFinite(limit),
+    unlimited: false,
+    purchasedSeats: Math.floor(Number(company?.purchasedSeats) || 0),
     salesUsed,
-    salesLimit: Number.isFinite(limit) ? limit : 9999,
+    salesLimit: limit,
   };
 }
 
 export async function assertCanAddAgent(companyId) {
-  const { used, limit, unlimited } = await companySeatUsage(companyId);
-  if (!unlimited && used >= limit) {
-    const err = new Error(`Your plan allows ${limit} team user${limit === 1 ? "" : "s"}. Upgrade to add more.`);
+  const { used, limit, plan, purchasedSeats } = await companySeatUsage(companyId);
+  if (used >= limit) {
+    const hint =
+      plan === "enterprise"
+        ? ` Enterprise seat pack is ${purchasedSeats || limit}. Increase seats (₹500 each above 12) to add more.`
+        : plan === "professional"
+          ? " Need more than 12? Choose Enterprise via Talk to Sales or Upgrade."
+          : " Upgrade your plan to add more.";
+    const err = new Error(`Your plan allows ${limit} team user${limit === 1 ? "" : "s"}.${hint}`);
     err.status = 403;
     err.code = "SEAT_LIMIT";
     err.limit = limit;

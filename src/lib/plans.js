@@ -47,11 +47,11 @@ export const PLAN_CATALOG = {
   enterprise: {
     key: "enterprise",
     name: "Enterprise",
-    amount: 0,
+    amount: 0, // computed: Professional base + (seats - 12) × ₹500
     currency: "INR",
-    period: "custom",
-    features: { inbox: true, campaign: true, chatbot: true, automation: true, api: true, unlimitedAgents: true },
-    agentLimit: 9999,
+    period: "month",
+    features: { inbox: true, campaign: true, chatbot: true, automation: true, api: true, unlimitedAgents: false },
+    agentLimit: 12, // floor; real limit = company.purchasedSeats
     contactLimit: 1000000,
     messageLimit: 10000000,
   },
@@ -69,10 +69,12 @@ export const PLAN_CATALOG = {
 
 export const PAID_PLAN_KEYS = ["starter", "growth", "professional", "enterprise"];
 
-/** ₹500 / extra Enterprise team user (paise), billed on top of base subscription. */
+/** Professional includes 12 team inbox users. Enterprise starts at 13+. */
+export const PROFESSIONAL_SEAT_CAP = 12;
+/** ₹500 / team inbox seat above Professional cap (paise). */
 export const EXTRA_SEAT_PAISE = 50000;
-/** First seat (owner) is included in Enterprise base; each additional user adds EXTRA_SEAT_PAISE. */
-export const ENTERPRISE_INCLUDED_SEATS = 1;
+/** Minimum Enterprise seat purchase (must be above Professional). */
+export const ENTERPRISE_MIN_SEATS = PROFESSIONAL_SEAT_CAP + 1;
 
 export const BILLING_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -97,8 +99,33 @@ export function hasFeature(plan, feature) {
   return Boolean(f[feature]);
 }
 
+export function normalizeEnterpriseSeats(seats) {
+  const n = Math.floor(Number(seats) || 0);
+  return Math.max(ENTERPRISE_MIN_SEATS, n);
+}
+
+/**
+ * Enterprise monthly = Professional price + (seats - 12) × ₹500.
+ * Example: 13 seats → ₹4,999 + ₹500; 20 seats → ₹4,999 + 8×₹500.
+ */
+export function enterpriseAmountPaise(seats, professionalBasePaise = PLAN_CATALOG.professional.amount) {
+  const s = normalizeEnterpriseSeats(seats);
+  const extra = Math.max(0, s - PROFESSIONAL_SEAT_CAP);
+  const base = Math.max(0, Number(professionalBasePaise) || PLAN_CATALOG.professional.amount);
+  return base + extra * EXTRA_SEAT_PAISE;
+}
+
+/** Catalog limit. For Enterprise, pass company.purchasedSeats via agentSeatLimitForCompany. */
 export function agentSeatLimit(plan) {
   const p = planFeatures(plan);
-  if (p.features.unlimitedAgents) return Infinity;
   return Number(p.agentLimit || 0);
+}
+
+export function agentSeatLimitForCompany(company) {
+  const plan = normalizePlan(company?.plan || "trial");
+  if (plan === "enterprise") {
+    const bought = Math.floor(Number(company?.purchasedSeats) || 0);
+    return bought > 0 ? bought : ENTERPRISE_MIN_SEATS;
+  }
+  return agentSeatLimit(plan);
 }

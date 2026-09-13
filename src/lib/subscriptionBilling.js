@@ -3,71 +3,130 @@ import { prisma } from "./prisma.js";
 import {
   PLAN_CATALOG,
   PAID_PLAN_KEYS,
+  PROFESSIONAL_SEAT_CAP,
   EXTRA_SEAT_PAISE,
-  ENTERPRISE_INCLUDED_SEATS,
+  ENTERPRISE_MIN_SEATS,
   BILLING_PERIOD_MS,
   normalizePlan,
   isPaidPlan,
+  normalizeEnterpriseSeats,
+  enterpriseAmountPaise,
 } from "./plans.js";
 import { applyPlanCredits, debitWallet } from "./wallet.js";
 
 export async function planBaseAmountPaise(planKey) {
   const key = normalizePlan(planKey);
+  if (key === "enterprise") {
+    // Enterprise base is Professional list price (extras added per seat).
+    const row = await prisma.plan.findUnique({ where: { key: "professional" } }).catch(() => null);
+    if (row && typeof row.amount === "number") return Math.max(0, row.amount);
+    return PLAN_CATALOG.professional.amount;
+  }
   const row = await prisma.plan.findUnique({ where: { key } }).catch(() => null);
   if (row && typeof row.amount === "number") return Math.max(0, row.amount);
   return Math.max(0, PLAN_CATALOG[key]?.amount || 0);
 }
 
-export async function enterpriseExtraSeats(companyId) {
-  const agents = await prisma.agent.count({ where: { companyId } });
-  return Math.max(0, agents - ENTERPRISE_INCLUDED_SEATS);
+export function quoteEnterprise(seats, professionalBasePaise) {
+  const purchasedSeats = normalizeEnterpriseSeats(seats);
+  const amountPaise = enterpriseAmountPaise(purchasedSeats, professionalBasePaise);
+  const extraSeats = Math.max(0, purchasedSeats - PROFESSIONAL_SEAT_CAP);
+  return {
+    purchasedSeats,
+    extraSeats,
+    amountPaise,
+    amountLabel: `₹${Math.round(amountPaise / 100).toLocaleString("en-IN")}/mo`,
+    breakdown: `Professional ₹${Math.round((professionalBasePaise || PLAN_CATALOG.professional.amount) / 100).toLocaleString("en-IN")} + ${extraSeats}×₹500`,
+    professionalSeatCap: PROFESSIONAL_SEAT_CAP,
+    extraSeatPaise: EXTRA_SEAT_PAISE,
+    minSeats: ENTERPRISE_MIN_SEATS,
+  };
 }
 
-/** Monthly subscription charge in paise (base plan + Enterprise per-user add-ons). */
+export async function enterpriseExtraSeats(companyId) {
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  const seats = Math.max(0, Math.floor(Number(company?.purchasedSeats) || 0));
+  return Math.max(0, seats - PROFESSIONAL_SEAT_CAP);
+}
+
+/** Monthly subscription charge in paise. */
 export async function subscriptionMonthlyPaise(companyId, planKey) {
   const plan = normalizePlan(planKey);
-  const base = await planBaseAmountPaise(plan);
-  if (plan !== "enterprise") return base;
-  const extra = await enterpriseExtraSeats(companyId);
-  return base + extra * EXTRA_SEAT_PAISE;
+  if (plan !== "enterprise") return planBaseAmountPaise(plan);
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  const proBase = await planBaseAmountPaise("professional");
+  const seats = Math.floor(Number(company?.purchasedSeats) || 0) || ENTERPRISE_MIN_SEATS;
+  return enterpriseAmountPaise(seats, proBase);
 }
 
 export function nextBillingExpiry(from = new Date()) {
   return new Date(from.getTime() + BILLING_PERIOD_MS);
 }
 
-/**
- * Recalculate Enterprise subscription.amount = base + (extra seats × ₹500).
- * Safe to call after add/remove team users or plan switch.
- */
-export async function refreshEnterpriseSubscriptionAmount(companyId) {
-  const company = await prisma.company.findUnique({ where: { id: companyId } });
-  if (!company || normalizePlan(company.plan) !== "enterprise") return null;
-
-  const amount = await subscriptionMonthlyPaise(companyId, "enterprise");
-  const extra = await enterpriseExtraSeats(companyId);
-  return prisma.subscription.upsert({
+/** Set Enterprise purchased seats + subscription.amount (Professional + extras × ₹500). */
+export async function setEnterpriseSeats(companyId, seats, { activate = true } = {}) {
+  const proBase = await planBaseAmountPaise("professional");
+  const quote = quoteEnterprise(seats, proBase);
+  const company = await prisma.company.update({
+    where: { id: companyId },
+    data: {
+      purchasedSeats: quote.purchasedSeats,
+      ...(activate
+        ? { plan: "enterprise", status: "ACTIVE", upgradedAt: new Date(), trialEndsAt: null }
+        : {}),
+    },
+  });
+  const now = new Date();
+  const sub = await prisma.subscription.upsert({
     where: { companyId },
-    update: { amount, plan: "enterprise", status: "active" },
+    update: {
+      plan: "enterprise",
+      status: "active",
+      amount: quote.amountPaise,
+      autoRenew: true,
+      activatedAt: now,
+      expiresAt: nextBillingExpiry(now),
+      trialEndsAt: null,
+    },
     create: {
       companyId,
       plan: "enterprise",
       status: "active",
-      amount,
+      amount: quote.amountPaise,
       autoRenew: true,
-      activatedAt: new Date(),
-      expiresAt: nextBillingExpiry(),
+      activatedAt: now,
+      expiresAt: nextBillingExpiry(now),
     },
-  }).then((sub) => ({ ...sub, extraSeats: extra }));
+  });
+  return { company, subscription: sub, quote };
 }
 
-/**
- * Activate / refresh paid subscription period after purchase or admin plan assign.
- */
-export async function activatePaidSubscription(companyId, planKey, { autoRenew = true } = {}) {
+export async function refreshEnterpriseSubscriptionAmount(companyId) {
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  if (!company || normalizePlan(company.plan) !== "enterprise") return null;
+  const seats = Math.floor(Number(company.purchasedSeats) || 0) || ENTERPRISE_MIN_SEATS;
+  return setEnterpriseSeats(companyId, seats, { activate: true });
+}
+
+export async function activatePaidSubscription(companyId, planKey, { autoRenew = true, seats = null } = {}) {
   const plan = normalizePlan(planKey);
-  const amount = await subscriptionMonthlyPaise(companyId, plan);
   const now = new Date();
+
+  if (plan === "enterprise") {
+    const company = await prisma.company.findUnique({ where: { id: companyId } });
+    const seatCount =
+      seats != null
+        ? seats
+        : Math.floor(Number(company?.purchasedSeats) || 0) || ENTERPRISE_MIN_SEATS;
+    return setEnterpriseSeats(companyId, seatCount, { activate: true });
+  }
+
+  const amount = await planBaseAmountPaise(plan);
+  await prisma.company.update({
+    where: { id: companyId },
+    data: { purchasedSeats: 0 },
+  }).catch(() => {});
+
   return prisma.subscription.upsert({
     where: { companyId },
     update: {
@@ -91,10 +150,6 @@ export async function activatePaidSubscription(companyId, planKey, { autoRenew =
   });
 }
 
-/**
- * Monthly auto-cut: debit wallet for subscription.amount and extend expiresAt.
- * Insufficient wallet → past_due + company EXPIRED.
- */
 export async function runSubscriptionRenewals() {
   const now = new Date();
   const due = await prisma.subscription.findMany({
@@ -176,10 +231,7 @@ export async function runSubscriptionRenewals() {
         where: { id: company.id },
         data: { status: "EXPIRED", plan: "expired" },
       }).catch(() => {});
-      console.warn(
-        `[subscriptionRenewal] company=${company.id} failed:`,
-        e?.message || e
-      );
+      console.warn(`[subscriptionRenewal] company=${company.id} failed:`, e?.message || e);
     }
   }
 

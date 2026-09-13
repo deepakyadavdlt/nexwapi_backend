@@ -165,6 +165,9 @@ async function applyCriticalPatches() {
     `ALTER TABLE "SalesLead" ADD COLUMN IF NOT EXISTS "assignedUserId" TEXT`,
     `ALTER TABLE "SalesLead" ADD COLUMN IF NOT EXISTS "assignedAgentEmail" TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE "SalesLead" ADD COLUMN IF NOT EXISTS "assignedAt" TIMESTAMP(3)`,
+    `ALTER TABLE "SalesLead" ADD COLUMN IF NOT EXISTS "requestedSeats" INTEGER NOT NULL DEFAULT 13`,
+    `ALTER TABLE "Company" ADD COLUMN IF NOT EXISTS "purchasedSeats" INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE "Payment" ADD COLUMN IF NOT EXISTS "seats" INTEGER NOT NULL DEFAULT 0`,
   ];
 
   const tablePatches = [

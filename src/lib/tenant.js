@@ -272,7 +272,7 @@ export async function ensureDefaultPlans() {
     { key: "starter", name: "Starter", amount: 89900, api: false, unlimitedAgents: false, agentLimit: 2, contactLimit: 5000, messageLimit: 10000 },
     { key: "growth", name: "Growth", amount: 199900, api: true, unlimitedAgents: false, agentLimit: 5, contactLimit: 25000, messageLimit: 50000 },
     { key: "professional", name: "Professional", amount: 499900, api: true, unlimitedAgents: false, agentLimit: 12, contactLimit: 100000, messageLimit: 200000 },
-    { key: "enterprise", name: "Enterprise", amount: 0, api: true, unlimitedAgents: true, agentLimit: 9999, contactLimit: 1000000, messageLimit: 10000000 },
+    { key: "enterprise", name: "Enterprise", amount: 0, api: true, unlimitedAgents: false, agentLimit: 13, contactLimit: 1000000, messageLimit: 10000000 },
     { key: "expired", name: "Expired", amount: 0, api: false, unlimitedAgents: false, agentLimit: 0, contactLimit: 0, messageLimit: 0, inbox: false, campaign: false, chatbot: false, automation: false },
   ];
   for (const r of rows) {

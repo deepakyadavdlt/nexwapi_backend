@@ -433,18 +433,22 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
           fireEvent(companyId, "message.received", { from: m.from, name: contact.name, text: bodyText, type: m.type }).catch(() => {});
           const platformId = await getPlatformCompanyId().catch(() => null);
           if (platformId && companyId === platformId) {
+            const preview = String(bodyText || "").trim() || `(${m.type || "message"})`;
+            const fromLabel = contact.name || contact.phone || m.from || "contact";
             notify({
               audience: "admin",
-              title: `WhatsApp: ${contact.name}`,
-              body: String(bodyText || m.type || "New message").slice(0, 180),
+              title: `WhatsApp · ${fromLabel}`,
+              body: preview.slice(0, 280),
               href: "/admin/inbox",
             }).catch(() => {});
           } else {
+            const preview = String(bodyText || "").trim() || `(${m.type || "message"})`;
+            const fromLabel = contact.name || contact.phone || m.from || "contact";
             notify({
               audience: "client",
               companyId,
-              title: `New message from ${contact.name}`,
-              body: String(bodyText || m.type || "Incoming WhatsApp").slice(0, 180),
+              title: `Message · ${fromLabel}`,
+              body: preview.slice(0, 280),
               href: "/dashboard/inbox",
             }).catch(() => {});
           }

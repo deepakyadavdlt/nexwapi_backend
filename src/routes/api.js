@@ -260,6 +260,24 @@ router.post("/auth/signup", signupLimiter, async (req, res) => {
 
     sendWelcome(user.email, user.name, partnerRow && partnerId ? publicPartnerBranding(partnerRow) : null).catch((e) => console.warn("[mail welcome]", e.message));
     sendOnboardWelcomeWhatsApp(company.id).catch((e) => console.warn("[wa:onboard]", e.message));
+    notify({
+      audience: "client",
+      companyId: company.id,
+      userId: user.id,
+      title: "Welcome — complete your setup",
+      body: [
+        `Hi ${name}, your 7-day trial is live with ${Number(pricing.trialCredits || 0).toLocaleString()} starter credits.`,
+        "",
+        "Setup checklist:",
+        "1. Connect WhatsApp Business number",
+        "2. Add or import contacts",
+        "3. Create a template & send first campaign",
+        "4. Use Inbox to reply to customers",
+        "",
+        "Open WhatsApp settings to finish onboarding. Need help? Visit Support anytime.",
+      ].join("\n"),
+      href: "/dashboard/whatsapp",
+    }).catch(() => {});
     const companyWithPartner = partnerRow && partnerId ? { ...company, partner: partnerRow } : company;
     res.status(201).json({ token: signToken(user), user: publicCompanyUser(user, companyWithPartner) });
   } catch (e) {
@@ -358,14 +376,7 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
         meta: { email: user.email, role: user.role },
       },
     }).catch(() => {});
-    notify({
-      audience: user.role === "SUPER_ADMIN" ? "admin" : "client",
-      companyId: user.companyId,
-      userId: user.id,
-      title: "New sign-in",
-      body: `${user.name || user.email} signed in`,
-      href: user.role === "SUPER_ADMIN" ? "/admin" : user.role === "PARTNER" ? "/dashboard" : "/dashboard",
-    }).catch(() => {});
+    // Sign-in / login events stay in audit logs only — do not spam the notifications feed.
     return res.json({ token: signToken(user), user: publicCompanyUser(user, user.company) });
   }
 
@@ -1338,12 +1349,16 @@ function outboundTextWithAgent(req, text) {
   return raw;
 }
 
+/** Low-value events that clutter the feed (login noise, etc.). */
+const NOTIFICATION_NOISE_TITLES = ["New sign-in", "Signed in", "User signed in"];
+
 router.get("/notifications", async (req, res) => {
   const isAdmin = req.user?.role === "SUPER_ADMIN";
   const where = isAdmin
-    ? { audience: "admin", OR: [{ userId: req.user.id }, { userId: null }] }
+    ? { audience: "admin", OR: [{ userId: req.user.id }, { userId: null }], title: { notIn: NOTIFICATION_NOISE_TITLES } }
     : {
         audience: "client",
+        title: { notIn: NOTIFICATION_NOISE_TITLES },
         OR: [
           { userId: req.user.id },
           { companyId: companyIdOf(req), userId: null },

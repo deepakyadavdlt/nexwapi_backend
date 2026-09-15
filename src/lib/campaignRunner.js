@@ -1,0 +1,261 @@
+// lib/campaignRunner.js — runs a broadcast campaign (used by the API route and the scheduler).
+import { prisma } from "./prisma.js";
+import { sendResolvedTemplate, getEffectiveCreds, assertTenantOutbound } from "./whatsappService.js";
+import { getTemplateHeaderMedia } from "./templateHeader.js";
+import { buildSegmentContactWhere } from "./segmentFilters.js";
+
+// Build the contact filter for a campaign audience: "All contacts", "Tag: x", or "Segment: name".
+export async function resolveAudience(audience, companyId) {
+  const where = {};
+  if (companyId) where.companyId = companyId;
+  if (!audience || /^all/i.test(audience)) return where;
+  if (/^segment:/i.test(audience)) {
+    const name = audience.replace(/^segment:\s*/i, "").trim();
+    const seg = await prisma.segment.findFirst({ where: { name, ...(companyId ? { companyId } : {}) } });
+    if (seg) return buildSegmentContactWhere(seg, companyId);
+    return where;
+  }
+  if (/^contacts:/i.test(audience)) {
+    const ids = audience.replace(/^contacts:\s*/i, "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (ids.length) return { ...where, id: { in: ids } };
+    return where;
+  }
+  where.tags = { has: audience.replace(/^tag:\s*/i, "").trim() };
+  return where;
+}
+
+export async function resolveAudienceContacts(audience, companyId) {
+  if (/^engaged:notreplied/i.test(audience)) {
+    const cs = await prisma.contact.findMany({
+      where: { ...(companyId ? { companyId } : {}) },
+      include: { messages: true },
+    });
+    return cs.filter((c) => c.messages.some((m) => m.direction === "out") && !c.messages.some((m) => m.direction === "in"));
+  }
+  if (/^engaged:notread/i.test(audience)) {
+    const cs = await prisma.contact.findMany({
+      where: { ...(companyId ? { companyId } : {}) },
+      include: { messages: true },
+    });
+    return cs.filter((c) => c.messages.some((m) => m.direction === "out" && m.status !== "read"));
+  }
+  return prisma.contact.findMany({ where: await resolveAudience(audience, companyId) });
+}
+
+export async function runCampaign(id) {
+  const campaign = await prisma.campaign.findUnique({ where: { id } });
+  if (!campaign || campaign.status === "running") return;
+
+  const companyId = campaign.companyId;
+  const company = await prisma.company.findUnique({ where: { id: companyId } });
+  const { assertCompanyOutbound } = await import("./tenant.js");
+  try {
+    assertCompanyOutbound(company);
+  } catch (e) {
+    throw new Error(e.message || "Plan expired — add wallet credits or upgrade");
+  }
+
+  const { spendCredits, refundCredits, getPlatformPricing, templateChargeCredits } = await import("./wallet.js");
+  const creds = await getEffectiveCreds(companyId);
+  assertTenantOutbound(creds);
+
+  const wa = await prisma.whatsAppAccount.findFirst({ where: { companyId, isDefault: true } });
+  if (wa?.wabaId) {
+    const { applyPartnerBillingToAccount } = await import("./partnerBilling.js");
+    const billing = await applyPartnerBillingToAccount(wa).catch(() => ({ ready: false }));
+    if (!billing.ready && !billing.skipped) {
+      console.warn(`[campaign] partner billing not ready for ${companyId}:`, billing.error || billing.reason);
+    }
+  }
+
+  const pricing = await getPlatformPricing();
+  const creditsNeeded = pricing.creditPerOutbound || 1;
+
+  let tpl = await prisma.template.findFirst({ where: { name: campaign.template, companyId } });
+  if (!tpl) throw new Error(`Template "${campaign.template}" not found. Create it under Templates first.`);
+  if (String(tpl.status).toLowerCase() !== "approved") {
+    const { refreshTemplateFromMeta } = await import("./templateSync.js");
+    tpl = (await refreshTemplateFromMeta(companyId, campaign.template)) || tpl;
+  }
+  if (String(tpl.status).toLowerCase() !== "approved") {
+    throw new Error(`Template "${campaign.template}" is still ${tpl.status} on WhatsApp. Campaigns send automatically once Meta marks it Approved.`);
+  }
+  const varCount = tpl ? (tpl.body.match(/\{\{\d+\}\}/g) || []).length : 0;
+  const lang = tpl?.language || undefined;
+  const contacts = await resolveAudienceContacts(campaign.audience, companyId);
+  if (!contacts.length) throw new Error("No contacts in this audience");
+
+  await prisma.campaign.update({
+    where: { id },
+    data: { status: "running", recipients: contacts.length, sent: 0, delivered: 0, read: 0, replied: 0, failed: 0 },
+  });
+
+  let sent = 0;
+  let failed = 0;
+  let lastError = "";
+  for (const c of contacts) {
+    let debited = false;
+    try {
+      if (!company.freeAccess) {
+        const charge = await templateChargeCredits(companyId, campaign.template, {
+          campaignId: id,
+          to: c.phone,
+        });
+        if (charge.charged) debited = true;
+      }
+      const params = Array.from({ length: varCount }, () => c.name || "Customer");
+      const header = await getTemplateHeaderMedia(companyId, campaign.template);
+      const r = await sendResolvedTemplate(c.phone, campaign.template, {
+        params,
+        language: lang,
+        body: tpl.body,
+        creds,
+        headerImageUrl: header.headerImageUrl || undefined,
+      });
+      sent++;
+      let text = tpl?.body || `[Template: ${campaign.template}]`;
+      params.forEach((p, i) => { text = text.replace(new RegExp(`\\{\\{${i + 1}\\}\\}`, "g"), p); });
+      await prisma.message.create({
+        data: {
+          companyId,
+          contactId: c.id,
+          waId: r.messages?.[0]?.id || null,
+          direction: "out",
+          type: "template",
+          text,
+          status: "sent",
+          automationSource: `campaign:${id}`,
+        },
+      });
+      await prisma.campaign.update({ where: { id }, data: { sent } });
+    } catch (e) {
+      failed++;
+      lastError = String(e.message || "Send failed");
+      console.error("[campaign] failed to", c.phone, ":", e.message);
+      await prisma.message.create({
+        data: {
+          companyId,
+          contactId: c.id,
+          direction: "out",
+          type: "template",
+          text: tpl?.body || `[Template: ${campaign.template}]`,
+          status: "failed",
+          error: String(e.message || "Send failed").slice(0, 500),
+          automationSource: `campaign:${id}`,
+        },
+      }).catch(() => {});
+      await prisma.campaign.update({ where: { id }, data: { failed } }).catch(() => {});
+      if (debited) {
+        await refundCredits(companyId, creditsNeeded, "message_refund", {
+          campaignId: id,
+          to: c.phone,
+          reason: e.message,
+        }).catch(() => {});
+      }
+      if (e.code === "NO_CREDITS") break;
+    }
+  }
+  const status = sent === 0 ? "failed" : "completed";
+  await prisma.campaign.update({ where: { id }, data: { status, scheduledAt: null, sent, failed } });
+  console.log(`[campaign] "${campaign.name}" done: ${sent}/${contacts.length} sent, ${failed} failed`);
+  try {
+    const owner = await prisma.user.findFirst({
+      where: { companyId: campaign.companyId, role: { in: ["OWNER", "ADMIN"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (owner?.email) {
+      const { sendCampaignStatus } = await import("./mailer.js");
+      await sendCampaignStatus(owner.email, campaign.name, status);
+    }
+  } catch (e) {
+    console.warn("[mail campaign]", e.message);
+  }
+  return { sent, failed, recipients: contacts.length, error: lastError || undefined };
+}
+
+/** Reconcile campaign counters from stored outbound messages (webhook delivery updates). */
+export async function reconcileCampaignStats(campaignId) {
+  if (!campaignId) return null;
+  const campaign = await prisma.campaign.findUnique({ where: { id: campaignId } });
+  if (!campaign) return null;
+
+  let msgs = await prisma.message.findMany({
+    where: { automationSource: `campaign:${campaignId}` },
+    select: { id: true, status: true },
+  });
+
+  // Older sends may lack automationSource — match by send window + template body.
+  if (!msgs.length && campaign.liveAt) {
+    const since = new Date(campaign.liveAt.getTime() - 5 * 60 * 1000);
+    const until = new Date(campaign.liveAt.getTime() + 2 * 60 * 60 * 1000);
+    const tpl = await prisma.template.findFirst({
+      where: { companyId: campaign.companyId, name: campaign.template, deletedAt: null },
+    });
+    const bodyHint = String(tpl?.body || campaign.template).slice(0, 48);
+    const candidates = await prisma.message.findMany({
+      where: {
+        companyId: campaign.companyId,
+        direction: "out",
+        type: "template",
+        at: { gte: since, lte: until },
+        OR: [
+          { text: { contains: bodyHint } },
+          { text: { contains: `[Template: ${campaign.template}]` } },
+          { text: { contains: campaign.template } },
+        ],
+      },
+      select: { id: true, status: true },
+      orderBy: { at: "asc" },
+      take: Math.max(campaign.recipients, 1) + 30,
+    });
+    if (candidates.length) {
+      msgs = candidates.slice(0, Math.max(campaign.recipients, candidates.length));
+      const ids = msgs.map((m) => m.id);
+      await prisma.message.updateMany({
+        where: { id: { in: ids }, automationSource: null },
+        data: { automationSource: `campaign:${campaignId}` },
+      }).catch(() => {});
+    }
+  }
+
+  if (!msgs.length) return null;
+
+  let failed = 0;
+  let delivered = 0;
+  let read = 0;
+  for (const m of msgs) {
+    const s = String(m.status || "").toLowerCase();
+    if (s === "failed" || s === "undelivered") failed += 1;
+    if (s === "delivered" || s === "read") delivered += 1;
+    if (s === "read") read += 1;
+  }
+  const sent = msgs.length - failed;
+  await prisma.campaign.update({
+    where: { id: campaignId },
+    data: { sent: Math.max(sent, 0), delivered, read, failed },
+  });
+  return { sent, delivered, read, failed };
+}
+
+export async function reconcileCompanyCampaigns(companyId) {
+  if (!companyId) return;
+  const campaigns = await prisma.campaign.findMany({
+    where: { companyId, status: { in: ["running", "completed"] } },
+    select: { id: true },
+    take: 50,
+    orderBy: { createdAt: "desc" },
+  });
+  for (const c of campaigns) {
+    await reconcileCampaignStats(c.id).catch(() => {});
+  }
+}
+
+export async function runDueCampaigns() {
+  const due = await prisma.campaign.findMany({
+    where: { status: "scheduled", scheduledAt: { not: null, lte: new Date() } },
+  });
+  for (const c of due) {
+    console.log(`[scheduler] launching scheduled campaign "${c.name}"`);
+    runCampaign(c.id).catch((e) => console.error("[scheduler] error:", e.message));
+  }
+}

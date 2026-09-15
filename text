@@ -1,0 +1,570 @@
+// Prisma schema — PostgreSQL (driver adapter: @prisma/adapter-pg)
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  OWNER
+  ADMIN
+  AGENT
+}
+
+enum CompanyStatus {
+  TRIAL
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+}
+
+enum SubscriptionPlan {
+  TRIAL
+  STARTER
+  PROFESSIONAL
+  ENTERPRISE
+}
+
+model Company {
+  id String @id @default(cuid())
+
+  name String
+
+  slug String @unique
+
+  payments  Payment[]
+  updatedBy String?
+
+  logo String?
+
+  email String?
+
+  phone String?
+
+  website String?
+
+  address String?
+
+  timezone String @default("Asia/Kolkata")
+
+  status CompanyStatus @default(TRIAL)
+
+  createdAt DateTime @default(now())
+
+  updatedAt DateTime @updatedAt
+  ownerId   String?
+
+  isDeleted Boolean @default(false)
+
+  isVerified Boolean @default(false)
+
+  trialStartedAt DateTime?
+
+  trialEndsAt DateTime?
+
+  lastActiveAt DateTime?
+
+  users User[]
+
+  whatsappAccounts WhatsAppAccount[]
+
+  subscriptions Subscription[]
+  contacts      Contact[]
+
+  messages Message[]
+
+  agents Agent[]
+
+  templates Template[]
+
+  campaigns Campaign[]
+
+  flows Flow[]
+
+  automations Automation[]
+
+  labels Label[]
+
+  segments Segment[]
+
+  products Product[]
+
+  settings Setting[]
+
+  apiKeys ApiKey[]
+
+  drips     Drip[]
+  usages    Usage[]
+  auditLogs AuditLog[]
+}
+
+model User {
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  password     String? // bcrypt hash (real auth later)
+  role         UserRole  @default(OWNER)
+  companyId    String
+  company      Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  chatbotUsed  Boolean   @default(false) // has this client built/used a chatbot flow
+  lastActiveAt DateTime? // last dashboard/API activity
+  createdAt    DateTime  @default(now())
+  payments     Payment[]
+  isActive     Boolean   @default(true)
+  updatedAt    DateTime  @updatedAt
+  avatar       String?
+
+  phone String?
+
+  lastLoginAt DateTime?
+}
+
+// A successful (or attempted) subscription payment via Razorpay.
+
+model Payment {
+  id String @id @default(cuid())
+
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  updatedAt DateTime         @updatedAt
+  plan      SubscriptionPlan @default(PROFESSIONAL)
+
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  paymentMethod String?
+  invoiceNo     String?
+  receiptUrl    String?
+  remarks       String?
+
+  amount   Int
+  currency String @default("INR")
+  status   String @default("created")
+
+  razorpayOrderId   String? @unique
+  razorpayPaymentId String?
+
+  createdAt DateTime  @default(now())
+  paidAt    DateTime?
+
+  @@index([userId])
+}
+
+model Subscription {
+  id        String  @id @default(cuid())
+  updatedBy String?
+  companyId String
+  isTrial   Boolean @default(true)
+
+  renewedAt DateTime?
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  plan SubscriptionPlan @default(TRIAL)
+
+  status String @default("active")
+
+  trialStartedAt DateTime @default(now())
+
+  trialEndsAt DateTime
+
+  activatedAt DateTime?
+
+  expiresAt DateTime?
+  amount    Int       @default(0)
+
+  currency String @default("INR")
+
+  billingCycle String @default("monthly")
+
+  autoRenew Boolean @default(true)
+
+  cancelAt DateTime?
+
+  razorpayCustomerId String?
+
+  razorpaySubscriptionId String?
+
+  createdAt DateTime @default(now())
+
+  updatedAt DateTime @updatedAt
+}
+
+model WhatsAppAccount {
+  id String @id @default(cuid())
+
+  companyId String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  businessId String?
+
+  wabaId String?
+
+  phoneNumberId String?
+
+  phoneNumber String?
+
+  businessName String?
+
+  isConnected Boolean @default(false)
+
+  displayPhoneNumber String?
+
+  verifiedName String?
+
+  accessToken String? @db.Text
+
+  refreshToken String? @db.Text
+
+  tokenExpiresAt DateTime?
+
+  qualityRating String?
+
+  messagingLimit String?
+
+  status String @default("disconnected")
+
+  metaAppId String?
+
+  appSecret String?
+
+  verifyToken String?
+
+  webhookSecret String?
+
+  graphVersion String @default("v23.0")
+
+  businessManagerId String?
+
+  isDefault Boolean @default(true)
+
+  isSandbox Boolean @default(false)
+
+  lastWebhookAt DateTime?
+
+  lastSyncAt DateTime?
+
+  phoneStatus        String?
+  webhookVerifyToken String?
+
+  permanentToken Boolean @default(false)
+
+  tokenGeneratedAt DateTime?
+
+  lastError         String?
+  webhookSubscribed Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  updatedAt DateTime @updatedAt
+}
+
+model Agent {
+  id        String @id @default(cuid())
+  name      String
+  companyId String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  email     String
+  role      String    @default("Agent") // Owner | Admin | Agent
+  color     String    @default("#25D366")
+  createdAt DateTime  @default(now())
+  contacts  Contact[]
+
+  @@unique([companyId, email])
+  @@index([companyId])
+}
+
+model Note {
+  id        String   @id @default(cuid())
+  contact   Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  contactId String
+  text      String
+  author    String   @default("You")
+  createdAt DateTime @default(now())
+
+  @@index([contactId])
+}
+
+model Contact {
+  id        String @id @default(cuid())
+  name      String
+  companyId String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  phone           String
+  tags            String[]  @default([])
+  optedIn         Boolean   @default(true)
+  color           String    @default("#25D366")
+  createdAt       DateTime  @default(now())
+  messages        Message[]
+  notes           Note[]
+  assignedAgent   Agent?    @relation(fields: [assignedAgentId], references: [id])
+  assignedAgentId String?
+  activeFlowId    String? // chatbot: current flow the contact is in
+  activeFlowStep  String? // chatbot: current step id within the flow
+  attributes      Json      @default("{}") // custom fields (key/value)
+  chatStatus      String    @default("open") // open | pending | resolved
+  labels          String[]  @default([]) // chat labels
+
+  @@unique([companyId, phone])
+  @@index([companyId])
+}
+
+model Event {
+  id        String   @id @default(cuid())
+  contactId String
+  type      String // status | assign | note | label | campaign | drip | created | template
+  text      String
+  createdAt DateTime @default(now())
+
+  @@index([contactId])
+}
+
+model Label {
+  id        String   @id @default(cuid())
+  name      String
+  color     String   @default("#25D366")
+  createdAt DateTime @default(now())
+  companyId String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+model Drip {
+  id          String           @id @default(cuid())
+  name        String
+  enabled     Boolean          @default(true)
+  steps       Json             @default("[]") // [{ template, delayHours }]
+  createdAt   DateTime         @default(now())
+  enrollments DripEnrollment[]
+  companyId   String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+}
+
+model DripEnrollment {
+  id          String   @id @default(cuid())
+  drip        Drip     @relation(fields: [dripId], references: [id], onDelete: Cascade)
+  dripId      String
+  contactId   String
+  currentStep Int      @default(0)
+  nextAt      DateTime
+  status      String   @default("active") // active | completed
+  createdAt   DateTime @default(now())
+
+  @@index([status, nextAt])
+}
+
+model Segment {
+  id        String   @id @default(cuid())
+  name      String
+  tags      String[] @default([])
+  match     String   @default("any") // any | all
+  createdAt DateTime @default(now())
+  companyId String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+}
+
+model Product {
+  id          String   @id @default(cuid())
+  name        String
+  price       String   @default("")
+  description String   @default("")
+  imageUrl    String   @default("")
+  createdAt   DateTime @default(now())
+  companyId   String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+}
+
+model Plan {
+  id           String   @id @default(cuid())
+  name         String   @unique
+  price        Int
+  messageLimit Int
+  agentLimit   Int
+  contactLimit Int
+  createdAt    DateTime @default(now())
+}
+
+model Usage {
+  id String @id @default(cuid())
+
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  messagesSent   Int @default(0)
+  contactsCount  Int @default(0)
+  campaignsCount Int @default(0)
+
+  month Int
+  year  Int
+
+  @@unique([companyId, month, year])
+}
+
+model AuditLog {
+  id String @id @default(cuid())
+
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  userId String?
+
+  action String
+
+  entity String
+
+  entityId String?
+
+  ip String?
+
+  createdAt DateTime @default(now())
+}
+
+model Setting {
+  id String @id @default(cuid())
+
+  companyId String @unique
+
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  awayEnabled  Boolean  @default(false)
+  awayMessage  String   @default("Thanks for messaging! We're away right now and will reply during business hours.")
+  hoursStart   Int      @default(9) // 0-23
+  hoursEnd     Int      @default(18)
+  days         String[] @default(["Mon", "Tue", "Wed", "Thu", "Fri"])
+  businessName String   @default("Nexwapi")
+  autoAssign   Boolean  @default(false) // round-robin assign new chats to agents
+  webhookUrl   String   @default("") // outgoing events (Zapier/Make/custom)
+  csatEnabled  Boolean  @default(false) // send a rating request on chat resolve
+  csatMessage  String   @default("Thanks for chatting with us! How would you rate your experience?")
+  updatedAt    DateTime @updatedAt
+}
+
+model ApiKey {
+  id        String @id @default(cuid())
+  name      String
+  companyId String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  key        String
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  @@unique([companyId, key])
+  @@index([companyId])
+}
+
+model Flow {
+  id          String   @id @default(cuid())
+  name        String
+  triggerType String   @default("keyword") // keyword | any
+  trigger     String   @default("")
+  enabled     Boolean  @default(true)
+  steps       Json     @default("[]") // [{ id, message, buttons: [{ title, next }] }]
+  createdAt   DateTime @default(now())
+  companyId   String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+}
+
+model Message {
+  id        String  @id @default(cuid())
+  waId      String? @unique // WhatsApp wamid (for delivery/read status updates)
+  contact   Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  contactId String
+  companyId String
+
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  direction String // "in" | "out"
+  type      String   @default("text") // text | template | image | document | audio | video | interactive
+  text      String
+  mediaUrl  String? // local URL for image/document/etc.
+  filename  String?
+  status    String   @default("sent") // sent | delivered | read
+  at        DateTime @default(now())
+
+  @@index([contactId])
+  @@index([companyId])
+}
+
+model Template {
+  id        String @id @default(cuid())
+  companyId String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  name      String
+  category  String   @default("Utility") // Authentication | Utility | Marketing
+  language  String   @default("en")
+  status    String   @default("pending") // pending | approved | rejected
+  body      String
+  format    String   @default("text") // text | carousel
+  cards     Json? // carousel cards: [{ imageUrl, body, buttons: [{ type, text, url }] }]
+  createdAt DateTime @default(now())
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+model QuickReply {
+  id        String   @id @default(cuid())
+  title     String
+  text      String
+  createdAt DateTime @default(now())
+}
+
+model Automation {
+  companyId String
+
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  id        String   @id @default(cuid())
+  name      String
+  keyword   String   @default("") // empty = with matchType "any"
+  matchType String   @default("contains") // contains | exact | any
+  reply     String
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([companyId])
+}
+
+model Campaign {
+  id          String    @id @default(cuid())
+  name        String
+  template    String
+  audience    String    @default("All contacts")
+  recipients  Int       @default(0)
+  sent        Int       @default(0)
+  delivered   Int       @default(0)
+  read        Int       @default(0)
+  replied     Int       @default(0)
+  status      String    @default("scheduled") // scheduled | running | completed
+  scheduledAt DateTime? // when to auto-send (null = manual)
+  createdAt   DateTime  @default(now())
+  companyId   String
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+}

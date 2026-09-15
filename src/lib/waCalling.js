@@ -105,7 +105,7 @@ export async function ensureCallsWebhookSubscription() {
       object: "whatsapp_business_account",
       callback_url: callback,
       verify_token: verify,
-      fields: "messages,message_template_status_update,calls,account_update",
+      fields: "messages,message_template_status_update,template_category_update,calls,account_update",
       access_token: token,
     }),
   });

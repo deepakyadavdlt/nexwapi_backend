@@ -327,7 +327,12 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             console.warn("[wa] calling webhook", e?.message || e)
           );
         }
-        if (change.field === "message_template_status_update" || value.message_template_name) {
+        if (
+          change.field === "message_template_status_update"
+          || change.field === "template_category_update"
+          || change.field === "message_template_category_update"
+          || value.message_template_name
+        ) {
           let tplCompanyId = companyId;
           if (!tplCompanyId && wabaId) {
             const byWaba = await prisma.whatsAppAccount.findFirst({
@@ -337,6 +342,24 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
           }
           const tName = value.message_template_name;
           const tEvent = value.event || value.message_template_status || value.status || "";
+          const newCat = value.new_category || value.category || "";
+          const correctCat = value.correct_category || "";
+          if (
+            tName
+            && (change.field === "template_category_update"
+              || change.field === "message_template_category_update"
+              || newCat
+              || correctCat)
+          ) {
+            const { applyTemplateCategoryUpdate } = await import("../lib/templateSync.js");
+            await applyTemplateCategoryUpdate({
+              companyId: tplCompanyId,
+              name: tName,
+              language: value.message_template_language,
+              newCategory: newCat,
+              correctCategory: correctCat,
+            }).catch((e) => console.warn("[wa] template category", e?.message || e));
+          }
           if (tName && tEvent) {
             await applyTemplateStatusUpdate({
               companyId: tplCompanyId,

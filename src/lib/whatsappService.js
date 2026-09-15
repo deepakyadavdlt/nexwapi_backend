@@ -565,6 +565,38 @@ function isAuthCategory(category) {
 }
 
 /**
+ * Map UI / legacy labels to Meta's only allowed enums:
+ * UTILITY | MARKETING | AUTHENTICATION
+ */
+export function normalizeMetaCategory(category) {
+  const raw = String(category || "").trim();
+  const u = raw.toUpperCase().replace(/[\s-]+/g, "_");
+  if (!u) return "UTILITY";
+  if (u.includes("AUTH")) return "AUTHENTICATION";
+  if (
+    u.includes("MARKET")
+    || u.includes("PROMO")
+    || u.includes("LEAD")
+  ) return "MARKETING";
+  if (
+    u.includes("UTIL")
+    || u.includes("SERVICE")
+    || u.includes("TRANSACT")
+    || u === "UTILITY"
+  ) return "UTILITY";
+  // Unknown labels must not be sent raw (e.g. "SERVICE ALERTS").
+  return "UTILITY";
+}
+
+/** Title-case for local DB / UI (Utility, Marketing, Authentication). */
+export function displayTemplateCategory(category) {
+  const meta = normalizeMetaCategory(category);
+  if (meta === "AUTHENTICATION") return "Authentication";
+  if (meta === "MARKETING") return "Marketing";
+  return "Utility";
+}
+
+/**
  * Meta Authentication (OTP) templates reject BODY.text — they use a fixed body
  * plus add_security_recommendation, optional expiry footer, and an OTP button.
  * @see https://developers.facebook.com/docs/whatsapp/business-management-api/authentication-templates
@@ -654,7 +686,9 @@ export function buildMetaTemplatePayload({
   return {
     name,
     language: waLang(language),
-    category: String(category || "UTILITY").toUpperCase(),
+    category: normalizeMetaCategory(category),
+    // Keep requested category. If Meta disagrees, reject instead of silently approving as Marketing.
+    allow_category_change: false,
     components,
   };
 }
@@ -678,7 +712,12 @@ export async function createTemplate(payload, creds) {
     const msg = data?.error?.error_user_msg || data?.error?.message || JSON.stringify(data);
     throw new Error(msg);
   }
-  return { ...data, language: body.language };
+  return {
+    ...data,
+    language: body.language,
+    category: data.category || body.category,
+    requestedCategory: body.category,
+  };
 }
 
 /** Delete a template by name from Meta WABA (all languages). */
@@ -724,7 +763,7 @@ export async function listTemplates(creds) {
   let res;
   try {
     res = await graphFetch(
-      `https://graph.facebook.com/${version}/${wabaId}/message_templates?limit=250&fields=name,status,language,category,components`,
+      `https://graph.facebook.com/${version}/${wabaId}/message_templates?limit=250&fields=name,status,language,category,correct_category,components`,
       accessToken
     );
   } catch (e) {

@@ -4,7 +4,13 @@
  */
 import { patchTemplateHeaderMedia } from "./templateHeader.js";
 import { prisma } from "./prisma.js";
-import { listTemplates, getEffectiveCreds, wabaIdForSending, resolveTemplateHeaderMediaUrl } from "./whatsappService.js";
+import {
+  listTemplates,
+  getEffectiveCreds,
+  wabaIdForSending,
+  resolveTemplateHeaderMediaUrl,
+  displayTemplateCategory,
+} from "./whatsappService.js";
 
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s);
 
@@ -62,6 +68,39 @@ export async function templateSyncCreds(companyId) {
     }).catch(() => {});
   }
   return { ...creds, wabaId };
+}
+
+/**
+ * Apply Meta template_category_update (Utility ↔ Marketing reclassification).
+ */
+export async function applyTemplateCategoryUpdate({ companyId, name, language, newCategory, correctCategory }) {
+  const tplName = String(name || "").trim();
+  const catRaw = correctCategory || newCategory;
+  if (!tplName || !catRaw) return null;
+  if (!companyId) {
+    console.warn("[templateSync] no company for template category", tplName);
+    return null;
+  }
+  const category = displayTemplateCategory(catRaw);
+  const where = {
+    companyId,
+    name: { equals: tplName, mode: "insensitive" },
+    deletedAt: null,
+  };
+  if (language) {
+    // Prefer exact language match when Meta sends it.
+    const hit = await prisma.template.findFirst({
+      where: { ...where, language: { equals: String(language), mode: "insensitive" } },
+    });
+    if (hit) {
+      return prisma.template.update({ where: { id: hit.id }, data: { category } });
+    }
+  }
+  const updated = await prisma.template.updateMany({ where, data: { category } });
+  if (updated.count) {
+    console.log("[templateSync] category →", category, tplName, companyId);
+  }
+  return updated;
 }
 
 /**
@@ -142,7 +181,11 @@ export async function syncCompanyTemplates(companyId) {
     const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
     const body = bodyComp?.text || existing?.body || "(synced from Meta)";
     const headerFields = headerFieldsFromMeta(mt);
-    const category = cap(mt.category) || existing?.category || "Utility";
+    // Prefer correct_category when Meta plans / has reclassified (often Utility → Marketing).
+    const category = displayTemplateCategory(mt.correct_category || mt.category)
+      || cap(mt.category)
+      || existing?.category
+      || "Utility";
     const language = mt.language || existing?.language || "en";
 
     try {

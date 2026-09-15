@@ -10,6 +10,7 @@ import { getTemplateHeaderMedia, patchTemplateHeaderMedia, enrichTemplatesWithHe
 import {
   sendText, sendTemplate, sendTemplateWithParams, sendResolvedTemplate, createTemplate, listTemplates,
   uploadMedia, sendMediaById, sendButtons, createCarouselTemplate, getEffectiveCreds, assertLiveCreds, assertTenantOutbound,
+  displayTemplateCategory,
 } from "../lib/whatsappService.js";
 import { spendCredits, refundCredits, creditWallet, creditsFromPaise, getPlatformPricing, applyPlanCredits, templateChargeCredits, chargeSessionOutbound } from "../lib/wallet.js";
 import {
@@ -3276,6 +3277,7 @@ router.post("/templates", async (req, res) => {
   const cleanName = String(name).toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
 
   let status = "pending";
+  let storedCategory = displayTemplateCategory(category);
   try {
     const companyId = companyIdOf(req);
     const { templateSyncCreds } = await import("../lib/templateSync.js");
@@ -3307,6 +3309,7 @@ router.post("/templates", async (req, res) => {
       }, creds);
     status = (r.status || "pending").toLowerCase();
     if (r.language) language = r.language;
+    if (r.category) storedCategory = displayTemplateCategory(r.category);
   } catch (e) {
     return res.status(e.status || 400).json({ error: e.message, code: e.code || undefined });
   }
@@ -3316,7 +3319,7 @@ router.post("/templates", async (req, res) => {
       data: {
         companyId: companyIdOf(req),
         name: cleanName,
-        category,
+        category: storedCategory,
         language,
         body: bodyText,
         status,
@@ -4475,7 +4478,7 @@ router.post("/whatsapp/connect", async (req, res) => {
     webhook: {
       url: `${host}/api/whatsapp/webhook`,
       verifyToken: wa.verifyToken,
-      fields: ["messages", "message_template_status_update", "calls"],
+      fields: ["messages", "message_template_status_update", "template_category_update", "calls"],
     },
   });
 });

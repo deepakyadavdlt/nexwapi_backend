@@ -3309,7 +3309,7 @@ router.post("/templates", async (req, res) => {
       }, creds);
     status = (r.status || "pending").toLowerCase();
     if (r.language) language = r.language;
-    if (r.category) storedCategory = displayTemplateCategory(r.category);
+    // Keep user-submitted category; sync uses Meta live category only.
   } catch (e) {
     return res.status(e.status || 400).json({ error: e.message, code: e.code || undefined });
   }

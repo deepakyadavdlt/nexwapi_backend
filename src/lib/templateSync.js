@@ -72,11 +72,17 @@ export async function templateSyncCreds(companyId) {
 
 /**
  * Apply Meta template_category_update (Utility ↔ Marketing reclassification).
+ * Only apply the LIVE new_category — correct_category is advisory until Meta flips it.
  */
 export async function applyTemplateCategoryUpdate({ companyId, name, language, newCategory, correctCategory }) {
   const tplName = String(name || "").trim();
-  const catRaw = correctCategory || newCategory;
-  if (!tplName || !catRaw) return null;
+  const catRaw = newCategory; // ignore correct_category for DB writes
+  if (!tplName || !catRaw) {
+    if (tplName && correctCategory && !newCategory) {
+      console.log("[templateSync] category advisory only", tplName, "planned=", correctCategory);
+    }
+    return null;
+  }
   if (!companyId) {
     console.warn("[templateSync] no company for template category", tplName);
     return null;
@@ -88,7 +94,6 @@ export async function applyTemplateCategoryUpdate({ companyId, name, language, n
     deletedAt: null,
   };
   if (language) {
-    // Prefer exact language match when Meta sends it.
     const hit = await prisma.template.findFirst({
       where: { ...where, language: { equals: String(language), mode: "insensitive" } },
     });
@@ -181,9 +186,15 @@ export async function syncCompanyTemplates(companyId) {
     const bodyComp = (mt.components || []).find((c) => String(c.type).toUpperCase() === "BODY");
     const body = bodyComp?.text || existing?.body || "(synced from Meta)";
     const headerFields = headerFieldsFromMeta(mt);
-    // Prefer correct_category when Meta plans / has reclassified (often Utility → Marketing).
-    const category = displayTemplateCategory(mt.correct_category || mt.category)
-      || cap(mt.category)
+    // Use Meta's LIVE category only. correct_category is a planned/advisory value and must
+    // NOT overwrite the UI (it was flipping Utility → Marketing while still pending).
+    const liveCat = mt.category;
+    const plannedCat = mt.correct_category;
+    if (plannedCat && liveCat && String(plannedCat).toUpperCase() !== String(liveCat).toUpperCase()) {
+      console.log("[templateSync] category advisory", mt.name, "live=", liveCat, "planned=", plannedCat);
+    }
+    const category = displayTemplateCategory(liveCat)
+      || cap(liveCat)
       || existing?.category
       || "Utility";
     const language = mt.language || existing?.language || "en";
